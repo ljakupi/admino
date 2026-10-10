@@ -8,9 +8,8 @@ Tests the FastAPI application created by ``create_app()``, covering:
   ``{"detail": "Unauthorized"}`` without a valid ``admino_session`` cookie; the
   old bearer token / vpn mode is gone (an ``Authorization`` header authenticates
   nothing, ``config.auth`` is never read, no VPN warning).
-- The ``chat.send`` role gate: Org Admins and Editors may chat; Viewers and
-  Super Admins get 403 ``{"detail": "Forbidden"}`` on POST /api/message and
-  POST /api/confirm/{id}.
+- The ``chat.send`` role gate: Org Admins and Editors may chat; Super Admins get
+  403 ``{"detail": "Forbidden"}`` on POST /api/message and POST /api/confirm/{id}.
 - POST /api/message and POST /api/confirm/{id} pass the logged-in principal to
   ``agent.run(principal=...)`` (and, through a real Agent, to the tool-call
   recorder).
@@ -667,17 +666,6 @@ class TestChatRoleGate:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post("/api/message", json=_MESSAGE_BODY)
         assert resp.status_code == 200
-
-    @pytest.mark.parametrize("route", _CHAT_ROUTES)
-    async def test_server_chat_route_viewer_returns_403(self, route: str) -> None:
-        """A Viewer is read-only: no chat."""
-        agent = FakeAgent([_make_agent_result()])
-        app = _make_app(agent, session=member_session("viewer"))
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await _call_chat_route(c, route)
-        assert resp.status_code == 403
-        assert resp.json() == _FORBIDDEN
-        assert agent.run_calls == []
 
     @pytest.mark.parametrize("route", _CHAT_ROUTES)
     async def test_server_chat_route_super_admin_returns_403(self, route: str) -> None:

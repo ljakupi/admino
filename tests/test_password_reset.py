@@ -355,7 +355,6 @@ _KNOWN_NOT_SENT = [cause for cause in _NOT_SENT_CAUSES if cause != "unknown"]
 _ELIGIBLE: dict[str, dict[str, Any]] = {
     "org-admin": {"role": "org_admin"},
     "editor": {"role": "editor"},
-    "viewer": {"role": "viewer"},
     "super-admin": _super_admin_fields(),
 }
 

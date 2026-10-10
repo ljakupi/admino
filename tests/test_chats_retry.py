@@ -584,7 +584,7 @@ class _Seeded:
     user_stop_messages: dict[str, _Stored]
     first_stop: uuid.UUID  # the editor's chat whose first message was stopped
     first_stop_message: _Stored
-    colleague: uuid.UUID  # org A viewer's failed chat
+    colleague: uuid.UUID  # org A Org Admin's failed chat
     other_org: uuid.UUID  # org B editor's failed chat
     trashed: uuid.UUID  # the editor's trashed failed chat
 
@@ -699,7 +699,7 @@ def seeded() -> _Seeded:
         user_stop_messages=user_stop_messages,
         first_stop=first_stop,
         first_stop_message=first_stop_message,
-        colleague=_failed_chat(db, world.a["viewer"].user_id),
+        colleague=_failed_chat(db, world.a["org_admin"].user_id),
         other_org=_failed_chat(db, world.b["editor"].user_id),
         trashed=_failed_chat(db, editor, deleted_at=_T0),
     )
@@ -1869,7 +1869,7 @@ async def test_chats_retry_every_statement_binds_the_callers_org_and_owner(
     )
     foreign = {
         world.org_b,
-        world.a["viewer"].user_id,
+        world.a["org_admin"].user_id,
         world.b["editor"].user_id,
         seeded.colleague,
         seeded.other_org,

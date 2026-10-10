@@ -13,8 +13,8 @@ Routes: ``GET /api/trash``, ``POST /api/trash/chats/{chat_id}/restore``,
 and ``DELETE /api/trash``.
 
 Harness: the app from ``create_app()`` runs against the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, plus a Super Admin, real session cookies), with the attachments root
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, plus a
+Super Admin, real session cookies), with the attachments root
 under ``tmp_path``. Trashed rows are seeded with ``FakeDb.add_chat`` /
 ``add_attachment(deleted_at=...)`` (the fake derives ``trash_group_id`` as
 migration 0032's backfill does once it ships) at fixed offsets from now, so
@@ -52,8 +52,8 @@ What is pinned:
   item included) and an unknown item, nothing changed (rows, files, audit);
   a non-UUID id 422; ``limit`` 0/101, a bad ``item_type`` and an over-long
   cursor 422 without echo, an undecodable cursor the 422 ``invalid_cursor``.
-- Roles: the Org Admin and the Editor may; the Viewer and the Super Admin get
-  403 with nothing changed; no session 401. CSRF on every state change.
+- Roles: the Org Admin and the Editor may; the Super Admin gets 403 with nothing
+  changed; no session 401. CSRF on every state change.
 - Each route's own per-user bucket with the contract's (rate, burst).
 - OpenAPI: each route's response model and status, the two restore routes'
   409 with one example per code.
@@ -171,7 +171,7 @@ def root(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, root: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database, the
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database, the
     attachments root at ``root``, every rate-limit bucket roomy."""
     db = FakeDb()
     built = build_world(db)
@@ -1280,18 +1280,15 @@ class TestTrashGuards:
         assert response.status_code == op.success, response.text
 
     @pytest.mark.parametrize("op", [_op_param(op) for op in _OPS])
-    @pytest.mark.parametrize("role", ["viewer", "super_admin"])
-    def test_trash_api_viewer_and_super_admin_are_403_and_change_nothing(
-        self, world: World, client: TestClient, op: _Op, role: str
+    def test_trash_api_super_admin_is_403_and_changes_nothing(
+        self, world: World, client: TestClient, op: _Op
     ) -> None:
-        """The Viewer on their own trash (from before a demotion) and the Super Admin on an
-        Editor's: exactly 403 Forbidden, nothing changed."""
-        caller = world.super_admin if role == "super_admin" else world.a["viewer"]
-        owner = world.a["viewer"] if role == "viewer" else world.a["editor"]
-        path = _target(world.db, op, owner)
+        """The Super Admin (no ``chat.send``) on an Editor's trash: exactly 403 Forbidden,
+        nothing changed."""
+        path = _target(world.db, op, world.a["editor"])
         before = _state(world.db)
 
-        response = _call(client, op, path, caller)
+        response = _call(client, op, path, world.super_admin)
 
         assert _outcome(response) == (403, FORBIDDEN)
         assert _state(world.db) == before

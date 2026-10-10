@@ -123,7 +123,7 @@ class _Seeded:
     tooly: uuid.UUID  # org A editor: user-titled, external content, TOOL_CHAT
     tool_tail: uuid.UUID  # org A editor: TOOL_TAIL_CHAT
     empty: uuid.UUID  # org A editor: no messages
-    colleague: uuid.UUID  # org A viewer's live chat
+    colleague: uuid.UUID  # org A Org Admin's live chat
     other_org: uuid.UUID  # org B editor's live chat
     trashed: uuid.UUID  # org A editor's trashed chat (with messages)
 
@@ -171,7 +171,7 @@ def seeded() -> _Seeded:
     _add_messages(db, tool_tail, TOOL_TAIL_CHAT)
     empty = seed_chat(db, editor)
     colleague = seed_chat(
-        db, world.a["viewer"], title=TITLE_CANARY, messages=[("user", MESSAGE_CANARY)]
+        db, world.a["org_admin"], title=TITLE_CANARY, messages=[("user", MESSAGE_CANARY)]
     )
     other_org = seed_chat(
         db, world.b["editor"], title=TITLE_CANARY, messages=[("user", MESSAGE_CANARY)]

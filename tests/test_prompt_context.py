@@ -62,7 +62,7 @@ _PERSONAL_TEXT: Final = "Personal-canary-170: keep it under five sentences."
 _BARE_ORG_ID: Final = uuid.UUID("f6a7b8c9-d0e1-4f2a-8b3c-4d5e6f7a8b92")
 
 _LANGUAGES: Final = ("de", "fr", "it", "en")
-_MEMBER_ROLES: Final = ("org_admin", "editor", "viewer")
+_MEMBER_ROLES: Final = ("org_admin", "editor")
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
@@ -251,7 +251,7 @@ class TestMapping:
     async def test_prompt_context_loader_every_member_role_gets_its_context(
         self, db: FakeDb, role: str
     ) -> None:
-        """No capability check: an Org Admin, an Editor and a Viewer all get their rows."""
+        """No capability check: an Org Admin and an Editor both get their rows."""
         user_id = _member(db, role=role, response_language="it", timezone="Europe/Zurich")
 
         context = await load_prompt_context(db.pool, _tenant(user_id, ORG_ID, role))

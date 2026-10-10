@@ -12,8 +12,8 @@ waited, the answer is the ``404 chat_not_found`` and the pending confirmation is
 removed before it (nothing run, stored or audited).
 
 Harness: the app from ``create_app()`` on the FakeDb world of tests/tenancy_world.py
-(orgs A and B with an Org Admin, an Editor and a Viewer each, a Super Admin, real
-session cookies), the attachments root under ``tmp_path``, a stub agent bound to
+(orgs A and B with an Org Admin and an Editor each, a Super Admin, real session
+cookies), the attachments root under ``tmp_path``, a stub agent bound to
 ``Agent.run``'s signature (it records every call: the ``agent_config``, the slot and
 the pending confirmation) and a ``ChatRuntime`` subclass that records each
 ``hold()`` call when it is made and how many callers are inside a hold. Requests run
@@ -220,7 +220,7 @@ class _WatchedRuntime(ChatRuntime):
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database, the
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database, the
     attachments root under tmp_path."""
     db = FakeDb()
     built = build_world(db)

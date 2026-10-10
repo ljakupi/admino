@@ -11,7 +11,7 @@ Pinned here, before the implementation exists:
   unaffected.
 - ``GET /api/platform/diagnostics`` (Super Admin only, through
   ``access.can(principal, Capability.PLATFORM_DIAGNOSTICS_VIEW)``): 401 without a
-  session, 403 for an Org Admin, Editor or Viewer (before any probe), a per-user
+  session, 403 for an Org Admin or Editor (before any probe), a per-user
   bucket (route key ``"/api/platform/diagnostics"``), and for a Super Admin 200
   with exactly ``{"status", "provider", "model", "llm_reachable"}`` — the DB
   status ("ok"/"degraded"), ``config.llm.provider``,
@@ -381,7 +381,7 @@ class TestPlatformDiagnostics:
 
         assert (response.status_code, response.json()) == (401, _UNAUTHORIZED)
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_diagnostics_member_role_is_403(self, role: Any) -> None:
         with _db(True), _llm(True):
             async with _client(_app(session=member_session(role))) as client:
@@ -389,7 +389,7 @@ class TestPlatformDiagnostics:
 
         assert (response.status_code, response.json()) == (403, _FORBIDDEN)
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_diagnostics_forbidden_caller_triggers_no_probe(self, role: Any) -> None:
         check = AsyncMock(return_value=True)
         probe = AsyncMock(return_value=True)
@@ -529,7 +529,8 @@ async def _respond(case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         (site / "index.html").write_text("<html>spa</html>", encoding="utf-8")
         (site / "app.js").write_text("console.log(1)", encoding="utf-8")
         monkeypatch.setenv("ADMINO_STATIC_DIR", str(site))
-    session = member_session("viewer") if case == "chat-gate-403" else None
+    # chat-gate-403: the Super Admin is refused chat.send (operator blindness).
+    session = super_admin_session() if case == "chat-gate-403" else None
     if case == "invalid-body-422":
         session = member_session("editor")
     app = _app(session=session)

@@ -28,7 +28,7 @@ What these tests pin down:
 - Wrong status → 409 ``invalid_status``; the org's last active Org Admin → 409
   ``last_admin``; another org's user, an unknown id, an invited account, a
   deleted user or a Super Admin → 404 ``{"detail": "User not found"}`` with the
-  same bytes; an Editor, a Viewer and a Super Admin → 403
+  same bytes; an Editor and a Super Admin → 403
   ``{"detail": "Forbidden"}``. Nothing changes on any refusal.
 - Self-deactivation and self-deletion (allowed when another active Org Admin
   remains) clear the ``admino_session`` cookie; any other target leaves it alone.
@@ -520,9 +520,9 @@ class TestRoutes:
 
 
 class TestAuthorization:
-    """An Editor, a Viewer and a Super Admin are refused; can() decides."""
+    """An Editor and a Super Admin are refused; can() decides."""
 
-    @pytest.mark.parametrize("who", ["editor", "viewer", "super_admin"])
+    @pytest.mark.parametrize("who", ["editor", "super_admin"])
     @pytest.mark.parametrize("name", _ROUTE_NAMES)
     def test_org_users_lifecycle_api_forbidden_without_org_users_manage(
         self, db: FakeDb, name: str, who: str
@@ -583,7 +583,7 @@ class TestAuthorization:
 class TestDeactivate:
     """POST /api/org/users/{user_id}/deactivate."""
 
-    @pytest.mark.parametrize("role", ["editor", "viewer", "org_admin"])
+    @pytest.mark.parametrize("role", ["editor", "org_admin"])
     def test_org_users_lifecycle_api_deactivate_returns_the_summary(
         self, db: FakeDb, role: str
     ) -> None:

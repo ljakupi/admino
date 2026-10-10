@@ -1,8 +1,8 @@
 """HTTP spec of chat turns on persisted chats (GH-176, contract sections 3 to 7).
 
 The app from ``create_app()`` runs against the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, plus a Super Admin, all with real session cookies). Two agent kinds:
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, plus
+a Super Admin, all with real session cookies). Two agent kinds:
 
 - a stub agent (``_Script``): its ``run`` binds every call to the contract's
   ``Agent.run`` signature, records what it got (history copied at call time) and
@@ -17,8 +17,8 @@ A "restart" is a new ``create_app()`` (it clears ``server._chat_runtime``) on
 the same FakeDb.
 
 What is pinned:
-- POST /api/chats/{chat_id}/messages: Org Admin and Editor run a turn; Viewer
-  and Super Admin get 403 before any chat statement; 401 without a session;
+- POST /api/chats/{chat_id}/messages: Org Admin and Editor run a turn; the Super
+  Admin gets 403 before any chat statement; 401 without a session;
   CSRF 403 (a same-origin request runs); extra body fields, a message over
   32768 characters or over the stored ``max_message_length`` and a non-UUID id
   are 422 with no run; unknown, other-org, other-user and trashed chats answer
@@ -383,7 +383,7 @@ class _Script:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)
@@ -526,15 +526,13 @@ def test_chat_turns_member_with_chat_send_runs_the_turn(
     assert agent.run.await_count == 1
 
 
-@pytest.mark.parametrize("role", ["viewer", "super_admin"])
-def test_chat_turns_viewer_and_super_admin_get_403_before_any_chat_statement(
-    world: World, client: TestClient, agent: MagicMock, role: str
+def test_chat_turns_super_admin_gets_403_before_any_chat_statement(
+    world: World, client: TestClient, agent: MagicMock
 ) -> None:
-    """A Viewer's own chat (kept from before a demotion) and, for the Super Admin, an
-    Editor's chat: 403 ``Forbidden``, no run and no statement on either chat table."""
-    account = world.by_role(role)  # type: ignore[arg-type]
-    owner = world.a["viewer"] if role == "viewer" else world.a["editor"]
-    chat_id = world.db.add_chat(owner.user_id)
+    """The Super Admin (no chat.send) on an Editor's chat: 403 ``Forbidden``, no run and
+    no statement on either chat table."""
+    account = world.super_admin
+    chat_id = world.db.add_chat(world.a["editor"].user_id)
     before = len(world.db.calls)
 
     response = _send(client, account, chat_id)

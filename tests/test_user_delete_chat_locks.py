@@ -313,7 +313,7 @@ class _OrgWorld:
 def _org_world(db: FakeDb) -> _OrgWorld:
     admin_id = _member(db, role="org_admin")
     target = _member(db)
-    colleague = _member(db, role="viewer")
+    colleague = _member(db, role="editor")
     outsider = _member(db, org_id=OTHER_ORG_ID, role="org_admin")
     db.open_session(target)
     db.open_session(target)
@@ -364,7 +364,7 @@ def _purge_world(db: FakeDb, *, with_chats: bool = True) -> _PurgeWorld:
     admin = _member(db, org_id=org_id, role="org_admin")
     deactivated = _member(db, org_id=org_id, status="deactivated")
     soft_deleted = _member(db, org_id=org_id, deleted_at=_TRASHED)
-    invited = _invited(db, org_id=org_id, role="viewer")
+    invited = _invited(db, org_id=org_id, role="editor")
     users = [admin, deactivated, soft_deleted, invited]
     org_chats: list[uuid.UUID] = []
     if with_chats:

@@ -18,7 +18,9 @@ What these tests pin down:
   test walks ``app.routes``), and the session is re-checked on every request: a
   deactivated user or org, a deleted (revoked) session, an expired one and one
   idle past its timeout (GH-152) are refused at once.
-- The chat routes need ``chat.send``: 403 for a Super Admin and a Viewer.
+- The chat routes need ``chat.send``: 403 for a Super Admin, and for a member
+  whose role lacks it (every member role holds it since GH-306, so the tests
+  withdraw it from the Editor for that test only).
 - CSRF: state-changing requests pass only when ``Sec-Fetch-Site`` is
   ``same-origin``/``none`` or, without it, when ``Origin`` matches ``Host``;
   refusals are 403 before authentication runs, the login included.
@@ -62,6 +64,7 @@ import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -74,8 +77,8 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.routing import Route
 
-from admino import models, server
-from admino.access import Principal
+from admino import access, models, server
+from admino.access import Capability, Principal
 from admino.models import AgentConfig, AgentResult, LLMMessage, PendingConfirmation, ToolCall
 from admino.server import create_app
 from tests.db_fakes import FakeDb as SharedFakeDb
@@ -107,6 +110,18 @@ _LOGIN_FAILED = {"detail": "Invalid email or password"}
 _PROMOTE_REFUSED = {"detail": "Critical permission promotions are temporarily unavailable."}
 _CRITICAL = "/api/org/critical-permissions"
 _CHAT_BODY = {"message": "hello", "session_id": "chat-1"}
+
+
+def _withdraw_chat_send_from_editors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Grant chat.send to the Org Admin only, for one test.
+
+    Every member role holds chat.send since GH-306 retired the read-only role, but
+    the chat routes keep their can() check: this is how a test reaches a member's
+    refusal.
+    """
+    matrix = {**access._MATRIX, Capability.CHAT_SEND: frozenset({"org_admin"})}
+    monkeypatch.setattr(access, "_MATRIX", MappingProxyType(matrix))
+
 
 # Routes that answer without a session: the health check, the login, the
 # password reset request and confirm (GH-151), opening and accepting an
@@ -933,7 +948,7 @@ class TestMe:
 
     def test_auth_api_me_ignores_request_claims(self, db: _FakeDb) -> None:
         """Query parameters or headers claiming another identity change nothing."""
-        account = db.add_account(role="viewer")
+        account = db.add_account(role="editor")
         token = db.open_session(account)
 
         response = _client(_app()).get(
@@ -946,7 +961,7 @@ class TestMe:
         assert (body["user_id"], body["kind"], body["role"]) == (
             str(_plain(account["id"])),
             "member",
-            "viewer",
+            "editor",
         )
 
     def test_auth_api_me_requires_a_session(self, db: _FakeDb) -> None:
@@ -1178,16 +1193,20 @@ class TestOpenSessionRevalidated:
             client.post("/api/message", json=_CHAT_BODY, headers=_cookie(token)).status_code == 401
         )
 
-    def test_auth_api_role_change_applies_on_the_next_request(self, db: _FakeDb) -> None:
-        """An editor demoted to viewer loses chat on the next request."""
-        account = db.add_account(role="editor")
+    def test_auth_api_role_change_applies_on_the_next_request(
+        self, db: _FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An Org Admin demoted to Editor loses chat on the next request (chat.send is
+        withdrawn from the Editor for this test)."""
+        _withdraw_chat_send_from_editors(monkeypatch)
+        account = db.add_account(role="org_admin")
         token = db.open_session(account)
         client = _client(_app())
         assert (
             client.post("/api/message", json=_CHAT_BODY, headers=_cookie(token)).status_code == 200
         )
 
-        account["role"] = "viewer"
+        account["role"] = "editor"
 
         response = client.post("/api/message", json=_CHAT_BODY, headers=_cookie(token))
         assert response.status_code == 403
@@ -1220,16 +1239,31 @@ class TestChatRoleGate:
             pytest.param(
                 {"kind": "super_admin", "role": None, "org_status": None}, id="super-admin"
             ),
-            pytest.param({"role": "viewer"}, id="viewer"),
         ],
     )
     def test_auth_api_chat_forbidden_without_chat_send(
         self, db: _FakeDb, route: str, who: dict[str, Any]
     ) -> None:
-        """A Super Admin (operator blindness) and a Viewer (read-only) get 403 Forbidden,
-        and the agent never runs."""
+        """A Super Admin (operator blindness) gets 403 Forbidden, and the agent never
+        runs."""
         agent = _FakeAgent()
         token = db.open_session(db.add_account(**who))
+
+        response = _chat_request(_client(_app(agent)), route, token)
+
+        assert response.status_code == 403
+        assert response.json() == _FORBIDDEN
+        assert agent.run_calls == []
+
+    @pytest.mark.parametrize("route", ["message", "confirm"])
+    def test_auth_api_chat_forbidden_for_a_member_without_chat_send(
+        self, db: _FakeDb, monkeypatch: pytest.MonkeyPatch, route: str
+    ) -> None:
+        """A member whose role lacks chat.send (withdrawn from the Editor for this test)
+        gets 403 Forbidden, and the agent never runs."""
+        _withdraw_chat_send_from_editors(monkeypatch)
+        agent = _FakeAgent()
+        token = db.open_session(db.add_account(role="editor"))
 
         response = _chat_request(_client(_app(agent)), route, token)
 
@@ -1883,7 +1917,6 @@ class TestCriticalPromotionSessions:
         "who",
         [
             pytest.param({"role": "editor"}, id="editor"),
-            pytest.param({"role": "viewer"}, id="viewer"),
             pytest.param({"kind": "super_admin", "role": None}, id="sa"),
         ],
     )

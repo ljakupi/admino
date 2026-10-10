@@ -692,7 +692,10 @@ Organizations and invitations (GH-153):
   unqualified column two sources share raises AmbiguousColumnError, and the
   schema's rules raise the driver's errors: the case-insensitive unique email
   (UniqueViolationError, whose text repeats the email, as the driver's does),
-  the users CHECKs of migration 0004 (for the columns a statement writes) and
+  the users CHECKs of migration 0004 (for the columns a statement writes;
+  ``users_role_check`` as migration 0033 narrowed it, GH-306: a member's role
+  is org_admin or editor, so 'viewer' is refused by every INSERT, UPDATE and
+  ``add_account`` seed) and
   its kind/org_id immutability trigger, the invitations CHECKs of migration
   0010 (a 32-byte token hash, ``sent_at >= created_at``, ``sent_at < expires_at
   <= sent_at + 72 hours``), UNIQUE user_id and token_hash, NOT NULL
@@ -953,6 +956,9 @@ _USER_COLUMNS: Final = frozenset(
         "deleted_at",
     }
 )
+# GH-306 (migration 0033): ``users_role_check`` allows the two member roles; a
+# Super Admin's role is NULL. The Viewer role is retired, so 'viewer' is refused.
+_USER_ROLES: Final = frozenset({"org_admin", "editor"})
 _ORG_COLUMNS: Final = frozenset(
     {
         "id",
@@ -2221,11 +2227,17 @@ class FakeDb:
         not preset yet) and ``personal_instructions`` ('' : none) are the
         account self-service columns (GH-166, migration 0021). ``user_id``
         (GH-176) gives the account a fixed id (e.g. ``auth_helpers.TEST_MEMBER_ID``)
-        instead of a random one; it must not exist yet.
+        instead of a random one; it must not exist yet. A member's ``role`` is
+        'org_admin' or 'editor' (GH-306, migration 0033's ``users_role_check``):
+        any other value, 'viewer' included, raises CheckViolationError as the
+        INSERT would.
         """
         user_id = uuid.uuid4() if user_id is None else uuid.UUID(int=user_id.int)
         assert user_id not in self.users, f"an account with id {user_id} exists already"
         is_member = kind == "member"
+        if is_member and role is not None and role not in _USER_ROLES:
+            msg = 'new row for relation "users" violates the role check'
+            raise asyncpg.exceptions.CheckViolationError(msg)
         if is_member and org_id not in self.orgs:
             self.add_org(org_id)
         self.users[user_id] = {
@@ -3943,7 +3955,7 @@ class FakeDb:
                     raise asyncpg.exceptions.UniqueViolationError(msg)
         rules = (
             ("kind", row["kind"] in {"super_admin", "member"}),
-            ("role", row["role"] in {None, "org_admin", "editor", "viewer"}),
+            ("role", row["role"] is None or row["role"] in _USER_ROLES),
             ("status", row["status"] in {"invited", "active", "deactivated"}),
             ("ui_language", row["ui_language"] in {"de", "fr", "en"}),
             ("response_language", row.get("response_language") in {None, *_RESPONSE_LANGUAGES}),

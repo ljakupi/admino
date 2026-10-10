@@ -27,8 +27,8 @@ Two ways to drive requests:
 
 What is pinned:
 - POST /api/chats/{chat_id}/stop (C5.7): 401 without a session; the CSRF
-  403 (the same request marked same-origin answers); 403 for a Viewer and the
-  Super Admin with no chat statement and no runtime entry; 422 for a non-UUID
+  403 (the same request marked same-origin answers); 403 for the Super Admin
+  with no chat statement and no runtime entry; 422 for a non-UUID
   id; the identical 404 ``chat_not_found`` for an unknown, another org's, a
   colleague's (an Org Admin on an Editor's chat) and a trashed chat; the
   per-user limit ``(1.0, 10)`` and its 429 (another user still gets through);
@@ -364,7 +364,7 @@ class _Tools:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)
@@ -694,16 +694,12 @@ def test_chat_stop_cross_origin_post_is_refused_and_same_origin_answers(world: W
     assert (allowed.status_code, allowed.json()) == (200, _NOT_STOPPED)
 
 
-@pytest.mark.parametrize("role", ["viewer", "super_admin"])
-def test_chat_stop_viewer_and_super_admin_get_403_before_any_chat_statement(
-    world: World, role: str
-) -> None:
-    """A Viewer's own chat and, for the Super Admin, an Editor's chat: 403 ``Forbidden``,
-    no statement on either chat table, no runtime entry."""
+def test_chat_stop_super_admin_gets_403_before_any_chat_statement(world: World) -> None:
+    """The Super Admin (no chat.send) on an Editor's chat: 403 ``Forbidden``, no
+    statement on either chat table, no runtime entry."""
     client = make_client(make_app())
-    account = world.by_role(role)  # type: ignore[arg-type]
-    owner = world.a["viewer"] if role == "viewer" else world.a["editor"]
-    chat_id = seed_chat(world.db, owner)
+    account = world.super_admin
+    chat_id = seed_chat(world.db, world.a["editor"])
     before = len(world.db.calls)
 
     response = client.post(_stop_url(chat_id), headers=account.cookie)

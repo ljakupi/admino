@@ -156,7 +156,7 @@ def root(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, root: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database; the
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database; the
     stored platform ``max_input_tokens`` is ``_MAX_INPUT`` (cap 20, the test default)."""
     db = FakeDb()
     built = build_world(db)

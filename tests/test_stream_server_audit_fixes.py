@@ -364,7 +364,7 @@ class _Harness:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database."""
     from tests.db_fakes import FakeDb
 
     db = FakeDb()

@@ -3,8 +3,8 @@
 Contract sections 1 and 4 (``RUN_DIR/contract.md``), issue #24 criteria "Per-user bound on
 the chat runtime" and its integration test, and the Decisions "rate_limit (429) for the
 runtime bound" and "Eviction at global capacity". The app from ``create_app()`` runs
-against the FakeDb world of tests/tenancy_world.py (orgs A and B with an Org Admin, an
-Editor and a Viewer each, real session cookies) around a stub agent (``_Script``, the
+against the FakeDb world of tests/tenancy_world.py (orgs A and B with an Org Admin and
+an Editor each, real session cookies) around a stub agent (``_Script``, the
 pattern of tests/test_chat_turns_api.py: every call bound to ``Agent.run``'s signature,
 scripted results whose history is the received history plus the turn). Small runtimes are
 swapped in AFTER ``make_app`` (``create_app()`` clears the module runtime) on a fake
@@ -301,7 +301,7 @@ class _Clock:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)

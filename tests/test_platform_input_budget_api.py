@@ -284,7 +284,7 @@ def test_platform_input_budget_refusal_runs_no_statement_builds_no_client_and_sk
     assert scoped_settings._platform_cache is cache
 
 
-@pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+@pytest.mark.parametrize("role", ["org_admin", "editor"])
 def test_platform_input_budget_member_gets_403_where_the_super_admin_gets_422(
     db: FakeDb, role: str
 ) -> None:

@@ -23,21 +23,29 @@ an account that passes goes on as today (a role change that keeps ``chat.send``,
 unchanged user, another member's or another org's change), and the run gets the
 request's principal (the approver's user and org).
 
+Both member roles have ``chat.send`` (#306), so a role change that loses it (#306,
+Decision 8: the re-check stays) withdraws ``chat.send`` from the role the member
+moves to, for that test only: the approving Org Admin made an Editor while only Org
+Admins have it (refused), another member made an Org Admin while only Editors have it
+(the approval runs).
+
 Harness: the app from ``create_app()`` on the FakeDb world of tests/tenancy_world.py
-(orgs A and B with an Org Admin, an Editor and a Viewer each, a Super Admin, real
-session cookies), plus a second Editor of org A (the colleague), org A storing
-``memory.store`` at ``confirm``. The REAL ``Agent`` (real tool-call recorder, so every
-dispatch writes its ``tool.call`` row) runs around a fake LLM that always answers a
-final reply; a subclass records the principal of every run. The registry is swapped
-for an unfrozen one holding only ``memory.store`` with a recording handler. The
-Editor's chat awaits the confirmation of that call (its rows stored, the pending
-confirmation in a ``ChatRuntime`` subclass that counts every ``hold()`` call when it
-is made and how many callers are inside a hold). Requests run in the test's event loop
-through one ``httpx.AsyncClient``: a holder task keeps the chat's hold, the confirm is
-started and queued (its ``hold()`` call is counted), the change is made through the
-API (an Org Admin's deactivation, removal or role change; the Super Admin's org
-deactivation or deletion schedule) or, for account rows the API can't produce, in the
-fake's users table, then the hold is released. Every wait is bounded.
+(orgs A and B with an Org Admin and an Editor each, a Super Admin, real session
+cookies), plus a second Editor of org A (the colleague) and, for the demotion, a
+second Org Admin of org A (the approver), org A storing ``memory.store`` at
+``confirm``. The REAL ``Agent`` (real tool-call recorder, so every dispatch writes its
+``tool.call`` row) runs around a fake LLM that always answers a final reply; a
+subclass records the principal of every run. The registry is swapped for an unfrozen
+one holding only ``memory.store`` with a recording handler. The approver's chat (the
+Editor's, or the second Org Admin's) awaits the confirmation of that call (its rows
+stored, the pending confirmation in a ``ChatRuntime`` subclass that counts every
+``hold()`` call when it is made and how many callers are inside a hold). Requests run
+in the test's event loop through one ``httpx.AsyncClient``: a holder task keeps the
+chat's hold, the confirm is started and queued (its ``hold()`` call is counted), the
+change is made through the API (an Org Admin's deactivation, removal or role change;
+the Super Admin's org deactivation or deletion schedule) or, for account rows the API
+can't produce, in the fake's users table, then the hold is released. Every wait is
+bounded.
 
 Security notes:
 - Every id, name, email, password and message here is a fixed fake value; no network,
@@ -54,14 +62,16 @@ import contextlib
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
 import httpx
 import pytest
 from pydantic import BaseModel, Field
 
+from admino import access, org_permissions, scoped_settings, server
 from admino import main as main_module
-from admino import org_permissions, scoped_settings, server
+from admino.access import Capability
 from admino.agent import Agent
 from admino.chat_runtime import ChatRuntime
 from admino.llm import LLMResponse
@@ -119,6 +129,7 @@ _STORE_BLOCK: Final = {
 _SEEDED: Final = (("user", "Earlier question about terns"), ("assistant", "Earlier answer."))
 _NOTICE_MARKER: Final = "PERMISSION UPDATE"
 _COLLEAGUE_EMAIL: Final = "org-a-colleague-editor-298@example.ch"
+_APPROVING_ADMIN_EMAIL: Final = "org-a-approving-admin-298@example.ch"
 _TOOL_CALL_RUN: Final = {
     "tool": "memory",
     "action": "store",
@@ -232,7 +243,7 @@ class _Clock:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database; org A
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database; org A
     stores memory.store at 'confirm'."""
     db = FakeDb()
     built = build_world(db)
@@ -259,6 +270,35 @@ def colleague(world: World) -> Account:
         role="editor",
         email=_COLLEAGUE_EMAIL,
         token=world.db.open_session(user_id),
+    )
+
+
+def _second_org_admin(world: World) -> Account:
+    """A second active Org Admin of org A, with a live session (org A's Org Admin can
+    demote it without hitting the last-admin guard)."""
+    user_id = world.db.add_account(
+        role="org_admin",
+        org_id=world.org_a,
+        email=_APPROVING_ADMIN_EMAIL,
+        password_hash=fake_hash(PASSWORD),
+    )
+    return Account(
+        user_id=user_id,
+        org_id=world.org_a,
+        role="org_admin",
+        email=_APPROVING_ADMIN_EMAIL,
+        token=world.db.open_session(user_id),
+    )
+
+
+def _chat_send_only_for(monkeypatch: pytest.MonkeyPatch, role: str) -> None:
+    """Leave ``chat.send`` to ``role`` alone for this test (#306, Decision 8): both
+    member roles have it, so a role change that loses it needs it withdrawn from the
+    other role."""
+    monkeypatch.setattr(
+        access,
+        "_MATRIX",
+        MappingProxyType({**access._MATRIX, Capability.CHAT_SEND: frozenset({role})}),
     )
 
 
@@ -343,8 +383,8 @@ async def _set_role(http: httpx.AsyncClient, world: World, target: Account, role
 
 
 async def _demote(http: httpx.AsyncClient, world: World, target: Account) -> None:
-    """The target's Org Admin makes the target a Viewer (``PATCH``)."""
-    await _set_role(http, world, target, "viewer")
+    """The target's Org Admin makes the target (an Org Admin) an Editor (``PATCH``)."""
+    await _set_role(http, world, target, "editor")
 
 
 async def _promote_to_admin(http: httpx.AsyncClient, world: World, target: Account) -> None:
@@ -517,10 +557,24 @@ def _answer(response: httpx.Response) -> tuple[int, Any]:
 # 1. A change of the approving user while the approval waits refuses it (Decisions 1-3)
 # ---------------------------------------------------------------------------
 
+# The role change losing chat.send: the approver is a second Org Admin of org A, made an
+# Editor while only Org Admins have chat.send.
+_DEMOTED: Final = "demoted-to-editor"
+
+
+def _approver(world: World, monkeypatch: pytest.MonkeyPatch, change: str) -> Account:
+    """The approving member: org A's Editor; for ``_DEMOTED`` a second Org Admin of org A,
+    with ``chat.send`` left to Org Admins (so the demotion to Editor loses it)."""
+    if change != _DEMOTED:
+        return world.a["editor"]
+    _chat_send_only_for(monkeypatch, "org_admin")
+    return _second_org_admin(world)
+
+
 _REFUSING: Final[dict[str, tuple[_Change, tuple[int, dict[str, str]]]]] = {
     "deactivated": (_deactivate, (401, UNAUTHORIZED)),
     "removed": (_remove, (401, UNAUTHORIZED)),
-    "demoted-to-viewer": (_demote, (403, FORBIDDEN)),
+    _DEMOTED: (_demote, (403, FORBIDDEN)),
     "org-deactivated": (_deactivate_org, (401, UNAUTHORIZED)),
     "org-deletion-scheduled": (_schedule_org_deletion, (401, UNAUTHORIZED)),
 }
@@ -539,17 +593,18 @@ async def test_confirm_account_lock_wait_change_during_the_wait_refuses_like_a_l
     change: str,
     approved: bool,
 ) -> None:
-    """The approving Editor is deactivated, removed from the org, demoted to Viewer, or
-    their org is deactivated or scheduled for deletion while the approval (or denial)
-    waits for the hold: it answers exactly what the same confirm sent after the change
-    with the same cookie answers (401 or 403). Nothing of it runs or is stored: no
-    agent run, no handler call, no ``tool.call`` row, the chat's messages as they were,
-    org A's due promotion of gmail.send not completed (no notice in the Org Admin's
-    chat), no platform settings, promotion or policy read after the change, and the
-    pending confirmation left as it is (a removed user's is dropped with the account)."""
+    """The approving Editor is deactivated or removed from the org, the approving Org
+    Admin is made an Editor (``chat.send`` left to Org Admins), or the approver's org is
+    deactivated or scheduled for deletion while the approval (or denial) waits for the
+    hold: it answers exactly what the same confirm sent after the change with the same
+    cookie answers (401 or 403). Nothing of it runs or is stored: no agent run, no
+    handler call, no ``tool.call`` row, the chat's messages as they were, org A's due
+    promotion of gmail.send not completed (no notice in the Org Admin's chat), no
+    platform settings, promotion or policy read after the change, and the pending
+    confirmation left as it is (a removed user's is dropped with the account)."""
     db = world.db
-    editor, admin = world.a["editor"], world.a["org_admin"]
-    chat_id, pending = _awaiting_chat(db, runtime, editor)
+    approver, admin = _approver(world, monkeypatch, change), world.a["org_admin"]
+    chat_id, pending = _awaiting_chat(db, runtime, approver)
     sibling = seed_chat(db, admin, messages=_SEEDED)
     stored = db.messages_of(chat_id)
     make_change, expected = _REFUSING[change]
@@ -559,18 +614,20 @@ async def test_confirm_account_lock_wait_change_during_the_wait_refuses_like_a_l
         await _promote_gmail_send(http, clock, admin)
 
         async def meanwhile() -> None:
-            await make_change(http, world, editor)
+            await make_change(http, world, approver)
             _spy_reads(monkeypatch, reads)
 
         refused = await _behind_a_holder(
             runtime,
-            editor,
+            approver,
             chat_id,
-            send=lambda: _confirm(http, editor, chat_id, approved=approved),
+            send=lambda: _confirm(http, approver, chat_id, approved=approved),
             meanwhile=meanwhile,
         )
         left = (list(reads), runtime.get_pending(chat_id), db.messages_of(chat_id))
-        later = await asyncio.wait_for(_confirm(http, editor, chat_id, approved=approved), _WAIT_S)
+        later = await asyncio.wait_for(
+            _confirm(http, approver, chat_id, approved=approved), _WAIT_S
+        )
 
     removed = change == "removed"
     assert (_answer(refused), _answer(later)) == (expected, expected)
@@ -592,7 +649,7 @@ async def test_confirm_account_lock_wait_change_during_the_wait_refuses_like_a_l
 
 _ORDER_CHANGES: Final[dict[str, tuple[_Change, tuple[int, dict[str, str]]]]] = {
     "deactivated": (_deactivate, (401, UNAUTHORIZED)),
-    "demoted-to-viewer": (_demote, (403, FORBIDDEN)),
+    _DEMOTED: (_demote, (403, FORBIDDEN)),
 }
 _CHECKS: Final = ["none-pending", "wrong-id", "expired", "body-mismatch"]
 
@@ -608,13 +665,14 @@ async def test_confirm_account_lock_wait_recheck_comes_before_the_confirmation_c
     change: str,
     check: str,
 ) -> None:
-    """A deactivated (or demoted) Editor whose waiting approval would have failed a
-    confirmation check under the hold (nothing pending any more, another id, expired
-    while it waited, the body's id differs: 404 or 400) gets the 401 (403) instead,
-    as the same confirm sent after the change does."""
+    """A deactivated Editor (or an Org Admin made an Editor while only Org Admins have
+    ``chat.send``) whose waiting approval would have failed a confirmation check under
+    the hold (nothing pending any more, another id, expired while it waited, the body's
+    id differs: 404 or 400) gets the 401 (403) instead, as the same confirm sent after
+    the change does."""
     db = world.db
-    editor = world.a["editor"]
-    chat_id, pending = _awaiting_chat(db, runtime, editor)
+    approver = _approver(world, monkeypatch, change)
+    chat_id, pending = _awaiting_chat(db, runtime, approver)
     make_change, expected = _ORDER_CHANGES[change]
     path_id = body_id = _CONFIRMATION_ID
     if check == "wrong-id":
@@ -625,16 +683,16 @@ async def test_confirm_account_lock_wait_recheck_comes_before_the_confirmation_c
     async with _async_client(app) as http:
 
         async def send() -> httpx.Response:
-            return await _confirm(http, editor, chat_id, path_id=path_id, body_id=body_id)
+            return await _confirm(http, approver, chat_id, path_id=path_id, body_id=body_id)
 
         async def meanwhile() -> None:
-            await make_change(http, world, editor)
+            await make_change(http, world, approver)
             if check == "none-pending":
                 runtime.pop_pending(chat_id)
             elif check == "expired":
                 monkeypatch.setattr(server, "_utc_now", lambda: pending.expires_at)
 
-        refused = await _behind_a_holder(runtime, editor, chat_id, send=send, meanwhile=meanwhile)
+        refused = await _behind_a_holder(runtime, approver, chat_id, send=send, meanwhile=meanwhile)
         later = await asyncio.wait_for(send(), _WAIT_S)
 
     assert (_answer(refused), _answer(later), handler.calls) == (expected, expected, [])
@@ -853,11 +911,14 @@ _KEEPING: Final[dict[str, tuple[_Change, str] | None]] = {
     "promoted-to-org-admin": (_promote_to_admin, "approver"),
     "colleague-deactivated": (_deactivate, "colleague"),
     "colleague-removed": (_remove, "colleague"),
-    "colleague-demoted": (_demote, "colleague"),
+    "colleague-loses-chat-send": (_promote_to_admin, "colleague"),
     "org-b-editor-deactivated": (_deactivate, "org-b-editor"),
-    "org-b-editor-demoted": (_demote, "org-b-editor"),
+    "org-b-editor-loses-chat-send": (_promote_to_admin, "org-b-editor"),
     "org-b-deactivated": (_deactivate_org, "org-b-editor"),
 }
+# The cases whose member is made an Org Admin while only Editors have chat.send, so that
+# member loses it (the approving Editor keeps it).
+_LOSING_CHAT_SEND: Final = frozenset({"colleague-loses-chat-send", "org-b-editor-loses-chat-send"})
 
 
 @pytest.mark.parametrize("case", list(_KEEPING))
@@ -868,14 +929,18 @@ async def test_confirm_account_lock_wait_approval_runs_when_the_approver_still_p
     runtime: _WatchedRuntime,
     handler: _Handler,
     agent: _RecordingAgent,
+    monkeypatch: pytest.MonkeyPatch,
     case: str,
 ) -> None:
     """Nothing changes, the approving Editor is promoted to Org Admin (keeps
-    ``chat.send``), another Editor of org A is deactivated, removed or demoted, or org
-    B's Editor or org B itself changes while the approval waits: the approval runs.
-    It answers 200 final, the handler ran once with the approved arguments, one
-    ``tool.call`` row records the confirmed call, and the run got the request's
-    principal (the approver's user id, kind and org)."""
+    ``chat.send``), another Editor of org A is deactivated, removed or made an Org Admin
+    while only Editors have ``chat.send`` (so it loses it), or org B's Editor (likewise)
+    or org B itself changes while the approval waits: the approval runs. It answers 200
+    final, the handler ran once with the approved arguments, one ``tool.call`` row
+    records the confirmed call, and the run got the request's principal (the approver's
+    user id, kind and org)."""
+    if case in _LOSING_CHAT_SEND:
+        _chat_send_only_for(monkeypatch, "editor")
     db = world.db
     editor = world.a["editor"]
     chat_id, _ = _awaiting_chat(db, runtime, editor)

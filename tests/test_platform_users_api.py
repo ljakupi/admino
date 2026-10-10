@@ -35,7 +35,7 @@ What these tests pin down:
   changes on a refusal; a refused replacement records only ``invitation.refuse``.
 - Every route needs a session (401) and ``admino.access.can``:
   ``platform.org_metadata.view`` for the reads, ``platform.users.manage`` for
-  the four actions. Org Admins, Editors and Viewers get 403 ``{"detail":
+  the four actions. Org Admins and Editors get 403 ``{"detail":
   "Forbidden"}`` before any query. A non-UUID id or a bad re-invite body is a
   422 that doesn't echo the input.
 - Rate limits per (route key, Super Admin), checked before any database work;
@@ -145,7 +145,7 @@ _HAS_ACTIVE_ADMIN = {"detail": _HAS_ACTIVE_ADMIN_MESSAGE, "reason": "has_active_
 _USER_KEYS = frozenset({"id", "name", "email", "role", "status", "created_at", "last_login_at"})
 _INVITATION_KEYS = frozenset({"id", "email", "role", "sent_at", "expires_at", "expired"})
 _METADATA_KEYS = frozenset({"seats", "storage_used_bytes", "chat_count", "file_count"})
-_MEMBER_ROLES = ["org_admin", "editor", "viewer"]
+_MEMBER_ROLES = ["org_admin", "editor"]
 _ORG_STATUSES = ["active", "deactivated", "pending_deletion"]
 
 # action -> (method, path template)
@@ -721,7 +721,7 @@ class TestRoutes:
 
 
 class TestAuthorization:
-    """Org Admins, Editors and Viewers get 403 before any query; can() decides."""
+    """Org Admins and Editors get 403 before any query; can() decides."""
 
     @pytest.mark.parametrize("role", _MEMBER_ROLES)
     @pytest.mark.parametrize("action", _ALL)
@@ -790,11 +790,11 @@ class TestUsersList:
         tie = base + timedelta(days=1)
         listed = [
             _admin(db, created_at=base + timedelta(days=3), last_login_at=base + timedelta(days=4)),
-            _user(db, role="viewer", status="deactivated", created_at=tie, email=_TARGET_EMAIL),
+            _user(db, status="deactivated", created_at=tie, email=_TARGET_EMAIL),
             _user(db, created_at=tie, name=_TARGET_NAME),
             _user(db, created_at=tie),
             _invited_admin(db, created_at=base, email=_INVITED_EMAIL)[0],
-            _invited_admin(db, role="viewer", created_at=base + timedelta(days=5))[0],
+            _invited_admin(db, role="editor", created_at=base + timedelta(days=5))[0],
         ]
         _user(db, OTHER_ORG_ID, created_at=base)
         _user(db, created_at=base, deleted_at=base + timedelta(days=2))
@@ -865,7 +865,7 @@ class TestMetadata:
         _admin(db)
         _user(db)
         _invited_admin(db, role="editor")
-        _invited_admin(db, role="viewer", sent_ago=timedelta(hours=100))
+        _invited_admin(db, sent_ago=timedelta(hours=100))
         _user(db, status="deactivated")
         _user(db, deleted_at=datetime.now(UTC) - timedelta(days=1))
         _invited_admin(db, deleted_at=datetime.now(UTC) - timedelta(days=1))
@@ -1627,7 +1627,6 @@ _INELIGIBLE = [
         pytest.param("invitation", kind, body, id=f"{flavour}-{kind}")
         for kind in (
             "invited-editor",
-            "invited-viewer",
             "active-editor",
             "deactivated-admin",
             "invited-admin-without-invitation",
@@ -1664,8 +1663,6 @@ def _ineligible(db: FakeDb, kind: str) -> uuid.UUID:
     """A user of ORG_ID whose status (or role) the action doesn't apply to."""
     if kind in {"invited", "invited-editor"}:
         return _invited_admin(db, role="editor")[0]
-    if kind == "invited-viewer":
-        return _invited_admin(db, role="viewer")[0]
     if kind == "invited-admin-without-invitation":
         return _invited_admin(db, invitation=False)[0]
     if kind == "deactivated-admin":

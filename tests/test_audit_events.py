@@ -354,7 +354,7 @@ _SUPER_ADMIN_ORG_ACTIONS: list[Any] = [
 # ---------------------------------------------------------------------------
 
 _ACCEPTED_VALUES: list[Any] = [
-    *(pytest.param(token, id=f"role-{token}") for token in ("org_admin", "editor", "viewer")),
+    *(pytest.param(token, id=f"role-{token}") for token in ("org_admin", "editor")),
     *(pytest.param(token, id=f"decision-{token}") for token in ("allow", "confirm", "deny")),
     *(
         pytest.param(token, id=f"tool-{token}")
@@ -427,7 +427,9 @@ _REJECTED_VALUES: list[Any] = [
     pytest.param(_BYTE_ORDER_MARK + "editor", id="byte-order-mark"),
     pytest.param(_RTL_OVERRIDE + "editor", id="bidi-override"),
     pytest.param("editor" * 20, id="long-repeated-token"),
-    pytest.param("editor,viewer", id="token-list-in-a-string"),
+    pytest.param("org_admin,editor", id="token-list-in-a-string"),
+    # GH-306: the retired read-only member role is no MemberRole, so no token.
+    pytest.param("viewer", id="retired-role-viewer"),
     pytest.param(str(_PROJECT), id="uuid-string"),
     pytest.param(str(_PROJECT).upper(), id="uuid-string-upper"),
     pytest.param("1", id="numeric-string"),
@@ -1132,9 +1134,17 @@ class TestMetadataVocabulary:
         tools = set(DEFAULT_PERMISSIONS) | {tool for tool, _ in HARDCODED_DENIALS}
         actions = {action for per_tool in DEFAULT_PERMISSIONS.values() for action in per_tool}
         actions |= {action for _, action in HARDCODED_DENIALS}
-        expected = {"org_admin", "editor", "viewer", "allow", "confirm", "deny"} | tools | actions
+        expected = {"org_admin", "editor", "allow", "confirm", "deny"} | tools | actions
 
         assert expected == METADATA_VOCABULARY
+
+    def test_audit_events_vocabulary_holds_the_two_member_roles_only(self) -> None:
+        """GH-306: the member roles in the vocabulary are the Org Admin and the Editor;
+        the retired read-only role "viewer" is no token (the migration's own
+        "viewer_retired" reason isn't one either: only the migration writes it)."""
+        roles = {"org_admin", "editor", "viewer", "viewer_retired"} & METADATA_VOCABULARY
+
+        assert roles == {"org_admin", "editor"}
 
     @pytest.mark.parametrize("token", ["documents", "download", "store", "recall", "send"])
     def test_audit_events_vocabulary_includes_permission_engine_tokens(self, token: str) -> None:
@@ -1242,7 +1252,7 @@ class TestMetadataValidator:
     def test_audit_events_metadata_one_bad_value_rejects_the_event(self) -> None:
         """One content value among valid ones still rejects the whole event."""
         with pytest.raises(ValidationError):
-            _event(metadata={"old_role": "editor", "new_role": "viewer", "note": "Bob asked"})
+            _event(metadata={"old_role": "editor", "new_role": "org_admin", "note": "Bob asked"})
 
 
 # ---------------------------------------------------------------------------
@@ -1434,13 +1444,13 @@ class TestRecordInsert:
 
     async def test_audit_events_record_binds_metadata_as_json_object(self, conn: MagicMock) -> None:
         """metadata binds as a JSON string of the validated dict."""
-        await _record(conn, metadata={"old_role": "editor", "new_role": "viewer", "seats": 5})
+        await _record(conn, metadata={"old_role": "editor", "new_role": "org_admin", "seats": 5})
 
         row = _inserted_row(conn)
         assert isinstance(row["metadata"], str)
         assert json.loads(row["metadata"]) == {
             "old_role": "editor",
-            "new_role": "viewer",
+            "new_role": "org_admin",
             "seats": 5,
         }
 
@@ -1915,14 +1925,14 @@ class TestRecordFailureAborts:
 
         with pytest.raises(AuditRecordError):
             async with conn.transaction():
-                await conn.execute("UPDATE users SET role = $1 WHERE id = $2", "viewer", _USER)
+                await conn.execute("UPDATE users SET role = $1 WHERE id = $2", "org_admin", _USER)
                 steps.append("role changed")
                 await _record(
                     conn,
                     action=AuditAction.USER_ROLE_CHANGE,
                     target_type=TargetType.USER,
                     target_ids=[_USER],
-                    metadata={"old_role": "editor", "new_role": "viewer"},
+                    metadata={"old_role": "editor", "new_role": "org_admin"},
                 )
                 steps.append("after record")
 

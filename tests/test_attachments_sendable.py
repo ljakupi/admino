@@ -149,7 +149,7 @@ def seeded() -> _Seeded:
         page_count=0, token_estimate=0, derived_bytes=0,
         created_at=_T0 + timedelta(seconds=2))  # fmt: skip
     other_chat = seed_chat(db, editor, title="Other")
-    colleague_chat = seed_chat(db, world.a["viewer"], title="Colleague")
+    colleague_chat = seed_chat(db, world.a["org_admin"], title="Colleague")
     other_org_chat = seed_chat(db, world.b["editor"], title="Other org")
     files = {
         "uploaded": add(chat, filename=WAITING_CANARY, kind="docx", status="uploaded"),

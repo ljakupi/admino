@@ -33,8 +33,8 @@ What these tests pin down:
   ``profile.name``), any unknown key and an empty patch. Each error points at
   the offending field (``loc``), so a model that refuses the whole section
   doesn't pass.
-- 401 without a session; 403 ``{"detail": "Forbidden"}`` for the Editor, the
-  Viewer and the Super Admin on both verbs, before any settings read or write;
+- 401 without a session; 403 ``{"detail": "Forbidden"}`` for the Editor and
+  the Super Admin on both verbs, before any settings read or write;
   a cross-site PATCH is refused by the CSRF middleware before the database;
   per-user rate limits (one Org Admin's patch bucket never throttles another
   org's admin).
@@ -1043,7 +1043,7 @@ class TestOrgSettingsAccess:
         assert (response.status_code, response.json()) == (401, _UNAUTHORIZED)
         assert db.calls == []
 
-    @pytest.mark.parametrize("role", ["editor", "viewer", "super_admin"])
+    @pytest.mark.parametrize("role", ["editor", "super_admin"])
     def test_org_settings_api_other_roles_are_403_on_both_verbs_and_touch_nothing(
         self, db: FakeDb, app: FastAPI, role: str
     ) -> None:
@@ -1249,15 +1249,15 @@ class TestOrgSessionPolicy:
     def test_org_settings_api_session_policy_patch_retimes_the_orgs_live_sessions(
         self, db: FakeDb, app: FastAPI
     ) -> None:
-        """The caller's, an editor's and a viewer's live sessions take 30 minutes and
+        """The caller's and two editors' live sessions take 30 minutes and
         created_at + 4 hours; an ended session of the org, org B's and a Super Admin's
         sessions are untouched; the event counts the three."""
         admin, token = _login(db, "org_admin")
         editor = db.add_account(role="editor")
         db.open_session(editor, created_ago=timedelta(hours=2), expires_in=timedelta(hours=10))
-        viewer = db.add_account(role="viewer")
+        colleague = db.add_account(role="editor")
         db.open_session(
-            viewer,
+            colleague,
             idle_timeout_minutes=45,
             last_seen_ago=timedelta(minutes=10),
             created_ago=timedelta(minutes=30),
@@ -1276,7 +1276,7 @@ class TestOrgSessionPolicy:
         response = _patch(_client(app), token, {"security": self._POLICY})
 
         assert response.status_code == 200, response.text
-        for user in (admin, editor, viewer):
+        for user in (admin, editor, colleague):
             row = _one(db.sessions_of(user))
             assert (row["idle_timeout_minutes"], _lifetime(row)) == (30, timedelta(hours=4))
         assert [db.sessions_of(user) for user in (ended, other, root)] == untouched
@@ -1315,7 +1315,7 @@ class TestOrgSessionPolicy:
         old = db.open_session(
             old_user, created_ago=timedelta(hours=5), expires_in=timedelta(hours=7)
         )
-        _, fresh = _login(db, "viewer")
+        _, fresh = _login(db, "editor")
         client = _client(app)
 
         response = _patch(client, token, {"security": {"session_max_lifetime_hours": 4}})

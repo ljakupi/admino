@@ -152,7 +152,7 @@ _WRONG_STATUSES: Final = [
 ]
 _OUTSIDE_CASES: Final = ("other-org", "unknown", "deleted", "super-admin")
 _INACTIVE_OTHER_ADMINS: Final = ("none", "deactivated", "invited", "deleted", "other-org")
-_MEMBER_ROLES: Final = ("org_admin", "editor", "viewer")
+_MEMBER_ROLES: Final = ("org_admin", "editor")
 _ORG_STATUSES: Final = ("active", "deactivated", "pending_deletion")
 
 _SEATS: Final = 10
@@ -371,7 +371,8 @@ def _inactive_other_admin(db: FakeDb, case: str) -> None:
 def _mixed_org(db: FakeDb) -> dict[str, uuid.UUID]:
     """ORG_ID (10 seats) with accounts of every kind, OTHER_ORG_ID (3 seats) with its own.
 
-    Listed for ORG_ID: admin, editor, viewer, deactivated, invited, expired (6). Seats used
+    Listed for ORG_ID: admin, editor, colleague (a second Editor), deactivated,
+    invited, expired (6). Seats used
     in ORG_ID: all of them but the deactivated one (5). Never listed or counted: the
     deleted active, invited and deactivated accounts, the Super Admin and every
     OTHER_ORG_ID account. OTHER_ORG_ID uses 2 seats (its admin and its invited account).
@@ -380,14 +381,14 @@ def _mixed_org(db: FakeDb) -> dict[str, uuid.UUID]:
     ids = {
         "admin": db.add_account(role="org_admin"),
         "editor": db.add_account(role="editor"),
-        "viewer": db.add_account(role="viewer"),
+        "colleague": db.add_account(role="editor"),
         "deactivated": db.add_account(role="editor", status="deactivated"),
         "invited": _invited(db),
         "expired": _invited(db, sent_ago=_EXPIRED_AGO),
     }
     _deleted(db, "active", role="editor")
-    _deleted(db, "invited", role="viewer")
-    _deleted(db, "deactivated", role="viewer")
+    _deleted(db, "invited", role="editor")
+    _deleted(db, "deactivated", role="editor")
     db.add_account(kind="super_admin", role=None)
     db.add_org(OTHER_ORG_ID, seats=3)
     db.add_account(role="org_admin", org_id=OTHER_ORG_ID)
@@ -839,7 +840,7 @@ class TestListUsers:
         account has no name and no last login."""
         db.add_account(role="org_admin", created_at=_CREATED - timedelta(days=30))
         deactivated = db.add_account(
-            role="viewer",
+            role="editor",
             status="deactivated",
             email="Mixed.Case@Example.test",
             name="Ada Beispiel",
@@ -860,7 +861,7 @@ class TestListUsers:
             "id": deactivated,
             "name": "Ada Beispiel",
             "email": "Mixed.Case@Example.test",
-            "role": "viewer",
+            "role": "editor",
             "status": "deactivated",
             "created_at": _CREATED,
             "last_login_at": _LAST_LOGIN,
@@ -1114,8 +1115,8 @@ class TestOrgMetadata:
     async def test_platform_users_metadata_chat_count_is_the_orgs_live_chats(
         self, pu: ModuleType, db: FakeDb
     ) -> None:
-        """GH-176: every member's chat that isn't trashed counts (the Viewer's and the
-        deactivated member's included); a trashed chat and another org's chats don't. The
+        """GH-176: every member's chat that isn't trashed counts (the second Editor's and
+        the deactivated member's included); a trashed chat and another org's chats don't. The
         Super Admin gets a count only: the exact contract keys, no title in the result and
         no statement that reads a title."""
         ids = _mixed_org(db)
@@ -1124,7 +1125,7 @@ class TestOrgMetadata:
             for user_id, row in db.users.items()
             if row["org_id"] == OTHER_ORG_ID and row["role"] == "org_admin"
         )
-        for owner in ("admin", "admin", "editor", "viewer", "deactivated"):
+        for owner in ("admin", "admin", "editor", "colleague", "deactivated"):
             db.add_chat(ids[owner], title=_CHAT_TITLE)
         db.add_chat(ids["editor"], title=_CHAT_TITLE, deleted_at=_CREATED)
         for _ in range(2):
@@ -1254,7 +1255,7 @@ class TestDeactivateUser:
     ) -> None:
         db.add_account(role="org_admin")
         target = db.add_account(
-            role="viewer",
+            role="editor",
             email="summary.target@example.test",
             name="Summary Person",
             created_at=_CREATED,

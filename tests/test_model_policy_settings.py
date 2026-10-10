@@ -1103,7 +1103,7 @@ class TestUpdateModelPolicy:
         assert db.matching(r"^update platform_settings\b") == []
         assert _model_policy(result.llm) == (64_000, False, 1)
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_scoped_settings_update_model_policy_member_is_refused_before_any_query(
         self, svc: ModuleType, db: FakeDb, role: str
     ) -> None:

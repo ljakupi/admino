@@ -20,8 +20,8 @@ reauthenticate" and "server.py routes"):
   each: session (401) -> per-user rate limit (429, keys
   ``/api/org/critical-permissions/{get,promote,cancel}`` with (1.0, 5),
   (5/60, 5), (0.5, 5), before any database work) -> ``org.permissions.manage``
-  (403 ``{"detail": "Forbidden"}`` for an Editor, a Viewer and the Super Admin,
-  before any database work) -> work. Cross-origin PATCH / DELETE -> 403.
+  (403 ``{"detail": "Forbidden"}`` for an Editor and the Super Admin, before
+  any database work) -> work. Cross-origin PATCH / DELETE -> 403.
 - The old ``/api/critical-permissions*`` routes and rate-limit keys are gone,
   and so are ``server._pending_promotions``, ``_promoted_permissions``,
   ``_resolve_pending_promotions`` and ``_PROMOTION_COOLDOWN_S``.
@@ -186,7 +186,7 @@ _REMOVED_SERVER_GLOBALS: Final = [
     "_resolve_pending_promotions",
     "_PROMOTION_COOLDOWN_S",
 ]
-_NON_ADMIN_ROLES: Final = ["editor", "viewer", "super_admin"]
+_NON_ADMIN_ROLES: Final = ["editor", "super_admin"]
 # SQL a refused or rate-limited request must never run (session lookups are fine).
 _WORK_SQL: Final = re.compile(r"\b(?:permissions|audit_events|login_throttle)\b")
 _PERMISSION_AUDIT_PREFIX: Final = "org.permission"

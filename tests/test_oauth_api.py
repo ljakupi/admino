@@ -18,11 +18,14 @@ What these tests pin down:
   session. The callback is public, because it is the provider's cross-site
   redirect.
 - Roles (GH-162): every session route checks ``oauth.connect`` through
-  access.py. Org Admins and Editors get the route's normal answer. Viewers and
-  Super Admins get 403 ``{"detail": "Forbidden"}``: their request stores no
-  pending state, sets no cookie and runs no oauth_tokens statement. A demoted
-  user's rows stay in the database (403 on every route) and are reported again
-  once the role allows ``oauth.connect``.
+  access.py. Org Admins and Editors get the route's normal answer. The Super
+  Admin, and a member whose role lacks the capability, get 403 ``{"detail":
+  "Forbidden"}``: their request stores no pending state, sets no cookie and
+  runs no oauth_tokens statement. Every member role holds ``oauth.connect``, so
+  a member's refusal is reached by withdrawing it from the Editor's grant in
+  ``access._MATRIX`` for that test. A user whose role loses it keeps their rows
+  in the database (403 on every route), reported again once the role allows
+  ``oauth.connect``.
 - Residency: authorize in a residency org is a 403 with
   ``server.OAUTH_RESIDENCY_DETAIL``, with nothing stored and no cookie. Status
   still answers 200 with ``data_residency: true`` and the kept row. Disconnect
@@ -46,7 +49,7 @@ What these tests pin down:
     cookie, older than 600 s, or the initiating session ended or belongs to
     someone else;
   - ``denied``, ``missing_code``;
-  - ``forbidden``: the initiator is now a Viewer;
+  - ``forbidden``: the initiator's role no longer allows ``oauth.connect``;
   - ``residency``, ``exchange_failed``.
   The pending state is one-shot (a replay is invalid_state). The session, role
   and residency checks run before any token-endpoint call. Every redirect
@@ -77,6 +80,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
@@ -85,7 +89,8 @@ import pytest
 from cryptography.fernet import Fernet
 from httpx import ASGITransport, AsyncClient
 
-from admino import oauth, server
+from admino import access, oauth, server
+from admino.access import Capability
 from admino.config import AppConfig
 from admino.oauth import OAuthError, encrypt_refresh_token
 from admino.server import create_app
@@ -343,6 +348,15 @@ def _sign_in(
     return caller
 
 
+def _withdraw_oauth_connect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Grant ``oauth.connect`` to Org Admins only, for this test: an Editor lacks it."""
+    monkeypatch.setattr(
+        access,
+        "_MATRIX",
+        MappingProxyType({**access._MATRIX, Capability.OAUTH_CONNECT: frozenset({"org_admin"})}),
+    )
+
+
 def _seed_token(
     db: FakeDb,
     user_id: uuid.UUID,
@@ -552,16 +566,22 @@ class TestOAuthRoles:
 
     @pytest.mark.parametrize("provider", _PROVIDERS)
     @pytest.mark.parametrize("action", _ACTIONS)
-    @pytest.mark.parametrize("role", ["viewer", "super_admin"])
+    @pytest.mark.parametrize(
+        "role",
+        [pytest.param("editor", id="editor-without-oauth-connect"), "super_admin"],
+    )
     async def test_oauth_role_without_oauth_connect_gets_403_and_touches_nothing(
         self,
         db: FakeDb,
         provider_calls: _ProviderCalls,
+        monkeypatch: pytest.MonkeyPatch,
         role: str,
         action: str,
         provider: str,
     ) -> None:
-        """A Viewer or Super Admin: 403 Forbidden, no state, no cookie, no token statement."""
+        """An Editor whose role lacks oauth.connect, or the Super Admin: 403 Forbidden,
+        no state, no cookie, no token statement."""
+        _withdraw_oauth_connect(monkeypatch)
         app = _app()
         caller = _sign_in(app, db, role)
         other = _account(db, "editor")
@@ -609,13 +629,15 @@ class TestOAuthRoles:
             assert all(_binds(call, caller.user_id) for call in deletes)
 
     @pytest.mark.parametrize("provider", _PROVIDERS)
-    async def test_oauth_viewer_in_a_residency_org_gets_forbidden_before_residency(
-        self, db: FakeDb, provider: str
+    async def test_oauth_member_without_oauth_connect_in_a_residency_org_gets_forbidden_first(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch, provider: str
     ) -> None:
-        """The role check runs first: a Viewer gets Forbidden, not the residency text."""
+        """The role check runs first: a member whose role lacks oauth.connect gets
+        Forbidden, not the residency text."""
+        _withdraw_oauth_connect(monkeypatch)
         db.orgs[ORG_ID]["data_residency"] = True
         app = _app()
-        _sign_in(app, db, "viewer")
+        _sign_in(app, db, "editor")
 
         resp = await _send(app, "authorize", provider)
 
@@ -1086,6 +1108,7 @@ class _Flow:
     age: float = 0.0
     seed: bool = True
     exchange_fails: bool = False
+    oauth_connect_withdrawn: bool = False
 
     def pending(self) -> Any:
         return server.OAuthPendingState(
@@ -1149,8 +1172,8 @@ def _initiator_deactivated(flow: _Flow) -> None:
     flow.db.users[flow.initiator.user_id]["status"] = "deactivated"
 
 
-def _initiator_now_viewer(flow: _Flow) -> None:
-    flow.db.users[flow.initiator.user_id]["role"] = "viewer"
+def _initiator_without_oauth_connect(flow: _Flow) -> None:
+    flow.oauth_connect_withdrawn = True
 
 
 def _org_residency_on(flow: _Flow) -> None:
@@ -1177,7 +1200,9 @@ _ERRORS: Final[list[Any]] = [
     pytest.param(_session_idle, "invalid_state", id="session-idle"),
     pytest.param(_session_of_another_user, "invalid_state", id="session-of-another-user"),
     pytest.param(_initiator_deactivated, "invalid_state", id="initiator-deactivated"),
-    pytest.param(_initiator_now_viewer, "forbidden", id="initiator-now-viewer"),
+    pytest.param(
+        _initiator_without_oauth_connect, "forbidden", id="initiator-without-oauth-connect"
+    ),
     pytest.param(_org_residency_on, "residency", id="org-residency-on"),
     pytest.param(_exchange_fails, "exchange_failed", id="exchange-error"),
 ]
@@ -1197,7 +1222,7 @@ _RETRYABLE_ERRORS: Final = [
         "other-binding-cookie",
         "provider-error",
         "missing-code",
-        "initiator-now-viewer",
+        "initiator-without-oauth-connect",
         "org-residency-on",
         "exchange-error",
     }
@@ -1222,7 +1247,11 @@ class TestOAuthCallbackErrors:
         if flow.exchange_fails:
             for mock in provider_calls.exchange.values():
                 mock.side_effect = OAuthError("exchange failed")
-        resp = await _callback(app, flow.params, state_cookie=flow.cookie)
+        # The initiator's role lacks oauth.connect for this request only.
+        with pytest.MonkeyPatch.context() as patch_matrix:
+            if flow.oauth_connect_withdrawn:
+                _withdraw_oauth_connect(patch_matrix)
+            resp = await _callback(app, flow.params, state_cookie=flow.cookie)
         return app, flow, resp
 
     @pytest.mark.parametrize("provider", _PROVIDERS)
@@ -1302,8 +1331,8 @@ class TestOAuthCallbackErrors:
         provider: str,
     ) -> None:
         """Once refused, the same state can't complete, even as a correct request."""
-        app, flow, first = await self._attempt(db, provider_calls, setup, provider)
-        db.users[flow.initiator.user_id]["role"] = "editor"
+        app, _, first = await self._attempt(db, provider_calls, setup, provider)
+        # _attempt gave oauth.connect back after the first request; put the rest right.
         db.orgs[ORG_ID]["data_residency"] = False
         for mock in provider_calls.exchange.values():
             mock.side_effect = None
@@ -1597,21 +1626,23 @@ class TestOAuthDisconnect:
 
 
 class TestOAuthDemotion:
-    """A demoted user's rows stay; the routes refuse until the role allows oauth.connect."""
+    """A user whose role loses oauth.connect keeps their rows; the routes refuse until
+    the role allows it. No member role lacks it, so these tests withdraw it from the
+    Editor's grant."""
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_oauth_demoted_viewer_is_refused_everywhere_and_keeps_the_rows(
-        self, db: FakeDb
+    async def test_oauth_role_losing_oauth_connect_is_refused_everywhere_and_keeps_the_rows(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Real session resolution: the Viewer role read from the database gets 403 on every
-        session route; no row is touched."""
+        """Real session resolution: the Editor role read from the database, without
+        oauth.connect, gets 403 on every session route; no row is touched."""
         app = _app()
         caller = _account(db, "editor")
         for provider in _PROVIDERS:
             _seed_token(db, caller.user_id, provider)
         rows = _token_rows(db)
-        db.users[caller.user_id]["role"] = "viewer"
+        _withdraw_oauth_connect(monkeypatch)
 
         async with _client(app) as client:
             responses = [
@@ -1625,13 +1656,16 @@ class TestOAuthDemotion:
         assert _token_rows(db) == rows
         assert server._oauth_pending_states == {}
 
-    async def test_oauth_promoted_back_to_editor_sees_the_kept_rows(self, db: FakeDb) -> None:
-        """Viewer, then Editor again: both connections are reported connected."""
+    async def test_oauth_promoted_to_a_role_with_oauth_connect_sees_the_kept_rows(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An Editor without oauth.connect, then promoted to Org Admin: both connections
+        are reported connected."""
         app = _app()
         caller = _account(db, "editor")
         for provider in _PROVIDERS:
             _seed_token(db, caller.user_id, provider)
-        db.users[caller.user_id]["role"] = "viewer"
+        _withdraw_oauth_connect(monkeypatch)
 
         async with _client(app) as client:
             refused = [
@@ -1640,7 +1674,7 @@ class TestOAuthDemotion:
                 )
                 for provider in _PROVIDERS
             ]
-            db.users[caller.user_id]["role"] = "editor"
+            db.users[caller.user_id]["role"] = "org_admin"
             restored = [
                 await client.get(
                     f"/api/oauth/{provider}/status", headers=session_cookie(caller.token)
@@ -1667,10 +1701,11 @@ class TestOAuthRateLimits:
     async def test_oauth_session_route_bucket_is_per_user_and_before_the_role_check(
         self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A Viewer spends its own bucket (403, 403, then 429); an Editor is unaffected."""
+        """The Super Admin (refused by the role check) spends their own bucket (403, 403,
+        then 429); an Editor is unaffected."""
         monkeypatch.setitem(server._RATE_LIMITS, "/api/oauth/google/status", (0.001, 2))
         app = _app()
-        viewer = _sign_in(app, db, "viewer")
+        refused = _sign_in(app, db, "super_admin")
 
         async with _client(app) as client:
             statuses = [
@@ -1681,7 +1716,7 @@ class TestOAuthRateLimits:
 
         assert statuses == [403, 403, 429]
         assert editor.status_code == 200
-        assert ("/api/oauth/google/status", f"user:{viewer.user_id}") in server._rate_buckets
+        assert ("/api/oauth/google/status", f"user:{refused.user_id}") in server._rate_buckets
 
     async def test_oauth_callback_bucket_is_per_client_ip_and_spends_no_state(
         self, db: FakeDb, monkeypatch: pytest.MonkeyPatch

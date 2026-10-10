@@ -16,14 +16,15 @@ org A -> org B 404 cases) can't say on its own:
   Admin's list holds only its own items, and the Org Admin's ``DELETE
   /api/trash`` purges only its own; the Editor's items stay reachable after
   each refusal.
-- Roles: a Viewer who owns trashed items (seeded before a demotion) and the
-  Super Admin get ``403 {"detail": "Forbidden"}`` on all seven trash routes
-  and nothing changes.
+- Roles: the Super Admin gets ``403 {"detail": "Forbidden"}`` on all seven
+  trash routes and nothing changes (GH-306: every member role has
+  ``chat.send``; an Editor whose ``chat.send`` is refused is pinned on each
+  trash route in tests/test_tenancy_roles.py).
 - No response, log record (DEBUG, JSON, as an operator would see it) or audit
   row of these refusals names the other user's chat title or file name.
 
-Harness: the world of tests/tenancy_world.py (orgs A and B with an Org Admin,
-an Editor and a Viewer each, a Super Admin; real session cookies) over the
+Harness: the world of tests/tenancy_world.py (orgs A and B with an Org Admin
+and an Editor each, a Super Admin; real session cookies) over the
 FakeDb of tests/db_fakes.py, the app from ``create_app()`` with a stub agent,
 and a per-test attachments root under ``tmp_path``. Each owner's trash is a
 trashed chat (a message, a file trashed with it), a file it deleted on its own
@@ -382,18 +383,17 @@ class TestColleagueTrash:
     def test_trash_isolation_org_admin_lists_only_its_own_trash(
         self, world: World, client: TestClient
     ) -> None:
-        """Org A's Org Admin, Editor and Viewer each have a trash: the Org Admin lists
-        only its own two items (none of the Editor's or the Viewer's, no colleague's
-        name), the Editor only its own."""
+        """Org A's Org Admin and Editor each have a trash: the Org Admin lists only its
+        own two items (none of the Editor's, no colleague's name), the Editor only its
+        own."""
         admin = _seed_trash(world, world.a["org_admin"], "Admin-A-194")
         editor = _seed_trash(world, world.a["editor"], "Zephyr-A-194")
-        viewer = _seed_trash(world, world.a["viewer"], "Viewer-A-194")
 
         admin_view = client.get("/api/trash", headers=admin.owner.cookie)
 
         assert admin_view.status_code == 200, admin_view.text
         assert {item["id"] for item in admin_view.json()["items"]} == admin.items
-        assert [m for m in (editor.marker, viewer.marker) if m in admin_view.text] == []
+        assert editor.marker not in admin_view.text
         assert _listed(client, editor.owner) == editor.items
 
     @pytest.mark.parametrize(("caller_role", "owner_role"), _COLLEAGUES)
@@ -456,25 +456,22 @@ class TestColleagueTrash:
 
 
 # ---------------------------------------------------------------------------
-# 3. Roles: a Viewer (items from before a demotion) and the Super Admin get 403
+# 3. Roles: the Super Admin gets 403
 # ---------------------------------------------------------------------------
 
 
 class TestRefusedRoles:
-    """``chat.send`` gates every trash route: a Viewer and the Super Admin are refused
-    before anything is read or changed."""
+    """``chat.send`` gates every trash route: the Super Admin is refused before anything
+    is read or changed."""
 
-    @pytest.mark.parametrize("role", ["viewer", "super_admin"])
+    @pytest.mark.parametrize("role", ["super_admin"])
     def test_trash_isolation_refused_role_gets_403_on_every_trash_route_and_nothing_changes(
         self, world: World, client: TestClient, role: Role
     ) -> None:
-        """The Viewer naming its own items (trashed before its demotion) and the Super
-        Admin naming org A's Editor's: ``403 {"detail": "Forbidden"}`` on all seven
-        routes, and no row, file, audit row or runtime entry changes."""
+        """The Super Admin naming org A's Editor's items: ``403 {"detail": "Forbidden"}``
+        on all seven routes, and no row, file, audit row or runtime entry changes."""
         caller = world.by_role(role)
-        target = _seed_trash(
-            world, world.a["viewer"] if role == "viewer" else world.a["editor"], "Zephyr-A-194"
-        )
+        target = _seed_trash(world, world.a["editor"], "Zephyr-A-194")
         requests = _every_trash_request(target)
         before = _state(world)
 

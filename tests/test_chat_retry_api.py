@@ -1,8 +1,8 @@
 """HTTP spec of POST /api/chats/{chat_id}/retry, the JSON run (GH-245, contract C4).
 
 The app from ``create_app()`` runs against the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, plus a Super Admin, all with real session cookies) around a stub agent
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, plus
+a Super Admin, all with real session cookies) around a stub agent
 (``_Script``): its ``run`` binds every call to the real ``Agent.run``
 signature, records what it got (history copied at call time, the keyword names)
 and answers a scripted ``AgentResult`` whose ``history`` is the history it
@@ -12,8 +12,8 @@ last message carries the status (``error`` on the assistant reply, ``stopped``
 on a partial reply, on a ``tool`` row or on the user row itself).
 
 What is pinned:
-- Who: Org Admin and Editor retry their own failed chat (200); Viewer and Super
-  Admin get 403 before any chat statement; 401 without a session; a cross-origin
+- Who: Org Admin and Editor retry their own failed chat (200); the Super Admin
+  gets 403 before any chat statement; 401 without a session; a cross-origin
   POST is the CSRF 403 (the same request same-origin runs); a non-UUID id is the
   422 validation list. Unknown, another org's, a colleague's and a trashed chat
   answer the identical 404 ``chat_not_found``. Every refusal runs nothing,
@@ -471,7 +471,7 @@ class _Script:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)
@@ -593,16 +593,13 @@ def test_chat_retry_member_with_chat_send_retries_their_failed_chat(
     assert [run.user_message for run in script.runs] == [_MESSAGE]
 
 
-@pytest.mark.parametrize("role", ["viewer", "super_admin"])
-def test_chat_retry_viewer_and_super_admin_get_403_before_any_chat_statement(
-    world: World, client: TestClient, agent: MagicMock, role: str
+def test_chat_retry_super_admin_gets_403_before_any_chat_statement(
+    world: World, client: TestClient, agent: MagicMock
 ) -> None:
-    """A Viewer's own failed chat (kept from before a demotion) and, for the Super Admin,
-    an Editor's failed chat: 403 ``Forbidden``, no run, no statement on either chat
-    table, nothing changed."""
-    account = world.by_role(role)  # type: ignore[arg-type]
-    owner = world.a["viewer"] if role == "viewer" else world.a["editor"]
-    failed = _failed_chat(world.db, owner.user_id)
+    """The Super Admin (no chat.send) on an Editor's failed chat: 403 ``Forbidden``, no
+    run, no statement on either chat table, nothing changed."""
+    account = world.super_admin
+    failed = _failed_chat(world.db, world.a["editor"].user_id)
     before = _snapshot(world.db, failed.chat_id)
     runtime = chat_runtime_state(world.db)
     calls = len(world.db.calls)

@@ -509,7 +509,7 @@ def root(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, root: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) behind the fake database, the attachments root at
+    """Orgs A and B (OA/ED each) behind the fake database, the attachments root at
     ``root`` and the default platform of this file (budget 9000)."""
     db = FakeDb()
     built = build_world(db)

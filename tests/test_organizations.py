@@ -15,7 +15,7 @@ What these tests pin down (the spec: the issue, its decisions, tracker #139 §5)
   is no module constant any more (``DELETION_GRACE_PERIOD`` is gone).
 - Authorization through ``access.can`` before any query: a Super Admin only
   (``org.create``, ``org.lifecycle.manage``, ``org.limits.manage``,
-  ``org.residency.manage``); Org Admins, Editors and Viewers get
+  ``org.residency.manage``); Org Admins and Editors get
   ``PermissionError``; an ``access.Operator`` is accepted by ``create_org`` only.
 - create_org, in one committed transaction: the organizations row, its tool
   permission matrix (GH-161: ``org_permissions.seed_org_permissions``, the 34
@@ -142,7 +142,7 @@ _DEFAULT_ORG_ID = uuid.UUID("00000000-0000-4000-8000-000000000001")
 _NOT_FOUND = "Organization not found"
 _INVALID_STATUS = "This change isn't possible in the organization's current status."
 _DUPLICATE = "A user with this email already exists."
-_MEMBER_ROLES = ["org_admin", "editor", "viewer"]
+_MEMBER_ROLES = ["org_admin", "editor"]
 _STATUSES = ["active", "deactivated", "pending_deletion"]
 _OLD = datetime(2025, 1, 2, 3, 4, 5, tzinfo=UTC)
 _DELETED_AT = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
@@ -559,8 +559,8 @@ class TestAuthorization:
     async def test_organizations_members_are_refused_before_any_query(
         self, orgs: ModuleType, db: FakeDb, name: str, role: str
     ) -> None:
-        """An Org Admin, Editor or Viewer gets PermissionError("Forbidden"); nothing is
-        read or written."""
+        """An Org Admin or Editor gets PermissionError("Forbidden"); nothing is read or
+        written."""
         actor = _member(db, role)
         before = _state(db)
 
@@ -1466,9 +1466,9 @@ def _org_people(db: FakeDb) -> tuple[list[uuid.UUID], list[str]]:
     users = [
         db.add_account(role="org_admin"),
         db.add_account(role="editor"),
-        db.add_account(role="viewer"),
+        db.add_account(role="editor"),
         db.add_account(role="editor", status="deactivated"),
-        db.add_account(role="viewer", status="invited", name=None, password_hash=None),
+        db.add_account(role="editor", status="invited", name=None, password_hash=None),
         db.add_account(role="org_admin", deleted_at=_DELETED_AT),
     ]
     tokens = _sessions(db, users[0], users[0], *users[1:])
@@ -1505,7 +1505,7 @@ class TestSessionRevocation:
             actor.user_id,
             db.add_account(kind="super_admin", role=None),
             db.add_account(role="org_admin", org_id=OTHER_ORG_ID),
-            db.add_account(role="viewer", org_id=OTHER_ORG_ID),
+            db.add_account(role="editor", org_id=OTHER_ORG_ID),
         )
 
         await _transition(orgs, db, name, actor)
@@ -1583,8 +1583,8 @@ class TestScheduleDeletion:
         self, orgs: ModuleType, db: FakeDb, start: str
     ) -> None:
         """One org_deletion_scheduled email per active, non-deleted Org Admin of the org,
-        in their language; not editors, viewers, invited, deactivated or deleted admins,
-        nor other orgs' admins or Super Admins."""
+        in their language; not editors, invited, deactivated or deleted admins, nor other
+        orgs' admins or Super Admins."""
         db.add_org(ORG_ID, status=start)
         actor = _super_admin(db)
         admin_de = db.add_account(role="org_admin", ui_language="de")
@@ -1593,7 +1593,6 @@ class TestScheduleDeletion:
         db.add_account(role="org_admin", status="invited", name=None, password_hash=None)
         db.add_account(role="org_admin", deleted_at=_DELETED_AT)
         db.add_account(role="editor")
-        db.add_account(role="viewer")
         db.add_account(role="org_admin", org_id=OTHER_ORG_ID)
         db.add_account(kind="super_admin", role=None)
 
@@ -2036,11 +2035,11 @@ def _populate(db: FakeDb, org_id: uuid.UUID, root: Path, super_admin: uuid.UUID)
     users = [
         db.add_account(role="org_admin", org_id=org_id),
         db.add_account(role="editor", org_id=org_id),
-        db.add_account(role="viewer", org_id=org_id, ui_language="fr"),
+        db.add_account(role="editor", org_id=org_id, ui_language="fr"),
         db.add_account(
             role="editor", org_id=org_id, status="invited", name=None, password_hash=None
         ),
-        db.add_account(role="viewer", org_id=org_id, status="deactivated"),
+        db.add_account(role="editor", org_id=org_id, status="deactivated"),
         db.add_account(role="editor", org_id=org_id, deleted_at=_DELETED_AT),
     ]
     _sessions(db, users[0], users[0], users[1], users[4], users[5])
@@ -2564,7 +2563,7 @@ def _user_joins_after_the_users_delete(
     def joining(method: str, sql: str, args: tuple[Any, ...], via: str, tx: int | None) -> Any:
         result = handle(method, sql, args, via, tx)
         if not joined and norm(sql).startswith("delete from users"):
-            joined.append(db.add_account(org_id=org_id, role="viewer"))
+            joined.append(db.add_account(org_id=org_id, role="editor"))
         return result
 
     monkeypatch.setattr(db, "handle", joining)

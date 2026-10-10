@@ -1,8 +1,8 @@
 """HTTP spec of retrying a failed answer with the REAL agent (GH-245, contract C4, Decision 3).
 
 The app from ``create_app()`` runs against the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, all with real session cookies) around the REAL ``admino.agent.Agent``
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, all
+with real session cookies) around the REAL ``admino.agent.Agent``
 with the real tool-call recorder of ``main._build_tool_call_recorder()``. Its
 LLM is a scripted fake keyed by the turn's user message (the n-th call of a
 run returns the n-th scripted step, counted by the assistant turns after the
@@ -343,7 +343,7 @@ class _Tools:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)

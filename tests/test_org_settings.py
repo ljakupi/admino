@@ -7,7 +7,7 @@ instead of the retired code default (``sessions.DEFAULT_ORG_SESSION_POLICY``).
 
 What these tests pin down:
 - ``get_org_settings(pool, *, actor)``: ``org.settings.manage`` before any
-  query (Editor, Viewer and Super Admin get ``PermissionError`` and nothing is
+  query (Editor and Super Admin get ``PermissionError`` and nothing is
   read). The org is the actor's own (a bind parameter). The response holds the
   profile (``organizations.name`` / ``default_response_language``), the
   instructions, the session policy and the trash retention (``org_settings``;
@@ -103,7 +103,7 @@ _POLICY_SQL = (
     "SELECT session_idle_timeout_minutes, session_max_lifetime_hours "
     "FROM org_settings WHERE org_id = $1"
 )
-_REFUSED_ROLES = ["editor", "viewer", "super_admin"]
+_REFUSED_ROLES = ["editor", "super_admin"]
 
 # Org A as _seed_a stores it, read with the platform's default trash bounds (0..90).
 _A_RESPONSE: dict[str, Any] = {
@@ -425,19 +425,20 @@ def _log_text(caplog: pytest.LogCaptureFixture) -> str:
 
 
 def _open_org_sessions(db: FakeDb, admin: Principal) -> tuple[list[str], list[str]]:
-    """Open live sessions: three of org A (the Org Admin's, an Editor's and a Viewer's,
-    created two hours ago) and two others (an org B admin's and a Super Admin's).
+    """Open live sessions: three of org A (the Org Admin's, an Editor's and another
+    Editor's, created two hours ago) and two others (an org B admin's and a Super
+    Admin's).
 
     Returns (org A tokens, other tokens).
     """
     editor = db.add_account(role="editor", org_id=ORG_ID)
-    viewer = db.add_account(role="viewer", org_id=ORG_ID)
+    colleague = db.add_account(role="editor", org_id=ORG_ID)
     other = db.add_account(role="org_admin", org_id=OTHER_ORG_ID)
     super_admin = db.add_account(kind="super_admin", role=None)
     mine = [
         db.open_session(admin.user_id),
         db.open_session(editor),
-        db.open_session(viewer, created_ago=timedelta(hours=2), expires_in=timedelta(hours=10)),
+        db.open_session(colleague, created_ago=timedelta(hours=2), expires_in=timedelta(hours=10)),
     ]
     others = [db.open_session(other), db.open_session(super_admin)]
     return mine, others
@@ -1280,9 +1281,9 @@ class TestOrgSessionsFollowThePolicy:
 
         _seed_a(db)
         admin = _actor(db, "org_admin")
-        viewer = db.add_account(role="viewer", org_id=ORG_ID)
+        editor = db.add_account(role="editor", org_id=ORG_ID)
         super_admin = db.add_account(kind="super_admin", role=None)
-        token = db.open_session(viewer, last_seen_ago=timedelta(minutes=40))
+        token = db.open_session(editor, last_seen_ago=timedelta(minutes=40))
         sa_token = db.open_session(super_admin, last_seen_ago=timedelta(minutes=40))
 
         await _update(svc, db, admin, {"security": {"session_idle_timeout_minutes": 30}})
@@ -1299,13 +1300,13 @@ class TestOrgSessionsFollowThePolicy:
         _seed_a(db)
         admin = _actor(db, "org_admin")
         editor = db.add_account(role="editor", org_id=ORG_ID)
-        viewer = db.add_account(role="viewer", org_id=ORG_ID)
+        colleague = db.add_account(role="editor", org_id=ORG_ID)
         db.open_session(admin.user_id)
         ended = [
             db.open_session(
                 editor, created_ago=timedelta(hours=13), expires_in=timedelta(hours=-1)
             ),
-            db.open_session(viewer, last_seen_ago=timedelta(minutes=90)),
+            db.open_session(colleague, last_seen_ago=timedelta(minutes=90)),
         ]
         ended_before = [copy.deepcopy(db.session(token)) for token in ended]
 

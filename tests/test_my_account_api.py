@@ -120,7 +120,7 @@ _ACCOUNT_COLUMNS: Final = (
 _AUTH_ME_KEYS: Final = frozenset(
     {"user_id", "kind", "org_id", "role", "ui_language", "response_language"}
 )
-_ROLES: Final = ("org_admin", "editor", "viewer", "super_admin")
+_ROLES: Final = ("org_admin", "editor", "super_admin")
 
 _NEW_ROUTES: Final[list[tuple[str, str]]] = [
     ("GET", _ME),
@@ -550,7 +550,7 @@ class TestGetAccount:
         instructions = "Sign off as Lina.\nKeep it short."
         _, token = _signed_in(
             db,
-            "viewer",
+            "editor",
             email=_EMAIL,
             name="Lina Muster",
             ui_language="fr",
@@ -1435,7 +1435,7 @@ class TestRateLimitsAndCapability:
 
 
 class TestEveryRole:
-    """Capability.ACCOUNT_MANAGE: Org Admin, Editor, Viewer and Super Admin."""
+    """Capability.ACCOUNT_MANAGE: Org Admin, Editor and Super Admin."""
 
     @pytest.mark.parametrize("who", _ROLES)
     @pytest.mark.parametrize("action", _ACTIONS)

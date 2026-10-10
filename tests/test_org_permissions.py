@@ -61,8 +61,9 @@ replaced by an AsyncMock where its own behaviour isn't the subject
 in ``TestPromotionWithRealReauth``.
 
 Security notes:
-- Least privilege: only an Org Admin manages the matrix; Editors and Viewers
-  read the summary; the Super Admin reaches neither (operator blindness).
+- Least privilege: only an Org Admin manages the matrix; every member (Org
+  Admins and Editors) reads the summary; the Super Admin reaches neither
+  (operator blindness).
 - Tenant isolation: the org always comes from the principal; another org's id
   is never bound and its rows and pending promotions never change.
 - Fail closed: hardcoded denials can't be changed through the matrix, a stored
@@ -157,7 +158,7 @@ _REFUSED = [
     *(
         pytest.param(name, role, id=f"{name}-{role}")
         for name in _MANAGE_FUNCTIONS
-        for role in ("editor", "viewer", "super_admin")
+        for role in ("editor", "super_admin")
     ),
     pytest.param("permissions_summary", "super_admin", id="permissions_summary-super_admin"),
 ]
@@ -582,7 +583,7 @@ class TestAuthorization:
         assert _state(db) == before
         reauth.assert_not_awaited()
 
-    @pytest.mark.parametrize("role", ["editor", "viewer", "super_admin"])
+    @pytest.mark.parametrize("role", ["editor", "super_admin"])
     async def test_org_permissions_refused_promotion_leaves_nothing_pending(
         self, svc: ModuleType, db: FakeDb, reauth: AsyncMock, role: str
     ) -> None:
@@ -595,7 +596,7 @@ class TestAuthorization:
 
         assert (await _critical(svc, db, admin))[("gmail", "send")] == ("deny", None)
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_org_permissions_summary_is_open_to_every_member_role(
         self, svc: ModuleType, db: FakeDb, role: str
     ) -> None:
@@ -975,15 +976,17 @@ class TestLoadToolPolicy:
         assert check_permission("gmail", "read", policy.permissions).allowed == "deny"
 
     async def test_org_permissions_policy_needs_no_capability(
-        self, svc: ModuleType, db: FakeDb
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The server loads it for any member's chat run (a Viewer's included)."""
+        """The server loads it for any member's chat run: it never asks access.can."""
         db.add_permissions(ORG_ID)
-        viewer = _actor(db, "viewer")
+        editor = _actor(db, "editor")
+        spy = _CanSpy(monkeypatch, svc)
 
-        policy = await svc.load_tool_policy(db.pool, _tenant(viewer))
+        policy = await svc.load_tool_policy(db.pool, _tenant(editor))
 
         assert policy.permissions == build_default_permissions_config()
+        assert spy.capabilities == []
 
     async def test_org_permissions_policy_load_writes_nothing(
         self, svc: ModuleType, db: FakeDb
@@ -1047,7 +1050,7 @@ class TestResidencyGating:
     switches say; memory keeps its stored switch; the matrix and the promotions are
     unchanged; nothing is written; another org is never affected."""
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_org_permissions_policy_residency_org_has_the_six_connector_tools_off(
         self, svc: ModuleType, db: FakeDb, role: str
     ) -> None:
@@ -2375,10 +2378,10 @@ class TestPermissionsSummary:
         self, svc: ModuleType, db: FakeDb
     ) -> None:
         db.add_permissions(ORG_ID)
-        viewer = _actor(db, "viewer")
+        editor = _actor(db, "editor")
         config = build_default_permissions_config()
 
-        result = await svc.permissions_summary(db.pool, actor=viewer)
+        result = await svc.permissions_summary(db.pool, actor=editor)
 
         assert _summary_states(result) == {
             (tool, action): check_permission(tool, action, config).allowed
@@ -2404,9 +2407,9 @@ class TestPermissionsSummary:
     ) -> None:
         """Even a malformed stored 'allow' on a hardcoded pair reads 'deny'."""
         db.add_permissions(ORG_ID, _with(gmail__delete="allow", outlook__send="allow"))
-        viewer = _actor(db, "viewer")
+        editor = _actor(db, "editor")
 
-        states = _summary_states(await svc.permissions_summary(db.pool, actor=viewer))
+        states = _summary_states(await svc.permissions_summary(db.pool, actor=editor))
 
         assert {states[pair] for pair in _HARDCODED_IN_MATRIX} == {"deny"}
 
@@ -2427,9 +2430,9 @@ class TestPermissionsSummary:
         db.add_permissions(ORG_ID)
         db.add_permissions(OTHER_ORG_ID, _with(gmail__send="confirm", memory__store="deny"))
         db.add_org_settings(OTHER_ORG_ID, outlook=False)
-        viewer = _actor(db, "viewer", ORG_ID)
+        editor = _actor(db, "editor", ORG_ID)
 
-        states = _summary_states(await svc.permissions_summary(db.pool, actor=viewer))
+        states = _summary_states(await svc.permissions_summary(db.pool, actor=editor))
 
         assert states[("gmail", "send")] == "deny"
         assert states[("memory", "store")] == "allow"
@@ -2442,9 +2445,9 @@ class TestPermissionsSummary:
         from admino.models import PermissionSummaryEntry
 
         db.add_permissions(ORG_ID, {"memory": {"store": "allow"}})
-        viewer = _actor(db, "viewer")
+        editor = _actor(db, "editor")
 
-        result = await svc.permissions_summary(db.pool, actor=viewer)
+        result = await svc.permissions_summary(db.pool, actor=editor)
 
         assert result.permissions == [
             PermissionSummaryEntry(tool="memory", action="store", state="allow")
@@ -2489,9 +2492,9 @@ class TestResidencySummary:
         memory reads as before."""
         db.add_permissions(ORG_ID)
         _residency(db, ORG_ID, on=True)
-        viewer = _actor(db, "viewer")
+        editor = _actor(db, "editor")
 
-        states = _summary_states(await svc.permissions_summary(db.pool, actor=viewer))
+        states = _summary_states(await svc.permissions_summary(db.pool, actor=editor))
 
         assert sorted(states) == _DEFAULT_PAIRS
         for tool in _RESIDENCY_TOOLS:
@@ -2522,11 +2525,11 @@ class TestResidencySummary:
         db.add_permissions(ORG_ID)
         db.add_permissions(OTHER_ORG_ID)
         _residency(db, OTHER_ORG_ID, on=True)
-        viewer_a = _actor(db, "viewer", ORG_ID)
-        viewer_b = _actor(db, "viewer", OTHER_ORG_ID)
+        editor_a = _actor(db, "editor", ORG_ID)
+        editor_b = _actor(db, "editor", OTHER_ORG_ID)
 
-        states_a = _summary_states(await svc.permissions_summary(db.pool, actor=viewer_a))
-        states_b = _summary_states(await svc.permissions_summary(db.pool, actor=viewer_b))
+        states_a = _summary_states(await svc.permissions_summary(db.pool, actor=editor_a))
+        states_b = _summary_states(await svc.permissions_summary(db.pool, actor=editor_b))
 
         assert states_a == _engine_states(set(DEFAULT_PERMISSIONS))
         assert "disabled" not in states_a.values()

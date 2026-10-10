@@ -237,7 +237,7 @@ class _Script:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database; the
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database; the
     attachments root is under ``tmp_path``."""
     db = FakeDb()
     built = build_world(db)

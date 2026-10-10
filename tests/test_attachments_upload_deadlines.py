@@ -635,7 +635,7 @@ class _Env:
 
 @pytest.fixture
 def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Env:
-    """Orgs A and B (OA/ED/VI each, a 64 MiB quota) behind the fake database, the
+    """Orgs A and B (OA/ED each, a 64 MiB quota) behind the fake database, the
     attachments root in tmp_path, roomy rate limits, ``_processing`` recorded."""
     db = FakeDb()
     world = build_world(db)

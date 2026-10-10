@@ -141,7 +141,7 @@ def _cache_control(response: httpx.Response) -> list[str]:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
-    """Orgs A and B (Org Admin, Editor, Viewer each) and a Super Admin, behind the FakeDb.
+    """Orgs A and B (an Org Admin and an Editor each) and a Super Admin, behind the FakeDb.
 
     As tests/test_tenancy.py's world: fast passwords, roomy rate buckets, an
     attachments root under ``tmp_path`` with a quota for both orgs, fake OAuth
@@ -257,10 +257,11 @@ def test_api_no_store_cross_origin_refusal_403(world: World, client: TestClient)
 
 
 def test_api_no_store_role_refusal_403(world: World, client: TestClient) -> None:
-    """A Viewer on the chat list (``chat.send`` refused): the 403 ``Forbidden``."""
-    viewer = world.a["viewer"]
+    """The Super Admin on the chat list (``chat.send`` refused, operator blindness): the
+    403 ``Forbidden``."""
+    super_admin = world.super_admin
 
-    response = client.get("/api/chats", headers=viewer.cookie)
+    response = client.get("/api/chats", headers=super_admin.cookie)
 
     assert (response.status_code, response.json(), _cache_control(response)) == (
         403,

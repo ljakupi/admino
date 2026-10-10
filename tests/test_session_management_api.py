@@ -27,8 +27,8 @@ What these tests pin down:
   unknown id → 404 ``{"detail": "Session not found"}``; a non-UUID → 422 without
   echo; one ``session.revoke`` audit row.
 - ``POST /api/org/users/{user_id}/logout`` → 204 and every session of the target
-  is deleted; 403 ``{"detail": "Forbidden"}`` for an Editor, a Viewer and a Super
-  Admin; 404 ``{"detail": "User not found"}`` for a user of another org, an
+  is deleted; 403 ``{"detail": "Forbidden"}`` for an Editor and a Super Admin;
+  404 ``{"detail": "User not found"}`` for a user of another org, an
   unknown id or a deleted user; one ``session.force_logout`` audit row.
 - All three routes depend on ``require_session``, authorize through
   ``admino.access.can()`` (``account.manage`` / ``org.users.manage``), have their
@@ -631,7 +631,7 @@ class TestListSessions:
         ]
         assert [entry["current"] for entry in sessions] == [False, True, False]
 
-    @pytest.mark.parametrize("who", ["org_admin", "editor", "viewer", "super_admin"])
+    @pytest.mark.parametrize("who", ["org_admin", "editor", "super_admin"])
     def test_session_management_api_list_works_for_every_role(self, db: FakeDb, who: str) -> None:
         """Account management is for everyone, the Super Admin included."""
         user_id = _super_admin(db) if who == "super_admin" else _member(db, role=who)
@@ -969,12 +969,12 @@ class TestForceLogoutRoute:
         assert db.session_revoked(other_device)
         assert client.get("/api/auth/me", headers=_cookie(admin_token)).status_code == 401
 
-    @pytest.mark.parametrize("who", ["editor", "viewer", "super_admin"])
+    @pytest.mark.parametrize("who", ["editor", "super_admin"])
     def test_session_management_api_force_logout_forbidden_without_org_users_manage(
         self, db: FakeDb, who: str
     ) -> None:
-        """An Editor, a Viewer and a Super Admin get 403 {"detail": "Forbidden"}; the target
-        keeps its sessions and nothing is audited."""
+        """An Editor and a Super Admin get 403 {"detail": "Forbidden"}; the target keeps its
+        sessions and nothing is audited."""
         _route(_app(), "POST", "/api/org/users/{user_id}/logout")
         actor = _super_admin(db) if who == "super_admin" else _member(db, role=who)
         actor_token = db.open_session(actor)

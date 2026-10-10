@@ -125,8 +125,8 @@ _SEAT_MESSAGE = "The organization has no free seats."
 _DUPLICATE_MESSAGE = "A user with this email already exists."
 _DELETED_AT = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
 _WELL_FORMED_UNKNOWN = "Q" * 21 + "-" + "z" * 20 + "_"
-_ROLES = ["org_admin", "editor", "viewer"]
-_NOT_ADMINS = ["editor", "viewer", "super_admin"]
+_ROLES = ["org_admin", "editor"]
+_NOT_ADMINS = ["editor", "super_admin"]
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +485,9 @@ class TestInvitationModels:
     def test_invitations_create_request_accepts_member_roles(self, role: str) -> None:
         assert models.InvitationCreateRequest(email="a@example.ch", role=role).role == role
 
-    @pytest.mark.parametrize("role", ["super_admin", "admin", "Editor", "", None, 1, "owner"])
+    @pytest.mark.parametrize(
+        "role", ["super_admin", "viewer", "admin", "Editor", "", None, 1, "owner"]
+    )
     def test_invitations_create_request_rejects_other_roles(self, role: Any) -> None:
         with pytest.raises(ValidationError):
             models.InvitationCreateRequest(email="a@example.ch", role=role)
@@ -524,7 +526,7 @@ class TestInvitationModels:
         summary = models.InvitationSummary(
             id=PgUUID(str(raw)),
             email="a@example.ch",
-            role="viewer",
+            role="org_admin",
             sent_at=now,
             expires_at=now + timedelta(hours=72),
             expired=False,
@@ -662,7 +664,7 @@ class TestCreateInvitation:
         and the language the admin passed."""
         admin = _admin(db)
 
-        await _create(inv, db, admin, role="viewer", language="fr")
+        await _create(inv, db, admin, role="org_admin", language="fr")
 
         row = db.user_by_email(_EMAIL)
         assert row is not None
@@ -670,7 +672,7 @@ class TestCreateInvitation:
             _EMAIL,
             "member",
             ORG_ID,
-            "viewer",
+            "org_admin",
             "invited",
         )
         assert (row["name"], row["password_hash"], row["deleted_at"]) == (None, None, None)
@@ -738,13 +740,13 @@ class TestCreateInvitation:
         """An InvitationSummary of the new invitation (a plain UUID id, not expired)."""
         admin = _admin(db)
 
-        summary = await _create(inv, db, admin, role="viewer")
+        summary = await _create(inv, db, admin, role="org_admin")
 
         invitation = _invitation(db)
         assert type(summary) is models.InvitationSummary
         assert type(summary.id) is uuid.UUID
         assert summary.id == invitation["id"]
-        assert (summary.email, summary.role, summary.expired) == (_EMAIL, "viewer", False)
+        assert (summary.email, summary.role, summary.expired) == (_EMAIL, "org_admin", False)
         assert (summary.sent_at, summary.expires_at) == (
             invitation["sent_at"],
             invitation["expires_at"],
@@ -768,7 +770,7 @@ class TestCreateInvitation:
         metadata {"role", "user_id"}."""
         admin = _admin(db)
 
-        summary = await _create(inv, db, admin, role="viewer")
+        summary = await _create(inv, db, admin, role="org_admin")
 
         assert len(db.audit) == 1
         row = _one_row(db.audit_rows("invitation.create"))
@@ -779,7 +781,7 @@ class TestCreateInvitation:
         )
         assert (row["target_type"], row["target_ids"]) == ("invitation", [str(summary.id)])
         assert row["ip"] == _IP
-        assert row["metadata"] == {"role": "viewer", "user_id": str(_invited_id(db))}
+        assert row["metadata"] == {"role": "org_admin", "user_id": str(_invited_id(db))}
 
     async def test_invitations_create_writes_in_one_transaction(
         self, inv: ModuleType, db: FakeDb
@@ -888,8 +890,7 @@ class TestCreateInvitation:
     async def test_invitations_create_without_org_users_invite_is_refused_before_any_query(
         self, inv: ModuleType, db: FakeDb, who: str
     ) -> None:
-        """An Editor, a Viewer and a Super Admin get PermissionError; nothing is read or
-        written."""
+        """An Editor and a Super Admin get PermissionError; nothing is read or written."""
         actor = _actor(db, who)
 
         with pytest.raises(PermissionError):
@@ -1001,7 +1002,7 @@ class TestDuplicateEmail:
         before = _state(db)
 
         with pytest.raises(accounts.DuplicateEmailError):
-            await _create(inv, db, admin, email=_EMAIL.upper(), role="viewer")
+            await _create(inv, db, admin, email=_EMAIL.upper(), role="org_admin")
 
         _assert_only_refusal_audited(
             db,
@@ -1009,7 +1010,7 @@ class TestDuplicateEmail:
             actor_kind="member",
             actor_user_id=admin.user_id,
             org_id=ORG_ID,
-            role="viewer",
+            role="org_admin",
             reason="email_taken",
         )
 
@@ -1233,7 +1234,7 @@ class TestListInvitations:
         pending one are left out."""
         admin = _admin(db)
         first = await _create(inv, db, admin, email="first.person@example.ch")
-        second = await _create(inv, db, admin, email="second.person@example.ch", role="viewer")
+        second = await _create(inv, db, admin, email="second.person@example.ch", role="org_admin")
         third = await _create(inv, db, admin, email="third.person@example.ch", role="org_admin")
         _age(db, first.id, timedelta(hours=1))
         _age(db, second.id, timedelta(hours=3))
@@ -1249,7 +1250,7 @@ class TestListInvitations:
         assert [(summary.email, summary.role) for summary in result] == [
             ("first.person@example.ch", "editor"),
             ("third.person@example.ch", "org_admin"),
-            ("second.person@example.ch", "viewer"),
+            ("second.person@example.ch", "org_admin"),
         ]
 
     async def test_invitations_list_flags_expired_invitations(
@@ -1374,7 +1375,7 @@ class TestRevokeInvitation:
         summary = await _create(inv, db, admin)
         await _revoke(inv, db, admin, summary.id)
 
-        again = await _create(inv, db, admin, role="viewer")
+        again = await _create(inv, db, admin, role="org_admin")
 
         assert list(db.invitations) == [again.id]
 
@@ -1488,7 +1489,7 @@ class TestResendInvitation:
         """sent_at is now, expires_at 72 hours later; created_at stays; the summary shows
         the new dates and the same id."""
         admin = _admin(db)
-        summary = await _create(inv, db, admin, role="viewer")
+        summary = await _create(inv, db, admin, role="org_admin")
         _age(db, summary.id, timedelta(hours=10))
         created_at = db.invitations[summary.id]["created_at"]
         before = datetime.now(UTC)
@@ -1503,7 +1504,7 @@ class TestResendInvitation:
         assert (resent.id, resent.email, resent.role, resent.expired) == (
             summary.id,
             _EMAIL,
-            "viewer",
+            "org_admin",
             False,
         )
         assert (resent.sent_at, resent.expires_at) == (row["sent_at"], row["expires_at"])
@@ -1773,12 +1774,12 @@ class TestGetInvitation:
     async def test_invitations_get_returns_org_name_role_and_email(
         self, inv: ModuleType, db: FakeDb
     ) -> None:
-        await _create(inv, db, _admin(db), role="viewer")
+        await _create(inv, db, _admin(db), role="org_admin")
 
         details = await inv.get_invitation(db.pool, db.invitation_token())
 
         assert type(details) is models.InvitationDetails
-        assert (details.org_name, details.role, details.email) == (ORG_NAME, "viewer", _EMAIL)
+        assert (details.org_name, details.role, details.email) == (ORG_NAME, "org_admin", _EMAIL)
 
     async def test_invitations_get_works_on_an_expiring_invitation(
         self, inv: ModuleType, db: FakeDb
@@ -1899,7 +1900,7 @@ class TestAcceptInvitation:
     ) -> None:
         """The new cookie works: a member of the inviting org with the invited role and the
         inviting admin's language."""
-        await _create(inv, db, _admin(db), role="viewer", language="fr")
+        await _create(inv, db, _admin(db), role="org_admin", language="fr")
 
         result = await _accept(inv, db, db.invitation_token())
 
@@ -1910,7 +1911,7 @@ class TestAcceptInvitation:
             _invited_id(db),
             "member",
             ORG_ID,
-            "viewer",
+            "org_admin",
         )
         assert session.ui_language == "fr"
 
@@ -2021,7 +2022,7 @@ class TestAcceptInvitation:
     async def test_invitations_accept_is_audited(self, inv: ModuleType, db: FakeDb) -> None:
         """One invitation.accept row: the new member as the actor, their org, target the
         invitation, the IP, metadata {"role"}."""
-        summary = await _create(inv, db, _admin(db), role="viewer")
+        summary = await _create(inv, db, _admin(db), role="org_admin")
 
         await _accept(inv, db, db.invitation_token())
 
@@ -2033,7 +2034,7 @@ class TestAcceptInvitation:
         )
         assert (row["target_type"], row["target_ids"]) == ("invitation", [str(summary.id)])
         assert row["ip"] == _IP
-        assert row["metadata"] == {"role": "viewer"}
+        assert row["metadata"] == {"role": "org_admin"}
 
     async def test_invitations_accept_writes_in_one_transaction(
         self, inv: ModuleType, db: FakeDb

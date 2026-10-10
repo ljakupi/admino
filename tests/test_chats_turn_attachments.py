@@ -190,7 +190,7 @@ def seeded() -> _Seeded:
     other_message = db.add_chat_message(other_chat, "user", "Another file")
     other_chat_file = add(other_chat, filename=FOREIGN_CANARY, status="ready",
                           message_id=other_message, created_at=_T0)  # fmt: skip
-    colleague_chat = seed_chat(db, world.a["viewer"], title=TITLE_CANARY)
+    colleague_chat = seed_chat(db, world.a["org_admin"], title=TITLE_CANARY)
     colleague_message = db.add_chat_message(colleague_chat, "user", MESSAGE_CANARY)
     other_org_chat = seed_chat(db, world.b["editor"], title=TITLE_CANARY)
     other_org_message = db.add_chat_message(other_org_chat, "user", MESSAGE_CANARY)

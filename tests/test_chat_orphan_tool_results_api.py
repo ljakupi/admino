@@ -124,7 +124,7 @@ class _BookArgs(BaseModel):
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database, with the
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database, with the
     stored ``max_context_messages`` ``_CAP`` (row and settings cache)."""
     db = FakeDb()
     built = build_world(db)

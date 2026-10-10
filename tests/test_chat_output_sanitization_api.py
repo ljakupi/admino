@@ -1,8 +1,8 @@
 """HTTP spec of LLM output sanitization in chat turns (GH-25, contract C6 with C5).
 
 The app from ``create_app()`` runs against the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, real session cookies) with the REAL ``admino.agent.Agent`` (the real
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, real
+session cookies) with the REAL ``admino.agent.Agent`` (the real
 tool-call recorder of ``main._build_tool_call_recorder()``) around an LLM faked
 at the client boundary (``_ScriptLLM``, provider "infomaniak"): per user message
 it plays the planned answers in order, one per LLM call of the turn. A
@@ -222,7 +222,7 @@ def _cut_key() -> tuple[ApiKey, str]:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)

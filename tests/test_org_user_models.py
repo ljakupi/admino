@@ -9,8 +9,9 @@ on ``admino.models`` at call time, so a missing model fails only its own tests.
 What these tests pin down:
 - ``OrgUserSummary`` has exactly ``id``, ``name``, ``email``, ``role``,
   ``status``, ``created_at`` and ``last_login_at``: no password, hash, token,
-  org id or account kind. ``role`` is one of the three member roles
-  (``super_admin`` refused), ``status`` is ``active`` or ``deactivated`` only
+  org id or account kind. ``role`` is one of the two member roles, Org Admin
+  or Editor (``super_admin`` and the retired ``viewer``, GH-306, refused),
+  ``status`` is ``active`` or ``deactivated`` only
   (an invited or deleted account is never a user here). ``name`` and
   ``last_login_at`` may be null. ``id`` is a plain ``uuid.UUID`` (an asyncpg
   UUID is converted), serialized as a string.
@@ -22,7 +23,8 @@ What these tests pin down:
 - ``OrgUserPatch`` (unknown fields refused: ``org_id``, ``user_id``,
   ``status``, ``kind``, ``password`` ...): any of ``role``, ``name`` and
   ``email``, a null counting as not given, at least one given. ``role`` is a
-  member role. ``name`` is stripped, 1 to 120 characters, and refuses control
+  member role (``org_admin`` or ``editor``; the retired ``viewer`` is refused,
+  GH-306). ``name`` is stripped, 1 to 120 characters, and refuses control
   (Cc), format (Cf, e.g. zero-width and direction overrides), surrogate (Cs)
   and line/paragraph separator (Zl, Zp) characters. ``email`` is stripped and
   follows exactly ``InvitationCreateRequest.email``'s rules (3 to 254
@@ -58,7 +60,7 @@ _SUMMARY_FIELDS = frozenset(
 )
 _PATCH_FIELDS = frozenset({"role", "name", "email"})
 _SEATS_FIELDS = frozenset({"used", "limit"})
-_MEMBER_ROLES = ("org_admin", "editor", "viewer")
+_MEMBER_ROLES = ("org_admin", "editor")
 
 # Field names that would carry a credential, a scope or the account kind.
 _NEVER_FIELDS = frozenset(
@@ -221,6 +223,15 @@ class TestOrgUserSummary:
         with pytest.raises(ValidationError):
             _summary(role=role)
 
+    def test_org_user_models_summary_rejects_the_retired_role(self) -> None:
+        """GH-306: no org user holds the retired read-only role; a row naming it is refused
+        at the role field."""
+        with pytest.raises(ValidationError) as caught:
+            _summary(role="viewer")
+
+        errors = caught.value.errors(include_input=False, include_url=False)
+        assert [error["loc"] for error in errors] == [("role",)]
+
     @pytest.mark.parametrize("status", ["active", "deactivated"])
     def test_org_user_models_summary_accepts_status(self, status: str) -> None:
         assert _summary(status=status).status == status
@@ -249,7 +260,7 @@ class TestOrgUserListResponse:
     def test_org_user_models_list_response_holds_summaries(self) -> None:
         first = _summary()
         second = _summary(
-            id=uuid.uuid4(), name=None, email="b@example.ch", role="viewer", status="deactivated"
+            id=uuid.uuid4(), name=None, email="b@example.ch", role="org_admin", status="deactivated"
         )
 
         response = _model("OrgUserListResponse")(users=[first, second], seats=_seats())
@@ -400,7 +411,7 @@ class TestOrgUserPatchShape:
     @pytest.mark.parametrize(
         ("values", "expected"),
         [
-            pytest.param({"role": "viewer"}, ("viewer", None, None), id="role"),
+            pytest.param({"role": "org_admin"}, ("org_admin", None, None), id="role"),
             pytest.param({"name": "Grace Hopper"}, (None, "Grace Hopper", None), id="name"),
             pytest.param(
                 {"email": "grace@example.ch"}, (None, None, "grace@example.ch"), id="email"
@@ -451,10 +462,10 @@ class TestOrgUserPatchShape:
 
     def test_org_user_models_patch_from_json(self) -> None:
         patch = _model("OrgUserPatch").model_validate_json(
-            '{"role": "viewer", "name": " Grace ", "email": null}'
+            '{"role": "org_admin", "name": " Grace ", "email": null}'
         )
 
-        assert (patch.role, patch.name, patch.email) == ("viewer", "Grace", None)
+        assert (patch.role, patch.name, patch.email) == ("org_admin", "Grace", None)
 
     @pytest.mark.parametrize(
         "extra",
@@ -471,13 +482,13 @@ class TestOrgUserPatchShape:
             pytest.param({"last_login_at": None}, id="last_login_at"),
             pytest.param({"deleted_at": None}, id="deleted_at"),
             pytest.param({"ui_language": "fr"}, id="ui_language"),
-            pytest.param({"Role": "viewer"}, id="case-variant-key"),
+            pytest.param({"Role": "org_admin"}, id="case-variant-key"),
         ],
     )
     def test_org_user_models_patch_refuses_unknown_fields(self, extra: dict[str, Any]) -> None:
         """The org, the target, the status and the kind are never chosen by the body."""
         with pytest.raises(ValidationError):
-            _patch(role="viewer", **extra)
+            _patch(role="editor", **extra)
 
     def test_org_user_models_patch_refuses_unknown_field_alone(self) -> None:
         """An unknown field doesn't count as the one given field."""
@@ -506,18 +517,28 @@ class TestOrgUserPatchRole:
             pytest.param("admin", id="admin"),
             pytest.param("owner", id="owner"),
             pytest.param("Editor", id="case-variant"),
-            pytest.param("VIEWER", id="upper-case"),
-            pytest.param(" viewer", id="leading-space"),
-            pytest.param("viewer\n", id="trailing-newline"),
+            pytest.param("EDITOR", id="upper-case"),
+            pytest.param(" editor", id="leading-space"),
+            pytest.param("editor\n", id="trailing-newline"),
             pytest.param("", id="empty"),
             pytest.param(1, id="int"),
             pytest.param(True, id="bool"),
-            pytest.param(["viewer"], id="list"),
+            pytest.param(["editor"], id="list"),
         ],
     )
     def test_org_user_models_patch_rejects_role(self, role: Any) -> None:
         with pytest.raises(ValidationError):
             _patch(role=role)
+
+    def test_org_user_models_patch_rejects_the_retired_role(self) -> None:
+        """GH-306: a role change to the retired read-only role is refused at the role
+        field, alone or next to a valid name."""
+        for values in ({"role": "viewer"}, {"role": "viewer", "name": "Grace Hopper"}):
+            with pytest.raises(ValidationError) as caught:
+                _patch(**values)
+
+            errors = caught.value.errors(include_input=False, include_url=False)
+            assert [error["loc"] for error in errors] == [("role",)], values
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +655,7 @@ class TestOrgUserPatchEmail:
     def test_org_user_models_patch_bad_email_rejects_even_with_a_role(self, email: Any) -> None:
         """A valid role next to it doesn't rescue a bad email (no partial patch)."""
         with pytest.raises(ValidationError):
-            _patch(role="viewer", email=email)
+            _patch(role="editor", email=email)
 
     @pytest.mark.parametrize(
         "email",
@@ -654,12 +675,12 @@ class TestOrgUserPatchEmail:
         """Same verdict, and the same stored value, as InvitationCreateRequest.email."""
         from admino.models import InvitationCreateRequest
 
-        invitation = _accepted(lambda: InvitationCreateRequest(email=email, role="viewer"))
+        invitation = _accepted(lambda: InvitationCreateRequest(email=email, role="editor"))
         patch = _accepted(lambda: _patch(email=email))
 
         assert patch == invitation
         if invitation:
-            expected = InvitationCreateRequest(email=email, role="viewer").email
+            expected = InvitationCreateRequest(email=email, role="editor").email
             assert _patch(email=email).email == expected
 
 
@@ -695,12 +716,12 @@ class TestOrgUserPatchErrorsHideInput:
             ),
             pytest.param({"role": "superuser-marker"}, ["superuser-marker"], id="role"),
             pytest.param(
-                {"role": "viewer", "status": "marker-value-8472"},
+                {"role": "editor", "status": "marker-value-8472"},
                 ["marker-value-8472"],
                 id="extra-key",
             ),
             pytest.param(
-                {"role": "viewer", "password": "hunter2-marker"},
+                {"role": "editor", "password": "hunter2-marker"},
                 ["hunter2-marker"],
                 id="extra-password",
             ),

@@ -25,7 +25,7 @@ the in-memory database tests/db_fakes.FakeDb:
    password), then invites a colleague (``POST /api/org/invitations``, the
    invitee's fixture email).
 3. Logins: a wrong password, an unknown email, then the right password.
-4. Password reset requests for an active member's fixture email (a Viewer
+4. Password reset requests for an active member's fixture email (an Editor
    seeded in the new org, with a fixture name) and for an unknown one. The
    background task runs.
 5. One outbox sender pass (``email_outbox.deliver_due``) whose SMTP delivery
@@ -725,7 +725,7 @@ def _request_resets(
     db: FakeDb, client: TestClient, org_id: uuid.UUID, secrets: dict[str, str]
 ) -> None:
     """Step 4: reset requests for an active member's email and an unknown email."""
-    account = db.add_account(role="viewer", org_id=org_id, email=_RESET_EMAIL, name=_RESET_NAME)
+    account = db.add_account(role="editor", org_id=org_id, email=_RESET_EMAIL, name=_RESET_NAME)
     for email in (_RESET_EMAIL, _UNKNOWN_EMAIL):
         response = client.post("/api/auth/password-reset", json={"email": email})
         assert response.status_code == 202, response.text
