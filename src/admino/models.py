@@ -38,12 +38,13 @@ Security notes:
   the target, the role and the language come from the path, the contract and
   the session) and hides its input from validation errors.
 - Account self-service (GH-166): ``MyAccountResponse`` carries the caller's
-  own email, name, languages, timezone and personal instructions only (no id,
-  hash, org, role or kind). ``MyAccountPatch`` and ``PasswordChangeRequest``
-  refuse unknown keys (the account, its email, role and org come from the
-  session) and hide their input from validation errors; the timezone must be
-  a name of the runtime's tz database, and its error never repeats it. The
-  two passwords are ``SecretStr``.
+  own email, name, languages, timezone, personal instructions and (GH-307)
+  the time of the last password change only (no id, hash, org, role or
+  kind). ``MyAccountPatch`` and ``PasswordChangeRequest`` refuse unknown
+  keys (the account, its email, role and org come from the session) and hide
+  their input from validation errors; the timezone must be a name of the
+  runtime's tz database, and its error never repeats it. The two passwords
+  are ``SecretStr``.
 - Organization settings (GH-169): ``OrgSettingsResponse`` carries the
   caller's own org's profile, instructions, session policy, trash retention
   (with the platform's bounds) and tool services, and, read-only, its
@@ -2040,21 +2041,22 @@ class SettingsLLM(BaseModel):
 
 
 class SettingsAppearance(BaseModel):
-    """Appearance settings (user scope)."""
+    """Appearance settings (user scope): the theme and (GH-307) the display density."""
 
     theme: Literal["light", "dark", "system"] = "light"
+    density: Literal["comfortable", "compact"] = "comfortable"
 
 
 class SettingsNotifications(BaseModel):
-    """Notification preferences (user scope).
+    """Notification preferences (user scope, GH-307).
 
-    ``enabled``: the tool-approval pings (on by default). ``task_done``: the
-    task-done pings (GH-35), off by default because switching them on asks the
-    browser for notification permission. Neither is a master switch for the other.
+    ``approvals``: show actions waiting for a decision in the notification
+    center. ``completed``: show finished tasks and routine runs there. Both on
+    by default; neither is a master switch for the other.
     """
 
-    enabled: bool = True
-    task_done: bool = False
+    approvals: bool = True
+    completed: bool = True
 
 
 class OAuthAuthorizeResponse(BaseModel):
@@ -2185,6 +2187,7 @@ class SettingsPatchAppearance(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     theme: Literal["light", "dark", "system"] | None = None
+    density: Literal["comfortable", "compact"] | None = None
 
 
 class SettingsPatchNotifications(BaseModel):
@@ -2192,23 +2195,25 @@ class SettingsPatchNotifications(BaseModel):
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
-    enabled: StrictBool | None = None
-    task_done: StrictBool | None = None
+    approvals: StrictBool | None = None
+    completed: StrictBool | None = None
 
 
 class UserSettingsResponse(BaseModel):
-    """GET/PATCH /api/me/settings response: the caller's own theme and notifications."""
+    """GET/PATCH /api/me/settings response: the caller's own appearance and notifications."""
 
     appearance: SettingsAppearance
     notifications: SettingsNotifications
 
 
 class UserSettingsPatch(BaseModel):
-    """PATCH /api/me/settings request body: the caller's theme and/or notifications.
+    """PATCH /api/me/settings request body: the caller's appearance and/or notifications.
 
-    Another scope's key (llm, tools, limits), a language or a user id is
-    refused, never ignored. A null counts as not given, and at least one value
-    must be given. Validation errors never repeat the input.
+    Another scope's key (llm, tools, limits), a language, a user id or an old
+    notification key (``enabled``, ``task_done``: GH-307 replaced them with
+    ``approvals`` and ``completed``) is refused, never ignored. A null counts
+    as not given, and at least one value must be given. Validation errors
+    never repeat the input.
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
@@ -2219,9 +2224,15 @@ class UserSettingsPatch(BaseModel):
     @model_validator(mode="after")
     def _check_something_given(self) -> UserSettingsPatch:
         """Refuse a patch that changes nothing."""
-        theme = None if self.appearance is None else self.appearance.theme
+        appearance = self.appearance or SettingsPatchAppearance()
         notifications = self.notifications or SettingsPatchNotifications()
-        if theme is None and notifications.enabled is None and notifications.task_done is None:
+        given = (
+            appearance.theme,
+            appearance.density,
+            notifications.approvals,
+            notifications.completed,
+        )
+        if all(value is None for value in given):
             msg = "Give at least one setting to change."
             raise FixedMessageError(msg)
         return self
@@ -3140,7 +3151,9 @@ class MyAccountResponse(BaseModel):
     account kind. ``name`` is None only for a Super Admin created without
     one; ``response_language`` None means the org's default; ``timezone``
     None means not preset yet (consumers use Europe/Zurich);
-    ``personal_instructions`` ``""`` means none.
+    ``personal_instructions`` ``""`` means none. ``password_changed_at``
+    (GH-307) is when the password was last changed (by the user or a
+    completed reset), None until the first change.
     """
 
     email: str = Field(max_length=254)
@@ -3149,6 +3162,7 @@ class MyAccountResponse(BaseModel):
     response_language: ResponseLanguage | None
     timezone: str | None = Field(max_length=_TIMEZONE_MAX_LENGTH)
     personal_instructions: str = Field(max_length=_PERSONAL_INSTRUCTIONS_MAX_LENGTH)
+    password_changed_at: datetime | None
 
 
 class MyAccountPatch(BaseModel):

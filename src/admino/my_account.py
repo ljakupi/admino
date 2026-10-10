@@ -6,7 +6,10 @@ Settings -> My account: their name, UI language, preferred response language
 ``update_account``), and their password (``change_password``). Changing the
 password ends every session of the user, the current one included, through
 ``sessions.revoke_user_sessions`` (#151's revoke-all service), so the user
-logs in again with the new password. The session list with revoke is
+logs in again with the new password. It also stores when the password
+changed (``password_changed_at``, GH-307), which the profile carries: None
+until the first change (a password change or a completed reset,
+``admino.password_reset``). The session list with revoke is
 ``admino.session_management`` (#152).
 
 Inputs: the database pool and the caller's ``Principal`` (from the session);
@@ -34,9 +37,11 @@ Security notes:
   password through ``auth.reauthenticate`` (a wrong one counts in the login
   throttle like a failed login; a locked account or IP is refused without a
   check). Argon2 hashing runs in a worker thread, outside the transaction.
-  The hash, the revocation of every session and the ``password.change`` audit
-  event share one transaction: a failed audit write rolls everything back
-  (fail closed), so the password never changes unaudited.
+  The hash with its change time (the transaction clock, ``now()``), the
+  revocation of every session and the ``password.change`` audit event share
+  one transaction: a failed audit write rolls everything back (fail closed),
+  so the password never changes unaudited and a refused change leaves the
+  change time as it was.
 - Content-free audit (tracker #139 §5): the actor, their org (none for the
   Super Admin), the user as target, the client IP and the number of sessions
   ended. No password, hash, email, name, timezone or instructions reaches an
@@ -67,7 +72,8 @@ if TYPE_CHECKING:
 ACCOUNT_NOT_FOUND_MESSAGE: Final = "Account not found"
 
 _PROFILE_SQL: Final = """
-    SELECT email, name, ui_language, response_language, timezone, personal_instructions
+    SELECT email, name, ui_language, response_language, timezone, personal_instructions,
+           password_changed_at
     FROM users
     WHERE id = $1 AND deleted_at IS NULL
 """
@@ -83,15 +89,17 @@ _UPDATE_PROFILE_SQL: Final = """
         timezone = coalesce($6, timezone),
         personal_instructions = coalesce($7, personal_instructions)
     WHERE id = $1 AND deleted_at IS NULL
-    RETURNING email, name, ui_language, response_language, timezone, personal_instructions
+    RETURNING email, name, ui_language, response_language, timezone, personal_instructions,
+              password_changed_at
 """
 
 _EMAIL_SQL: Final = "SELECT email FROM users WHERE id = $1 AND deleted_at IS NULL"
 
 # Only an account that is still active and not deleted: one deactivated or
 # deleted after the re-authentication keeps its password (nothing matches).
+# GH-307: the change time is the transaction clock, stored with the hash.
 _UPDATE_HASH_SQL: Final = """
-    UPDATE users SET password_hash = $1
+    UPDATE users SET password_hash = $1, password_changed_at = now()
     WHERE id = $2 AND deleted_at IS NULL AND status = 'active'
     RETURNING id
 """
@@ -130,6 +138,7 @@ def _account_response(row: Any) -> MyAccountResponse:
         response_language=row["response_language"],
         timezone=row["timezone"],
         personal_instructions=row["personal_instructions"],
+        password_changed_at=row["password_changed_at"],
     )
 
 
@@ -203,9 +212,10 @@ async def change_password(
     """Set the caller's new password and end every one of their sessions.
 
     The policy is checked first, then the current password (through the
-    login throttle). The new hash, the deletion of every session of the user
-    (the current one included) and the ``password.change`` audit event share
-    one transaction.
+    login throttle). The new hash with its change time
+    (``password_changed_at``), the deletion of every session of the user (the
+    current one included) and the ``password.change`` audit event share one
+    transaction.
 
     Args:
         pool: The database pool.
