@@ -692,8 +692,13 @@ Security notes:
 - Error responses use generic messages; never leak internal paths or config.
   The 422 validation list (both validation handlers, GH-302) carries each
   error's ``loc``, its ``type`` and the fixed message of that type
-  (``_VALIDATION_MESSAGES``): pydantic's message, input, context and URL,
-  which can quote what was sent, never reach the body.
+  (``_VALIDATION_MESSAGES``), or, for admino's own request validators, their
+  fixed message (``models.FixedMessageError``, GH-304: a string written in
+  admino's code, never built from what was sent). Pydantic's message, input,
+  context and URL, which can quote what was sent, never reach the body;
+  ``loc`` names the field (for an unknown field or a map key, the name as
+  sent). The platform LLM settings 400 for an invalid merged ``LLMConfig``
+  builds its list with the same mapping (``_safe_validation_errors``).
 - ``SecurityHeadersMiddleware`` is pure ASGI (GH-8): it sets the headers on
   the response start and passes ``receive`` and every body message through,
   so a stream reaches the client frame by frame and its disconnect reaches
@@ -884,6 +889,7 @@ from admino.models import (
     DeltaPayload,
     DonePayload,
     ErrorPayload,
+    FixedMessageError,
     InvitationAcceptRequest,
     InvitationCreateRequest,
     InvitationDetails,
@@ -7091,8 +7097,10 @@ def _new_platform_llm_client(
         The new client, or None when the running one stays.
 
     Raises:
-        HTTPException: 400 when the merged LLM config is invalid or its client
-            can't be built.
+        HTTPException: 400 when the merged LLM config is invalid (``detail``
+            is the validation list of ``_safe_validation_errors``: ``loc``, a
+            fixed ``msg`` and ``type`` per error, no value echoed; GH-304) or
+            its client can't be built.
     """
     from admino.config import LLMConfig
     from admino.llm import create_llm_client
@@ -7102,11 +7110,11 @@ def _new_platform_llm_client(
     try:
         new_llm_config = LLMConfig.model_validate({**config.llm.model_dump(mode="json"), **merged})
     except ValidationError as exc:
-        safe_errors = [
-            {"loc": [str(loc) for loc in err["loc"]], "msg": err["msg"], "type": err["type"]}
-            for err in exc.errors(include_input=False)
-        ]
-        raise HTTPException(status_code=400, detail=safe_errors) from None
+        # GH-304: the 422s' per-error mapping, never pydantic's msg (LLMConfig's
+        # validators can name the merged values). The error itself isn't logged.
+        raise HTTPException(
+            status_code=400, detail=_safe_validation_errors(exc.errors(include_input=False))
+        ) from None
 
     provider = new_llm_config.provider
     model_field = f"{provider}_model"
@@ -7176,9 +7184,10 @@ async def patch_platform_settings(
     Raises:
         HTTPException: 429 when rate-limited, 403 without
             ``Capability.PLATFORM_DEFAULTS_MANAGE`` (both before any database
-            work), 400 when the merged LLM config is invalid or its client
-            can't be built, or when the merged trash retention minimum exceeds
-            the maximum (nothing written either way).
+            work), 400 when the merged LLM config is invalid (the validation
+            list, no value echoed) or its client can't be built, or when the
+            merged trash retention minimum exceeds the maximum (nothing
+            written either way).
     """
     global _config
     if _agent is None or _config is None:
@@ -7975,7 +7984,9 @@ async def oauth_microsoft_disconnect(principal: _PrincipalDep) -> dict[str, str]
 # GH-302 (Decision 4): the one text a 422 validation error carries per pydantic error
 # type. pydantic's own msg can quote the input (a malformed UUID's character, a model
 # validator's text, a bound), so it never reaches the body: the type and loc say which
-# check failed, and the API's clients translate the type, not this text.
+# check failed, and the API's clients translate the type, not this text. A
+# FixedMessageError of admino's own validators answers its fixed text instead of the
+# value_error entry (GH-304, _safe_validation_errors).
 _VALIDATION_MESSAGES: Final[Mapping[str, str]] = MappingProxyType(
     {
         "missing": "Field required",
@@ -8019,16 +8030,69 @@ _VALIDATION_MESSAGES: Final[Mapping[str, str]] = MappingProxyType(
 _VALIDATION_FALLBACK_MESSAGE: Final = "Invalid input"
 
 
+def _safe_validation_errors(errors: Sequence[ErrorDetails]) -> list[dict[str, object]]:
+    """Map validation errors to ``{"loc", "msg", "type"}`` entries that echo no input.
+
+    The one per-error mapping of both 422 handlers (``_validation_response``)
+    and the platform LLM settings 400 (GH-302, GH-304). ``msg`` is:
+
+    - the ``FixedMessageError``'s text, when the error is a ``value_error``
+      whose ``ctx["error"]`` is one with a non-empty message: admino's own
+      request validators, whose texts are fixed strings in admino's code (a
+      test scans every ``FixedMessageError(...)`` call), never built from the
+      value;
+    - otherwise the fixed text of the error's ``type`` in
+      ``_VALIDATION_MESSAGES``, or ``_VALIDATION_FALLBACK_MESSAGE`` for a type
+      outside it. That covers pydantic's built-in errors, a plain
+      ``ValueError`` (admino's or a library's, such as ``ipaddress`` or
+      ``zoneinfo`` quoting the value) and a library's own ``value_error``
+      (an email validator's ``PydanticCustomError``).
+
+    Pydantic's ``msg``, ``input``, ``ctx`` and ``url``, which can quote what
+    was sent, never reach an entry. ``loc`` is kept as given, items
+    ``str()``-ed, so it names the field: for an unknown field
+    (``extra_forbidden``) or a map key, that is the name as the client sent
+    it. A missing ``type`` is ``value_error``. Nothing is logged.
+
+    Args:
+        errors: The validation errors, in pydantic's (FastAPI's) order.
+
+    Returns:
+        One entry per error, in the same order, keys ``loc``, ``msg``, ``type``.
+    """
+    safe_errors: list[dict[str, object]] = []
+    for err in errors:
+        error_type = err.get("type", "value_error")
+        ctx_error = (err.get("ctx") or {}).get("error")
+        # Only admino's opt-in class passes, and only on a value_error: a plain
+        # ValueError or a library's error can carry the input in its text.
+        if (
+            error_type == "value_error"
+            and isinstance(ctx_error, FixedMessageError)
+            and str(ctx_error)
+        ):
+            msg = str(ctx_error)
+        else:
+            msg = _VALIDATION_MESSAGES.get(error_type, _VALIDATION_FALLBACK_MESSAGE)
+        safe_errors.append(
+            {
+                "loc": [str(loc) for loc in err.get("loc", ())],
+                "msg": msg,
+                "type": error_type,
+            }
+        )
+    return safe_errors
+
+
 def _validation_response(errors: Sequence[ErrorDetails]) -> JSONResponse:
     """The 422 validation list: per error, its ``loc``, a fixed ``msg`` and its ``type``.
 
-    No input value is echoed: ``msg`` comes from ``_VALIDATION_MESSAGES`` by
-    ``type`` (the fallback for a type outside the table), never from
-    pydantic, whose ``msg``, ``ctx``, ``input`` and ``url`` can carry the
-    request's input and are dropped. ``loc`` is kept as FastAPI gives it, so
-    it names the field: for an unknown field (``extra_forbidden``) or a map
-    key, that is the name as the client sent it. ``loc`` items are
-    ``str()``-ed; a missing ``type`` is ``value_error``.
+    No input value is echoed: each entry comes from ``_safe_validation_errors``,
+    so ``msg`` is the fixed text of the error's ``type``, or, for admino's own
+    request validators (``FixedMessageError``), their fixed message, never
+    pydantic's ``msg``, ``ctx``, ``input`` or ``url``. ``loc`` names the
+    field: for an unknown field (``extra_forbidden``) or a map key, that is
+    the name as the client sent it.
 
     Args:
         errors: The validation errors, in pydantic's (FastAPI's) order.
@@ -8036,17 +8100,7 @@ def _validation_response(errors: Sequence[ErrorDetails]) -> JSONResponse:
     Returns:
         JSONResponse: ``422 {"detail": [{"loc", "msg", "type"}, ...]}``.
     """
-    safe_errors = []
-    for err in errors:
-        error_type = err.get("type", "value_error")
-        safe_errors.append(
-            {
-                "loc": [str(loc) for loc in err.get("loc", ())],
-                "msg": _VALIDATION_MESSAGES.get(error_type, _VALIDATION_FALLBACK_MESSAGE),
-                "type": error_type,
-            }
-        )
-    return JSONResponse(status_code=422, content={"detail": safe_errors})
+    return JSONResponse(status_code=422, content={"detail": _safe_validation_errors(errors)})
 
 
 async def _validation_error_handler(
@@ -8056,10 +8110,11 @@ async def _validation_error_handler(
     """Handle Pydantic validation errors without echoing any input value.
 
     The 422 validation list (``_validation_response``): each error's
-    ``loc``, ``type`` and the fixed message of its type (GH-302). Neither an
-    input value nor pydantic's message, context or URL is in the body;
-    ``loc`` names the field, which for an unknown field or a map key is the
-    name as sent.
+    ``loc``, ``type`` and the fixed message of its type (GH-302), or, for
+    admino's own validators, their fixed message (``FixedMessageError``,
+    GH-304). Neither an input value nor pydantic's message, context or URL is
+    in the body; ``loc`` names the field, which for an unknown field or a map
+    key is the name as sent.
 
     Args:
         request: The incoming request (unused but required by FastAPI).
@@ -8080,11 +8135,13 @@ async def _request_validation_error_handler(
     FastAPI raises RequestValidationError (not pydantic.ValidationError)
     for request body/query/path validation failures. The 422 validation list
     (``_validation_response``) keeps each error's ``loc`` and ``type`` and
-    answers the fixed message of its type (GH-302): pydantic's ``msg`` (which
-    quoted a malformed UUID's character), ``input``, ``ctx`` and ``url`` never
-    reach the response. ``loc`` names the field: for an unknown field
-    (``extra_forbidden``) or a map key, that is the name as the client sent
-    it. Reason-coded 422s are other handlers' and unchanged.
+    answers the fixed message of its type (GH-302), or, for admino's own
+    request validators, their fixed message (``FixedMessageError``, GH-304):
+    pydantic's ``msg`` (which quoted a malformed UUID's character), ``input``,
+    ``ctx`` and ``url`` never reach the response. ``loc`` names the field:
+    for an unknown field (``extra_forbidden``) or a map key, that is the name
+    as the client sent it. Reason-coded 422s are other handlers' and
+    unchanged.
 
     Args:
         request: The incoming request (unused but required by FastAPI).

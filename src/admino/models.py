@@ -107,6 +107,13 @@ Security notes:
   text shown to users without the credential rules: never shown itself.
 - ``PlatformDiagnosticsResponse`` (GH-158) carries the LLM provider, model
   and statuses only, for the Super Admin; the public /health is status-only.
+- Validator messages (GH-304): every validator of the API's request models
+  (and the shared checks they call: the invitation email, the org name, the
+  chat title) raises ``FixedMessageError`` with a fixed text, which the 422
+  validation list answers as ``msg``. The text is a literal or a name bound
+  once to one, never built from the value (a test scans for it). Every other
+  validator (internal models, tool arguments, response models, ``config.py``)
+  keeps ``ValueError``, which the 422 answers with its type's fixed text.
 - Settings scopes (GH-159): ``UserSettingsPatch``, ``OrgSettingsPatch`` and
   ``PlatformSettingsPatch`` refuse unknown keys at every level (another
   scope's key, an org id, an LLM endpoint), take strict bools, need at least
@@ -275,6 +282,44 @@ from admino.access import (  # noqa: TC001 — Pydantic resolves field annotatio
 from admino.permissions import (  # noqa: TC001 — Pydantic resolves field annotations at runtime
     PermissionsConfig,
 )
+
+
+class FixedMessageError(ValueError):
+    """An admino validator's refusal whose fixed text the API answers as the 422 ``msg``.
+
+    GH-304: a request model's validator raises it instead of a plain
+    ``ValueError`` to opt its message into the validation list. Pydantic
+    treats it as any ``ValueError`` (type ``value_error``, msg
+    ``"Value error, <message>"``, the instance as ``ctx["error"]``), so its
+    own errors are unchanged; the server's 422 handlers and the platform LLM
+    400 answer ``message`` itself as ``msg``. Every other ``value_error`` (a
+    plain ``ValueError``, a library validator's error) keeps the fixed text of
+    its type.
+
+    Security: the message reaches the client verbatim, so it must be written
+    in admino's code, never built from what was sent. Construct it only with
+    a string literal or a name bound once to one (a module constant or a
+    single local assignment). ``tests/test_fixed_message_guard.py`` scans
+    every ``FixedMessageError(...)`` call in ``src/admino/`` and fails on any
+    other argument (an f-string, ``%``, ``.format``, ``+``, a parameter, a
+    rebound name), on an import or assignment of the class under another
+    name and on a ``class`` statement that subclasses it. The scan sees only
+    these calls, while the handlers answer ``str()`` of any instance (a
+    subclass's too): never set a message any other way (``__new__``,
+    assigning ``args``, a ``type()`` subclass, ``getattr``).
+
+    Args:
+        message: The fixed text; ``str(exc)`` is exactly this.
+    """
+
+    def __init__(self, message: str) -> None:
+        """Keep the one fixed message (``str(exc)``).
+
+        One positional argument only (``ValueError`` would take any number),
+        so a second value can never ride along in ``args``.
+        """
+        super().__init__(message)
+
 
 # Control characters to strip from SSE data (SSEEvent), from tool output sent
 # to the model (tools/registry.py) and from a stored user agent
@@ -911,7 +956,7 @@ class ConfirmRequest(BaseModel):
         """Refuse a body naming both a chat_id and a session_id, or neither."""
         if (self.chat_id is None) == (self.session_id is None):
             msg = "Give exactly one of chat_id and session_id."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         return self
 
 
@@ -2130,7 +2175,7 @@ class SettingsPatchLLM(BaseModel):
         if v is None:
             return v
         if not isinstance(v, str) or _MODEL_NAME_RE.fullmatch(v) is None:
-            raise ValueError(_MODEL_NAME_ERROR)
+            raise FixedMessageError(_MODEL_NAME_ERROR)
         return v
 
 
@@ -2178,7 +2223,7 @@ class UserSettingsPatch(BaseModel):
         notifications = self.notifications or SettingsPatchNotifications()
         if theme is None and notifications.enabled is None and notifications.task_done is None:
             msg = "Give at least one setting to change."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         return self
 
 
@@ -2375,7 +2420,7 @@ class PlatformSettingsPatch(BaseModel):
         sections = (self.llm, self.limits, self.files, self.retention, self.security)
         if not any(section.model_dump(exclude_none=True) for section in sections if section):
             msg = "Give at least one setting to change."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         return self
 
 
@@ -2625,11 +2670,12 @@ def _check_invite_email(value: str) -> str:
         char.isspace() or unicodedata.category(char) in _EMAIL_BANNED_CATEGORIES for char in value
     ):
         msg = "The email must not contain whitespace, control or invisible characters."
-        raise ValueError(msg)
+        raise FixedMessageError(msg)
     local, at, domain = value.partition("@")
     if not at or not local or "@" in domain or "." not in domain[1:-1]:
-        msg = "The email must look like name@example.com."
-        raise ValueError(msg)
+        # Its own name: a FixedMessageError's message is a name bound once (GH-304 guard).
+        shape_msg = "The email must look like name@example.com."
+        raise FixedMessageError(shape_msg)
     return value
 
 
@@ -2724,7 +2770,7 @@ class InvitationAcceptRequest(BaseModel):
         """Refuse control, format and line/paragraph separator characters."""
         if any(unicodedata.category(char) in _NAME_BANNED_CATEGORIES for char in value):
             msg = "The name must not contain control or formatting characters."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         return value
 
 
@@ -2755,7 +2801,7 @@ def _check_org_name(value: str) -> str:
     """
     if any(unicodedata.category(char) in _ORG_NAME_BANNED_CATEGORIES for char in value):
         msg = "The name must not contain control or formatting characters."
-        raise ValueError(msg)
+        raise FixedMessageError(msg)
     return value
 
 
@@ -2818,7 +2864,7 @@ class OrgLimitsPatch(BaseModel):
         """Refuse a patch that changes nothing."""
         if self.seats is None and self.monthly_budget_chf is None and self.storage_quota is None:
             msg = "Give at least one limit to change."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         return self
 
 
@@ -2949,7 +2995,7 @@ class OrgUserPatch(BaseModel):
             unicodedata.category(char) in _USER_NAME_BANNED_CATEGORIES for char in value
         ):
             msg = "The name must not contain control or formatting characters."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         return value
 
     @field_validator("email")
@@ -2963,7 +3009,7 @@ class OrgUserPatch(BaseModel):
         """Refuse a patch that changes nothing."""
         if self.role is None and self.name is None and self.email is None:
             msg = "Give a role, a name or an email to change."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         return self
 
 
@@ -3147,7 +3193,7 @@ class MyAccountPatch(BaseModel):
             unicodedata.category(char) in _USER_NAME_BANNED_CATEGORIES for char in value
         ):
             msg = "The name must not contain control or formatting characters."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         return value
 
     @field_validator("timezone")
@@ -3156,7 +3202,7 @@ class MyAccountPatch(BaseModel):
         """Accept a known IANA zone name only; the message never includes the value."""
         if value is not None and value not in _available_timezones():
             msg = "Unknown timezone."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         return value
 
     @field_validator("personal_instructions")
@@ -3169,7 +3215,7 @@ class MyAccountPatch(BaseModel):
         """
         if value is not None and _has_refused_instruction_char(value):
             msg = "The personal instructions must not contain control or formatting characters."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         return value
 
     @model_validator(mode="after")
@@ -3178,13 +3224,14 @@ class MyAccountPatch(BaseModel):
         given = self.model_fields_set
         if not given:
             msg = "Give at least one field to change."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         if any(
             field in given and getattr(self, field) is None
             for field in _NOT_NULLABLE_ACCOUNT_FIELDS
         ):
-            msg = "Only response_language can be null."
-            raise ValueError(msg)
+            # Its own name: a FixedMessageError's message is a name bound once (GH-304 guard).
+            null_msg = "Only response_language can be null."
+            raise FixedMessageError(null_msg)
         return self
 
 
@@ -3340,7 +3387,7 @@ class OrgSettingsPatch(BaseModel):
         """
         if value is not None and _has_refused_instruction_char(value):
             msg = "The instructions must not contain control or formatting characters."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         return value
 
     @model_validator(mode="after")
@@ -3351,7 +3398,7 @@ class OrgSettingsPatch(BaseModel):
             section.model_dump(exclude_none=True) for section in sections if section
         ):
             msg = "Give at least one setting to change."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         return self
 
 
@@ -3430,7 +3477,7 @@ def _check_chat_title(value: str) -> str:
     """
     if any(unicodedata.category(char) in CHAT_TITLE_BANNED_CATEGORIES for char in value):
         msg = "The title must not contain control or formatting characters."
-        raise ValueError(msg)
+        raise FixedMessageError(msg)
     return value
 
 
@@ -3618,7 +3665,7 @@ class ChatMessageCreate(BaseModel):
         """Refuse an id given twice (compared as UUIDs); the message names no id."""
         if len(set(value)) != len(value):
             msg = "Each attachment can be sent only once per message."
-            raise ValueError(msg)
+            raise FixedMessageError(msg)
         return value
 
 

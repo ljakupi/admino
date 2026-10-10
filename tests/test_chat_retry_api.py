@@ -61,6 +61,12 @@ What is pinned:
   history read, no file, no store). No app record carries the turn's texts or file
   name. Their well-formed twins (the same turns with tool_use blocks) are still
   retried: 200, the failed turn replaced.
+- GH-304 (Decision 6, contract C7; #302 review suggestion 1): a well-formed failed
+  turn whose ``seq`` range holds rows of another chat of the same owner and org (each
+  malformed for the shape check if it counted) is retried (200) with its own user
+  message and history and replaced, and the other chat (row, messages with their ids,
+  file) is untouched, also with its rows on both sides of the range and for a tool
+  turn ending ``stopped``.
 
 New names (the route) are reached through HTTP only, so the file collects
 before GH-245 is implemented.
@@ -1705,3 +1711,114 @@ def test_chat_retry_well_formed_twin_with_tool_use_blocks_is_still_retried(
     ids = _ids(db, failed.chat_id)
     assert ids[:2] == failed.earlier_ids
     assert set(ids).isdisjoint(failed.failed_ids)
+
+
+# ---------------------------------------------------------------------------
+# 11. Another chat's rows inside the failed turn (GH-304 Decision 6, contract C7)
+# ---------------------------------------------------------------------------
+
+_OTHER_QUESTION: Final = "Other question 304"
+
+# The own chat's well-formed failed turn (after ``_EARLIER``) interleaved with rows of
+# another chat of the same owner and org, in insertion order (so seq order): each
+# (chat, message, stored status), the chat "mine" or "other". Every "other" row
+# strictly inside the own turn's range is malformed for the shape check (a user row, a
+# complete no-block reply, a limit_reached or a stopped row), so counting it would
+# answer the 409 ``not_retryable``.
+_INTERLEAVED_TURNS: Final[dict[str, tuple[tuple[str, LLMMessage, str], ...]]] = {
+    # The reviewer's draft (PR #303): the other chat's complete no-block reply mid-turn.
+    "other_chats_complete_reply_mid_turn": (
+        ("other", _user(_OTHER_QUESTION), "complete"),
+        ("mine", _user(_MESSAGE), "complete"),
+        ("other", _assistant("Other answer 304"), "complete"),
+        ("mine", _assistant(_FAILED_REPLY), "error"),
+    ),
+    # Before the range, between every own row and after the own latest row.
+    "other_chats_rows_on_both_sides_of_a_tool_turn": (
+        ("other", _user(_OTHER_QUESTION), "complete"),
+        ("mine", _user(_MESSAGE), "complete"),
+        ("other", _assistant("Other answer 304"), "complete"),
+        ("mine", _tool_use(_RECALL), "complete"),
+        ("other", _user("Other follow-up 304"), "complete"),
+        ("mine", _tool(_TOOL_RESULT, _RECALL), "complete"),
+        ("other", _assistant("Other partial 304"), "limit_reached"),
+        ("mine", _assistant(_FAILED_REPLY), "error"),
+        ("other", _assistant("Other late answer 304"), "complete"),
+    ),
+    "other_chats_rows_in_a_tool_turn_ending_stopped": (
+        ("mine", _user(_MESSAGE), "complete"),
+        ("other", _user(_OTHER_QUESTION), "complete"),
+        ("mine", _tool_use(_RECALL), "complete"),
+        ("other", _assistant("Other answer 304"), "complete"),
+        ("mine", _tool(_TOOL_RESULT, _RECALL), "complete"),
+        ("other", _assistant("Other stop 304"), "stopped"),
+        ("mine", _assistant(_PARTIAL_REPLY), "stopped"),
+    ),
+}
+
+
+def _interleaved_turn(
+    world: World, placed: tuple[tuple[str, LLMMessage, str], ...]
+) -> tuple[_Failed, uuid.UUID]:
+    """The Editor's chat (last active long ago) with ``_EARLIER``, then ``placed`` row by
+    row into it or into another chat of the Editor (a file on that chat's first
+    question); the own chat's ``_Failed`` and the other chat's id."""
+    db = world.db
+    owner = world.a["editor"].user_id
+    mine = db.add_chat(owner, last_activity_at=_LONG_AGO)
+    other = db.add_chat(owner, title="Other 304", last_activity_at=_LONG_AGO)
+    earlier_ids = _seed(db, mine, *_EARLIER)
+    failed_ids: list[uuid.UUID] = []
+    other_ids: list[uuid.UUID] = []
+    for side, message, status in placed:
+        stored = plain(
+            db.add_chat_message(
+                mine if side == "mine" else other,
+                message.role,
+                message.content,
+                tool_use_blocks=message.tool_use_blocks,
+                tool_call_id=message.tool_call_id,
+                status=status,
+            )
+        )
+        (failed_ids if side == "mine" else other_ids).append(stored)
+    db.add_attachment(
+        other,
+        filename="other-304.pdf",
+        kind="pdf",
+        status="ready",
+        page_count=1,
+        token_estimate=10,
+        derived_bytes=10,
+        message_id=other_ids[0],
+    )
+    return _Failed(mine, earlier_ids, failed_ids), other
+
+
+@pytest.mark.parametrize("case", list(_INTERLEAVED_TURNS))
+def test_chat_retry_other_chats_rows_inside_the_failed_turn_leave_the_retry_unchanged(
+    world: World, client: TestClient, script: _Script, case: str
+) -> None:
+    """GH-304 (C7): the own failed turn is retried (200) with its own user message and
+    the history before it; it is replaced (the earlier rows with their ids, the user
+    message again, the run's reply), and the other chat's row, messages (ids included)
+    and file are exactly as they were, its rows inside the replaced range too."""
+    editor = world.a["editor"]
+    db = world.db
+    failed, other = _interleaved_turn(world, _INTERLEAVED_TURNS[case])
+    other_before = _snapshot(db, other)
+
+    response = _retry(client, editor, failed.chat_id)
+
+    assert response.status_code == 200, response.text
+    (run,) = script.runs
+    assert (run.user_message, _dump(run.history)) == (_MESSAGE, _dump(_EARLIER))
+    assert _stored(db, failed.chat_id) == [
+        *map(_row, _EARLIER),
+        _row(_user(_MESSAGE)),
+        _row(_assistant(_STUB_REPLY)),
+    ]
+    ids = _ids(db, failed.chat_id)
+    assert ids[:2] == failed.earlier_ids
+    assert set(ids).isdisjoint(failed.failed_ids)
+    assert _snapshot(db, other) == other_before

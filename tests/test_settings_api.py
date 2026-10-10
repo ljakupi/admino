@@ -3222,9 +3222,9 @@ class TestTaskDonePings:
     ) -> None:
         """A patch whose only task_done is null is the "nothing given" 422 on the body.
 
-        GH-302 (Decision 4): the validator's own text ("Give at least one setting to
-        change.") is no longer in the 422; its ``value_error`` type on ``["body"]``, with
-        the fixed message "Invalid value", says which check failed.
+        GH-304 (Decision 5): the validator's own fixed text ("Give at least one setting
+        to change.") is the ``msg`` of its ``value_error`` on ``["body"]`` again (GH-302
+        had replaced it with "Invalid value").
         """
         _, token = _login(db, "editor")
         before = _state(db)
@@ -3236,7 +3236,7 @@ class TestTaskDonePings:
         assert all(error["type"] != "extra_forbidden" for error in errors), errors
         assert [error["loc"] for error in errors] == [["body"]]
         assert [(error["type"], error["msg"]) for error in errors] == [
-            ("value_error", "Invalid value")
+            ("value_error", "Give at least one setting to change.")
         ]
         assert _state(db) == before
 
