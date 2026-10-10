@@ -846,8 +846,10 @@ Viewer's chats from before a role change stay stored, unused.
   `{"detail": [{"loc": [...], "msg": "...", "type": "..."}]}`, one entry per problem.
   `loc` says where (`["path", "chat_id"]`, `["body", "message"]`), `type` names the check
   that failed (such as `uuid_parsing`, `missing` or `less_than_equal`), and `msg` is a
-  fixed text per `type` (such as `Input should be a valid UUID`), so nothing you sent is
-  repeated, not even one character of it. A blank message (empty, or nothing but
+  fixed text per `type` (such as `Input should be a valid UUID`) that never quotes a
+  value you sent, not even one character of it. `loc` names the field, so for an
+  unknown field (extra fields are refused, `extra_forbidden`) or a key of a map it is
+  the name you sent. A blank message (empty, or nothing but
   spaces, tabs, line breaks and other whitespace) that sends no files answers `422`
   `{"detail": "Message is empty", "reason": "message_empty"}` on both message routes,
   before any chat is read, so every chat ID gets the same answer; it still counts
@@ -1501,7 +1503,9 @@ and images. They're what the model gets once the file is sent (see
 `PATCH /api/attachments/{id}` with `{"active": false}` excludes one of your files from the
 chat's later messages, and `{"active": true}` includes it again. The body is exactly that:
 `active` must be `true` or `false` (not a string, a number or `null`), and a missing
-`active` or any other field answers `422`, without echoing what you sent. The answer is
+`active` or any other field answers `422`, without echoing any value you sent (the
+`loc` of any other field is its name as you sent it, see **Errors** under
+[Chats](#chats)). The answer is
 `200` with the attachment, like `GET /api/attachments/{id}`, its `active` the new value.
 
 - **Any status.** It works on your own live attachment whatever its status (`uploaded`,

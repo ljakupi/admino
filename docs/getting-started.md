@@ -400,9 +400,16 @@ security rules.
 - **`Migration version 0031 is used by more than one file: 0031_a.sql, 0031_b.sql.`**
   Two migration files in `src/admino/migrations/` share one number (for example after
   merging two branches that each added one). The migrate step stops before it applies
-  anything and exits with 1, and the app refuses to start the same way; the log names
-  the number and the files, never their contents. Give one of the files the next free
-  number, then run `make migrate` again.
+  anything and exits with 1; its log names the number and the files, never their
+  contents. The app refuses to start the same way, but its own log says only
+  `Database startup failed (DuplicateMigrationVersionError)`, followed by the usual
+  hint to check the database settings and the migrations: read the migrate step's log
+  (`docker compose logs migrate`, or `make migrate`) for the number and the files.
+  Give the next free number to the file the database hasn't applied: its `_migrations`
+  table records, for each number, the `name` of the file it applied
+  (`SELECT name FROM _migrations WHERE version = 31`). Renumbering the applied one
+  would apply it again and leave the other skipped; on a new database, where neither
+  is applied, either one will do. Then run `make migrate` again.
 - **A tool says the account isn't connected.** Open the **Tools** page and click
   **Connect** for that provider (see [Connect your accounts](#connect-your-accounts)).
   Connections are per user: connecting your account doesn't connect a colleague's. If

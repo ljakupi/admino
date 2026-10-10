@@ -8022,10 +8022,13 @@ _VALIDATION_FALLBACK_MESSAGE: Final = "Invalid input"
 def _validation_response(errors: Sequence[ErrorDetails]) -> JSONResponse:
     """The 422 validation list: per error, its ``loc``, a fixed ``msg`` and its ``type``.
 
-    ``msg`` comes from ``_VALIDATION_MESSAGES`` by ``type`` (the fallback for
-    a type outside the table), never from pydantic: its ``msg``, ``ctx``,
-    ``input`` and ``url`` can carry the request's input and are dropped.
-    ``loc`` items are ``str()``-ed; a missing ``type`` is ``value_error``.
+    No input value is echoed: ``msg`` comes from ``_VALIDATION_MESSAGES`` by
+    ``type`` (the fallback for a type outside the table), never from
+    pydantic, whose ``msg``, ``ctx``, ``input`` and ``url`` can carry the
+    request's input and are dropped. ``loc`` is kept as FastAPI gives it, so
+    it names the field: for an unknown field (``extra_forbidden``) or a map
+    key, that is the name as the client sent it. ``loc`` items are
+    ``str()``-ed; a missing ``type`` is ``value_error``.
 
     Args:
         errors: The validation errors, in pydantic's (FastAPI's) order.
@@ -8050,11 +8053,13 @@ async def _validation_error_handler(
     request: Request,
     exc: ValidationError,
 ) -> JSONResponse:
-    """Handle Pydantic validation errors without echoing any input.
+    """Handle Pydantic validation errors without echoing any input value.
 
     The 422 validation list (``_validation_response``): each error's
-    ``loc``, ``type`` and the fixed message of its type (GH-302). Neither the
-    raw input nor pydantic's message, context or URL is in the body.
+    ``loc``, ``type`` and the fixed message of its type (GH-302). Neither an
+    input value nor pydantic's message, context or URL is in the body;
+    ``loc`` names the field, which for an unknown field or a map key is the
+    name as sent.
 
     Args:
         request: The incoming request (unused but required by FastAPI).
@@ -8070,21 +8075,24 @@ async def _request_validation_error_handler(
     request: Request,
     exc: RequestValidationError,
 ) -> JSONResponse:
-    """Handle FastAPI request validation errors without echoing any input.
+    """Handle FastAPI request validation errors without echoing any input value.
 
     FastAPI raises RequestValidationError (not pydantic.ValidationError)
     for request body/query/path validation failures. The 422 validation list
     (``_validation_response``) keeps each error's ``loc`` and ``type`` and
     answers the fixed message of its type (GH-302): pydantic's ``msg`` (which
     quoted a malformed UUID's character), ``input``, ``ctx`` and ``url`` never
-    reach the response. Reason-coded 422s are other handlers' and unchanged.
+    reach the response. ``loc`` names the field: for an unknown field
+    (``extra_forbidden``) or a map key, that is the name as the client sent
+    it. Reason-coded 422s are other handlers' and unchanged.
 
     Args:
         request: The incoming request (unused but required by FastAPI).
         exc: The FastAPI RequestValidationError wrapping Pydantic errors.
 
     Returns:
-        JSONResponse with safe error details (no raw input values).
+        JSONResponse with safe error details (no input values; ``loc`` as
+        FastAPI gives it).
     """
     return _validation_response(exc.errors())
 
