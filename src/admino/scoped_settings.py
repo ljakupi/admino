@@ -3,8 +3,9 @@
 Migration 0013 replaced the old key/value ``settings`` table with one table per
 owner, and this module is the service behind their routes and the startup:
 
-- ``user_settings`` (each user, the Super Admin included): theme and
-  notifications (the tool-approval and, GH-35, the task-done pings).
+- ``user_settings`` (each user, the Super Admin included): theme, density
+  and the notification types (GH-307, migration 0033: approvals waiting for
+  a decision, completed tasks and routine runs).
   ``get_user_settings`` / ``update_user_settings`` read and change the
   caller's own row and ``reset_user_settings`` deletes it, so it reads as the
   defaults again (``Capability.ACCOUNT_MANAGE``). Not audited: the user scope
@@ -64,7 +65,7 @@ owner, and this module is the service behind their routes and the startup:
   stored platform policy).
 
 A missing user or org_settings row reads as the column defaults (theme
-light, tool-approval pings on, task-done pings off; every tool on, no
+light, density comfortable, both notification types on; every tool on, no
 instructions, 60 minutes idle, 12 hours lifetime, 30 days trash) and a read
 writes nothing; an update creates the row from the column defaults first.
 
@@ -152,6 +153,8 @@ from admino.models import (
     PromptContext,
     SettingsAppearance,
     SettingsNotifications,
+    SettingsPatchAppearance,
+    SettingsPatchNotifications,
     ToolsSettings,
     UserSettingsResponse,
 )
@@ -172,11 +175,11 @@ _TOOLS: Final = tuple(ToolsSettings.model_fields)
 _NO_PLATFORM_ROW: Final = "The platform settings are missing; startup seeds them."
 
 _USER_SQL: Final = """
-    SELECT theme, notifications_enabled, notifications_task_done
+    SELECT theme, density, notifications_approvals, notifications_completed
     FROM user_settings
     WHERE user_id = $1
 """
-# The column defaults of migrations 0013 and 0015 fill a new row.
+# The column defaults of migrations 0013 and 0033 fill a new row.
 _USER_ENSURE_SQL: Final = """
     INSERT INTO user_settings (user_id) VALUES ($1)
     ON CONFLICT (user_id) DO NOTHING
@@ -185,11 +188,12 @@ _USER_ENSURE_SQL: Final = """
 _USER_UPDATE_SQL: Final = """
     UPDATE user_settings
     SET theme = coalesce($2, theme),
-        notifications_enabled = coalesce($3, notifications_enabled),
-        notifications_task_done = coalesce($4, notifications_task_done),
+        density = coalesce($3, density),
+        notifications_approvals = coalesce($4, notifications_approvals),
+        notifications_completed = coalesce($5, notifications_completed),
         updated_at = now()
     WHERE user_id = $1
-    RETURNING theme, notifications_enabled, notifications_task_done
+    RETURNING theme, density, notifications_approvals, notifications_completed
 """
 # No row reads as the defaults, so future columns reset too.
 _USER_RESET_SQL: Final = "DELETE FROM user_settings WHERE user_id = $1"
@@ -509,9 +513,10 @@ def _require(actor: Principal, *capabilities: Capability) -> None:
 def _user_response(row: Record) -> UserSettingsResponse:
     """The UserSettingsResponse of a user_settings row."""
     return UserSettingsResponse(
-        appearance=SettingsAppearance(theme=row["theme"]),
+        appearance=SettingsAppearance(theme=row["theme"], density=row["density"]),
         notifications=SettingsNotifications(
-            enabled=row["notifications_enabled"], task_done=row["notifications_task_done"]
+            approvals=row["notifications_approvals"],
+            completed=row["notifications_completed"],
         ),
     )
 
@@ -569,7 +574,7 @@ def _super_admin_policy(security: PlatformSecurity) -> sessions.SessionPolicy:
 
 
 async def get_user_settings(pool: asyncpg.Pool, *, actor: Principal) -> UserSettingsResponse:
-    """Return the actor's own theme and notifications (the defaults without a row).
+    """Return the actor's own appearance and notifications (the defaults without a row).
 
     Args:
         pool: The database pool.
@@ -602,7 +607,7 @@ async def update_user_settings(
     Args:
         pool: The database pool.
         actor: The logged-in account (any role, the Super Admin included).
-        patch: The validated theme and/or notifications to set.
+        patch: The validated appearance and/or notifications fields to set.
 
     Returns:
         The stored UserSettingsResponse after the change.
@@ -612,18 +617,24 @@ async def update_user_settings(
             issued.
     """
     _require(actor, Capability.ACCOUNT_MANAGE)
-    theme = None if patch.appearance is None else patch.appearance.theme
-    enabled = None if patch.notifications is None else patch.notifications.enabled
-    task_done = None if patch.notifications is None else patch.notifications.task_done
+    appearance = patch.appearance or SettingsPatchAppearance()
+    notifications = patch.notifications or SettingsPatchNotifications()
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(_USER_ENSURE_SQL, actor.user_id)
         # The row exists now: the UPDATE ... RETURNING yields exactly one row.
-        (row,) = await conn.fetch(_USER_UPDATE_SQL, actor.user_id, theme, enabled, task_done)
+        (row,) = await conn.fetch(
+            _USER_UPDATE_SQL,
+            actor.user_id,
+            appearance.theme,
+            appearance.density,
+            notifications.approvals,
+            notifications.completed,
+        )
     return _user_response(row)
 
 
 async def reset_user_settings(pool: asyncpg.Pool, *, actor: Principal) -> UserSettingsResponse:
-    """Revert the actor's own theme and notifications to the defaults (GH-35).
+    """Revert the actor's own appearance and notifications to the defaults (GH-35).
 
     Deletes the actor's ``user_settings`` row: a missing row reads as the
     defaults. Idempotent (no row: nothing to delete). Not audited: the user

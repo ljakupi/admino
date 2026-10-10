@@ -11,6 +11,8 @@ What these tests pin down:
   org, the client IP), and a frozen ``LoginResult`` returned: the raw token (kept
   out of its repr) and the cookie's ``max_age_seconds``. A hash with older
   parameters is rehashed with the current ones; a current hash is left alone.
+  The rehash keeps the same password, so it leaves ``password_changed_at``
+  as it was (GH-307).
 - Session policy (GH-152, GH-160, GH-169): the session is opened with
   ``scoped_settings.session_policy_for(<pool>, <the account's kind>, <the
   account's org_id>)``: a member's row stores the idle timeout and lifetime of
@@ -939,6 +941,30 @@ class TestLoginRehash:
             await _login(pool, password=_WRONG_PASSWORD)
 
         assert pool.matching(r"update users set password_hash") == []
+
+    @pytest.mark.parametrize(
+        "earlier",
+        [
+            pytest.param(None, id="never-changed"),
+            pytest.param(datetime(2026, 3, 4, 5, 6, 7, 890123, tzinfo=UTC), id="changed-before"),
+        ],
+    )
+    async def test_auth_login_rehash_keeps_password_changed_at(
+        self, old_hash: str, earlier: datetime | None
+    ) -> None:
+        """GH-307 (decision 4): the hash upgrade keeps the same password, so it isn't a
+        change. On the shared fake's users table the stored hash is upgraded, the UPDATE
+        stays ``password_hash = $1 WHERE id = $2`` (no password_changed_at), and the
+        account's password_changed_at keeps its value."""
+        db = FakeDb()
+        user_id = db.add_account(email=_EMAIL, password_hash=old_hash, password_changed_at=earlier)
+
+        await login(db.pool, email=_EMAIL, password=_PASSWORD, ip=_IP, user_agent=_USER_AGENT)
+
+        (rehash,) = db.matching(r"^update users set password_hash\b")
+        assert rehash.normalized == "update users set password_hash = $1 where id = $2"
+        assert db.users[user_id]["password_hash"] != old_hash
+        assert db.users[user_id]["password_changed_at"] == earlier
 
 
 # ---------------------------------------------------------------------------
