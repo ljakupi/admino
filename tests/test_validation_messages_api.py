@@ -27,9 +27,11 @@ What is pinned:
   ``limit`` of ``GET /api/chats/{chat_id}`` is "Input is too small" below and
   "Input is too large" above, the same text for two different inputs, with neither
   the input nor the bound (no digit at all) in the body; a malformed JSON body is
-  ``json_invalid`` / "Invalid JSON" with no fragment of the body; a model
-  validator's own text ("Give at least one setting to change.") becomes
-  ``value_error`` / "Invalid value" on ``["body"]``; several errors keep FastAPI's
+  ``json_invalid`` / "Invalid JSON" with no fragment of the body; an admino model
+  validator's own fixed text ("Give at least one setting to change.") is the ``msg``
+  of its ``value_error`` on ``["body"]`` (GH-304 Decision 5: it raises
+  ``FixedMessageError``, whose fixed text passes; tests/test_fixed_validator_messages_api.py
+  pins that mapping); several errors keep FastAPI's
   order, ``loc`` (an extra field's ``loc`` still names the field) and ``type``;
   a reason-coded 422 (``invalid_cursor``) is unchanged.
 
@@ -525,21 +527,27 @@ def test_validation_messages_api_malformed_json_body_is_invalid_json(
     assert "draft" not in response.text
 
 
-def test_validation_messages_api_model_validator_text_is_invalid_value(
+def test_validation_messages_api_model_validator_fixed_text_is_the_msg(
     world: World, client: TestClient
 ) -> None:
-    """``PATCH /api/me/settings`` with nothing to change: the validator's own text is
-    replaced by "Invalid value"; ``loc`` ``["body"]`` and ``value_error`` still say which
-    check failed."""
+    """``PATCH /api/me/settings`` with nothing to change: the validator's own fixed text
+    ("Give at least one setting to change.") is the ``msg`` again (GH-304 Decision 5);
+    ``loc`` ``["body"]`` and ``value_error`` still say which check failed."""
     editor = world.a["editor"]
 
     response = client.patch("/api/me/settings", json={}, headers=editor.cookie)
 
     assert response.status_code == 422, response.text
     assert response.json() == {
-        "detail": [{"loc": ["body"], "msg": _INVALID_VALUE, "type": "value_error"}]
+        "detail": [
+            {
+                "loc": ["body"],
+                "msg": "Give at least one setting to change.",
+                "type": "value_error",
+            }
+        ]
     }
-    assert "setting" not in response.text
+    assert _INVALID_VALUE not in response.text
 
 
 def test_validation_messages_api_envelope_keeps_loc_type_and_order(

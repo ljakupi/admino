@@ -76,6 +76,14 @@ What these tests pin down:
   ``chats._RETRY_TARGET_SQL`` is migration 0031's, text for text (whitespace and case
   aside). The forged ``error`` after a completed turn has no target any more (the
   store-time refusal, called directly, still holds).
+- GH-304 (Decision 6, contract C7; #302 review suggestion 1): the shape check's chat
+  filter by behaviour. ``seq`` is one identity across every chat (as on PostgreSQL), so
+  rows of another chat of the same owner and org can sit inside the failed turn's
+  ``seq`` range; each such row would make the turn malformed if the check counted it
+  (a user row, a complete no-block answer, a ``limit_reached`` or ``stopped`` row). The
+  target is still exactly the own turn (``user_seq``, ``through_seq``, ``status``, the
+  own user text and the own user row's file), with the other chat's rows inside the
+  range only, on both sides of it and after it, and for a tool turn ending ``stopped``.
 - Tenant isolation (§5): every statement binds the caller's org, every statement on
   the chat or the function binds the caller as owner, and no foreign id is bound.
 - No content in logs or errors (§1): message, answer, tool-output, file-name and title
@@ -1077,6 +1085,132 @@ def test_chats_retry_read_shape_predicate_is_delete_failed_turns(chats: ModuleTy
 
     assert _shape_predicate(chats._RETRY_TARGET_SQL) == _shape_predicate(
         migration.read_text(encoding="utf-8")
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3c. read_retry_target: another chat's rows inside the turn (GH-304 Decision 6, C7)
+# ---------------------------------------------------------------------------
+
+# One seeded row placed in a chat: "mine" (the chat read) or "other" (another chat of the
+# same owner and org), and its spec. Labels are unique across both chats.
+_Placed = tuple[str, _Spec]
+
+_OTHER_QUESTION: Final[_Spec] = ("o1", "user", "Other question 304", "complete", {})
+_MINE_FILE: Final = uuid.UUID("e3040000-0000-4000-8000-000000000001")
+_OTHER_FILE: Final = uuid.UUID("53040000-0000-4000-8000-000000000002")
+
+# GH-304: the own chat's well-formed failed turn, interleaved with the other chat's rows
+# (in insertion order, so seq order); each (rows, through label, status, user label) like
+# _TARGET_SHAPES. Every "other" row strictly inside the own turn's range is malformed
+# for the shape check (a user row, a complete no-block answer, a limit_reached or a
+# stopped row), so counting it would cost the target.
+_INTERLEAVED: Final[dict[str, tuple[tuple[_Placed, ...], str, str, str]]] = {
+    # The reviewer's draft (PR #303): the other chat's complete no-block answer mid-turn.
+    "other-chats-complete-answer-mid-turn": (
+        (
+            ("other", _OTHER_QUESTION),
+            ("mine", _U1),
+            ("mine", _A1),
+            ("mine", _U2),
+            ("other", ("o2", "assistant", "Other answer 304", "complete", {})),
+            ("mine", ("a2", "assistant", ANSWER_CANARY, "error", {})),
+        ),
+        "a2",
+        "error",
+        "u2",
+    ),
+    # Before the range, between every own row and after the own latest row.
+    "other-chats-rows-on-both-sides-of-a-tool-turn": (
+        (
+            ("mine", _U1),
+            ("mine", _A1),
+            ("other", _OTHER_QUESTION),
+            ("mine", _U2),
+            ("other", ("o2", "assistant", "Other answer 304", "complete", {})),
+            ("mine", _CALENDAR_TURN),
+            ("other", ("o3", "user", "Other follow-up 304", "complete", {})),
+            ("mine", ("t2", "tool", TOOL_CANARY, "complete", {"tool_call_id": "call_cal_1"})),
+            ("other", ("o4", "assistant", "Other partial 304", "limit_reached", {})),
+            ("mine", ("a3", "assistant", ANSWER_CANARY, "error", {})),
+            ("other", ("o5", "assistant", "Other late answer 304", "complete", {})),
+        ),
+        "a3",
+        "error",
+        "u2",
+    ),
+    "other-chats-rows-in-a-tool-turn-ending-stopped": (
+        (
+            ("mine", _U1),
+            ("mine", _A1),
+            ("mine", _U2),
+            ("other", _OTHER_QUESTION),
+            ("mine", _CALENDAR_TURN),
+            ("other", ("o2", "assistant", "Other answer 304", "complete", {})),
+            ("mine", ("t2", "tool", TOOL_CANARY, "complete", {"tool_call_id": "call_cal_1"})),
+            ("other", ("o3", "assistant", "Other stop 304", "stopped", {})),
+            ("mine", ("a3", "assistant", _PARTIAL, "stopped", {})),
+        ),
+        "a3",
+        "stopped",
+        "u2",
+    ),
+}
+
+
+def _interleaved_chats(
+    seeded: _Seeded, placed: tuple[_Placed, ...]
+) -> tuple[uuid.UUID, uuid.UUID, dict[str, _Stored]]:
+    """Two chats of the editor (org A) seeded row by row in ``placed``'s order, a file on
+    the own turn's user row (u2) and one on the other chat's question (o1); the own
+    chat's id, the other's and every row by label."""
+    db = seeded.db
+    editor = seeded.world.a["editor"].user_id
+    by_side = {
+        "mine": db.add_chat(editor, title="Mine", title_source="user"),
+        "other": db.add_chat(editor, title="Other", title_source="user"),
+    }
+    stored: dict[str, _Stored] = {}
+    for side, spec in placed:
+        stored.update(_seed(db, by_side[side], (spec,)))
+    for side, label, file_id in (("mine", "u2", _MINE_FILE), ("other", "o1", _OTHER_FILE)):
+        db.add_attachment(
+            by_side[side],
+            attachment_id=file_id,
+            filename=f"{side}-304.pdf",
+            kind="pdf",
+            status="ready",
+            message_id=stored[label].id,
+            created_at=_T1,
+        )
+    return by_side["mine"], by_side["other"], stored
+
+
+@pytest.mark.parametrize("case", list(_INTERLEAVED))
+async def test_chats_retry_read_other_chats_rows_inside_the_turn_leave_the_target_unchanged(
+    chats: ModuleType, seeded: _Seeded, case: str
+) -> None:
+    """GH-304 (C7): the other chat's rows sit inside the own turn's seq range (the
+    premise, checked first), and the target is exactly the own turn: its user row's seq
+    and text, its latest row's seq and status, the own user row's file only."""
+    placed, through, status, user = _INTERLEAVED[case]
+    mine, _, stored = _interleaved_chats(seeded, placed)
+    other_labels = [spec[0] for side, spec in placed if side == "other"]
+    inside = [
+        label
+        for label in other_labels
+        if stored[user].seq < stored[label].seq < stored[through].seq
+    ]
+    assert inside, "the other chat's rows must sit inside the own turn's seq range"
+
+    target = await chats.read_retry_target(seeded.db.pool, seeded.editor, mine)
+
+    assert target == chats.RetryTarget(
+        through_seq=stored[through].seq,
+        status=status,
+        user_seq=stored[user].seq,
+        message=MESSAGE_CANARY,
+        attachment_ids=(_MINE_FILE,),
     )
 
 

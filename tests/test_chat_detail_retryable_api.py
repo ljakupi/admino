@@ -45,6 +45,12 @@ What is pinned:
 - It agrees with the retry route's status check (GH-245): every chat it calls
   retryable is re-run by ``POST /api/chats/{chat_id}/retry`` (200), every other
   answers the 409 ``not_retryable``.
+- GH-304 (Decision 6, contract C7; #302 review suggestion 1): a well-formed failed
+  turn whose ``seq`` range holds rows of another chat of the same owner and org (seq
+  is one identity across chats; each such row would make the turn malformed if the
+  shape check counted it) is still ``retryable: true``, with the other chat's rows
+  inside the range only, on both sides of it and after it, and for a tool turn ending
+  ``stopped``; the page holds the own chat's rows only.
 
 Nothing new is imported at module level, so the file collects either way.
 
@@ -783,3 +789,96 @@ class TestChatDetailRetryableAgreesWithRetry:
         answer = (retried.status_code, retried.json() if retried.status_code == 409 else None)
         expected = (200, None) if retryable else (409, _NOT_RETRYABLE)
         assert (reported, answer) == (retryable, expected)
+
+
+# ---------------------------------------------------------------------------
+# 4. Another chat's rows inside the failed turn (GH-304 Decision 6, contract C7)
+# ---------------------------------------------------------------------------
+
+# One stored row placed in a chat: "mine" (the chat read) or "other" (another chat of
+# the same owner and org).
+_Placed = tuple[str, _Row]
+
+# The own chat's well-formed failed turn interleaved with the other chat's rows, in
+# insertion order (so seq order). Every "other" row strictly inside the own turn's range
+# is malformed for the shape check (a user row, a complete no-block reply, a
+# limit_reached or a stopped row), so counting it would make the turn not retryable.
+_INTERLEAVED: Final[dict[str, list[_Placed]]] = {
+    # The reviewer's draft (PR #303): the other chat's complete no-block reply mid-turn.
+    "other-chats-complete-reply-mid-turn": [
+        ("other", _ASK),
+        ("mine", _ASK),
+        ("other", _reply("complete")),
+        ("mine", _reply("error")),
+    ],
+    # Before the range, between every own row and after the own latest row.
+    "other-chats-rows-on-both-sides-of-a-tool-turn": [
+        ("mine", _ASK),
+        ("mine", _reply("complete")),
+        ("other", _ASK),
+        ("mine", _ASK),
+        ("other", _reply("complete")),
+        ("mine", _reply("complete", _BLOCKS)),
+        ("other", _ASK),
+        ("mine", _result("complete")),
+        ("other", _reply("limit_reached")),
+        ("mine", _reply("error")),
+        ("other", _reply("complete")),
+    ],
+    "other-chats-rows-in-a-tool-turn-ending-stopped": [
+        ("mine", _ASK),
+        ("other", _ASK),
+        ("mine", _reply("complete", _BLOCKS)),
+        ("other", _reply("complete")),
+        ("mine", _result("complete")),
+        ("other", _reply("stopped")),
+        ("mine", _reply("stopped")),
+    ],
+}
+
+
+def _interleaved_chats(db: FakeDb, owner: Account, placed: list[_Placed]) -> uuid.UUID:
+    """Two titled chats of ``owner`` seeded row by row in ``placed``'s order (the texts
+    of ``_shaped_chat``); the own chat's id."""
+    by_side = {
+        "mine": db.add_chat(owner.user_id, title="Retry 304", title_source="user"),
+        "other": db.add_chat(owner.user_id, title="Other 304", title_source="user"),
+    }
+    for side, (role, status, blocks) in placed:
+        chat_id = by_side[side]
+        if role == "user":
+            db.add_chat_message(chat_id, "user", "Offerte 304 bitte", status=status)
+        elif role == "tool":
+            db.add_chat_message(
+                chat_id, "tool", "Two emails found.", tool_call_id=_CALL_ID, status=status
+            )
+        else:
+            db.add_chat_message(
+                chat_id,
+                "assistant",
+                "Ich suche die Offerte 304.",
+                tool_use_blocks=blocks,
+                status=status,
+            )
+    return by_side["mine"]
+
+
+class TestChatDetailRetryableInterleaved:
+    """Another chat's rows inside the turn's seq range don't change ``retryable``."""
+
+    @pytest.mark.parametrize("case", list(_INTERLEAVED))
+    def test_chat_detail_retryable_other_chats_rows_inside_the_turn_keep_it_retryable(
+        self, world: World, client: TestClient, case: str
+    ) -> None:
+        """GH-304 (C7): the own chat's page holds its own rows only (role and status in
+        seq order), and ``retryable`` is ``true`` (a JSON bool) though the other chat's
+        rows sit between the own turn's user row and its failed latest row."""
+        editor = world.a["editor"]
+        placed = _INTERLEAVED[case]
+        chat_id = _interleaved_chats(world.db, editor, placed)
+
+        body = _body(_detail(client, editor, chat_id))
+
+        own = [(role, status) for side, (role, status, _) in placed if side == "mine"]
+        page = [(message["role"], message["status"]) for message in body["messages"]]
+        assert (page, body.get("retryable", "missing")) == (own, True)
