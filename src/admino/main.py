@@ -13,9 +13,10 @@ Startup sequence:
 4. Load the bundled common-password list (the password policy's list check).
 5. Initialise the database as the least-privilege runtime role
    ``admino_app`` (GH-220): connect with PG_APP_PASSWORD, check health, and
-   refuse to start while a shipped migration is not applied (startup never
-   migrates: the one-shot migrate step, ``python -m admino.migrate``, does
-   that as the owner). Then seed the platform settings row from config.yaml
+   refuse to start while a shipped migration is not applied or two shipped
+   migration files share a version number (GH-302; startup never migrates:
+   the one-shot migrate step, ``python -m admino.migrate``, does that as the
+   owner). Then seed the platform settings row from config.yaml
    (its llm on every boot, its limits once), seed the default permission
    matrix of every org that has none (``org_permissions.seed_missing_orgs``),
    and overlay the stored platform LLM and limits onto the config. No
@@ -342,9 +343,12 @@ async def _async_startup(config: AppConfig) -> AppConfig:
         ValueError: If PG_APP_PASSWORD is not set.
         RuntimeError: If the database health check fails, or the schema is
             not up to date.
+        DuplicateMigrationVersionError: Two shipped migration files share a
+            version (GH-302), raised unchanged once the pool is closed.
     """
     from admino import org_permissions, scoped_settings
     from admino.database import (
+        DuplicateMigrationVersionError,
         check_health,
         close_pool,
         database_url_from_env,
@@ -368,7 +372,14 @@ async def _async_startup(config: AppConfig) -> AppConfig:
         msg = "PostgreSQL health check failed — database is unreachable."
         raise RuntimeError(msg)
 
-    if await pending_migration_versions(pool):
+    try:
+        pending = await pending_migration_versions(pool)
+    except DuplicateMigrationVersionError:
+        # Like pending migrations: the pool goes, the app doesn't start. Its fixed
+        # message (a version and file names) propagates as it is.
+        await close_pool()
+        raise
+    if pending:
         await close_pool()
         msg = (
             "The database schema is not up to date: run the migrations first "

@@ -397,6 +397,12 @@ security rules.
 - **The database schema is not up to date.** The app found pending migrations and
   doesn't run them itself. In Docker, check the `migrate` service's log
   (`docker compose logs migrate`); for local dev, run `make migrate`.
+- **`Migration version 0031 is used by more than one file: 0031_a.sql, 0031_b.sql.`**
+  Two migration files in `src/admino/migrations/` share one number (for example after
+  merging two branches that each added one). The migrate step stops before it applies
+  anything and exits with 1, and the app refuses to start the same way; the log names
+  the number and the files, never their contents. Give one of the files the next free
+  number, then run `make migrate` again.
 - **A tool says the account isn't connected.** Open the **Tools** page and click
   **Connect** for that provider (see [Connect your accounts](#connect-your-accounts)).
   Connections are per user: connecting your account doesn't connect a colleague's. If

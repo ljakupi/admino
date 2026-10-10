@@ -159,7 +159,10 @@ How it's enforced:
   can't delete a completed turn otherwise, only its whole chat (above). The function
   unlinks that user message's files first, so they're kept, and refuses anything else
   with one fixed error that names no row. The deletion and the new turn are stored in one
-  transaction, so a refused or failed retry leaves the failed turn as it was.
+  transaction, so a refused or failed retry leaves the failed turn as it was. The retry
+  checks the same shape before it runs: a turn the function would refuse (a stopped or
+  approval turn whose tool call came without call ids) answers `409` `not_retryable`
+  before any model call or action.
 - **New tables get explicit grants.** A migration that creates a table grants
   `admino_app` exactly what the app needs on it, in the same file; a unit test fails
   otherwise. New functions get no `EXECUTE` for anyone by default.

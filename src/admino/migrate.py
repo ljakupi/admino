@@ -15,7 +15,9 @@ owns every table and function. In order it:
    PG_PASSWORD.
 2. Opens a one-connection pool as the owner and applies the pending migrations
    (``database.run_migrations``; migration 0018 creates the runtime role
-   ``admino_app``).
+   ``admino_app``). Two shipped migration files with one version number stop
+   it before any statement (GH-302): nothing is applied, and the log names
+   the version and the files.
 3. Sets ``admino_app``'s password from PG_APP_PASSWORD, as a SCRAM-SHA-256
    verifier computed here, then closes the pool.
 
@@ -36,7 +38,9 @@ Security notes:
   identity only for ASCII, so the verifier matches what a client sends).
 - No log line, exception message or return value carries a password, the DSN
   or the verifier: failures are logged by exception type with a fixed hint,
-  never a message or a traceback.
+  never a message or a traceback. The one exception is
+  ``database.DuplicateMigrationVersionError``, whose fixed message (a version
+  number and file names only) is logged as it is, without the hint.
 - No eval, exec, importlib, subprocess or shell.
 """
 
@@ -247,8 +251,9 @@ def main() -> int:
     """Validate the configuration, migrate, and set the runtime role's password.
 
     Returns:
-        0 when migrated, 1 on an unsafe configuration (nothing connects) or a
-        failure (logged by exception type only).
+        0 when migrated, 1 on an unsafe configuration (nothing connects), two
+        migration files sharing a version (their fixed message logged, nothing
+        applied) or another failure (logged by exception type only).
     """
     _configure_logging()
     owner_dsn = owner_database_url_from_env()
@@ -269,6 +274,12 @@ def main() -> int:
         return 1
     try:
         asyncio.run(migrate(owner_dsn, runtime_password))
+    except database.DuplicateMigrationVersionError as exc:
+        # Before _MIGRATE_ERRORS (it is a RuntimeError): its message is fixed text, the
+        # version and the file names, never SQL, the DSN or a password, and the
+        # connection hint would point the operator at the wrong cause.
+        logger.error("%s", exc)
+        return 1
     except _MIGRATE_ERRORS as exc:
         # The type only: the message can carry the DSN or the verifier.
         logger.error(_MIGRATE_FAILED, type(exc).__name__)
