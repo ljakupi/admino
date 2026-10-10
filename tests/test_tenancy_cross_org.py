@@ -2068,17 +2068,21 @@ class TestOwnUserAccountRoutes:
     def test_cross_org_my_settings_get_reads_only_the_callers_row(
         self, world: World, client: TestClient
     ) -> None:
-        """B's editor stored dark/no notifications; A's editor (no row) gets the defaults."""
+        """B's editor stored dark/compact/no approval notifications; A's editor (no row)
+        gets the defaults (GH-307 fields)."""
         world.db.add_user_settings(
-            world.b["editor"].user_id, theme="dark", notifications_enabled=False
+            world.b["editor"].user_id,
+            theme="dark",
+            density="compact",
+            notifications_approvals=False,
         )
 
         a_view = client.get("/api/me/settings", headers=world.a["editor"].cookie)
         b_view = client.get("/api/me/settings", headers=world.b["editor"].cookie)
 
         assert a_view.status_code == 200, a_view.text
-        assert a_view.json()["appearance"]["theme"] == "light"
-        assert a_view.json()["notifications"]["enabled"] is True
+        assert a_view.json()["appearance"] == {"theme": "light", "density": "comfortable"}
+        assert a_view.json()["notifications"]["approvals"] is True
         assert b_view.json()["appearance"]["theme"] == "dark"  # control
 
     @covers(("PATCH", "/api/me/settings"))
@@ -2108,8 +2112,8 @@ class TestOwnUserAccountRoutes:
         """A's editor resets: A is back to the defaults, B's dark theme stays."""
         victim = world.b["editor"]
         caller = world.a["editor"]
-        world.db.add_user_settings(victim.user_id, theme="dark", notifications_task_done=True)
-        world.db.add_user_settings(caller.user_id, theme="dark", notifications_task_done=True)
+        world.db.add_user_settings(victim.user_id, theme="dark", notifications_completed=False)
+        world.db.add_user_settings(caller.user_id, theme="dark", notifications_completed=False)
         b_before = _user_settings_row(world.db, victim.user_id)
 
         response = client.post("/api/me/settings/reset", headers=caller.cookie)
