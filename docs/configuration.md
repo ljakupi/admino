@@ -421,6 +421,12 @@ next to it; **Save** stays off until something changed, and **Reset** drops your
   attack; raise `lockout_minutes` or lower `lockout_after_failures` instead.
 - A value out of range answers `422`. A trash minimum above the maximum, after merging
   with the stored values, answers `400`. Nothing is changed in either case.
+- An `llm` change is merged over the stored LLM settings and checked like `config.yaml`'s
+  `llm` section. A result that isn't valid (in practice a damaged stored row, since every
+  value you send is checked first) answers `400` with the same validation list as
+  a `422` (see **Errors** under [Chats](#chats)): per problem its `loc`, its `type` and a
+  fixed `msg` (`Invalid value` for the LLM settings' own checks), never a value you sent
+  or a stored one. Nothing is changed, and the running provider stays.
 - A `llm.max_input_tokens` that leaves no room for the reserved output and the safety
   margin (see [Context budget](#context-budget): the reserved output must be below the
   budget) answers `422` `{"detail": "The model's max input tokens leave no room for the
@@ -846,10 +852,15 @@ Viewer's chats from before a role change stay stored, unused.
   `{"detail": [{"loc": [...], "msg": "...", "type": "..."}]}`, one entry per problem.
   `loc` says where (`["path", "chat_id"]`, `["body", "message"]`), `type` names the check
   that failed (such as `uuid_parsing`, `missing` or `less_than_equal`), and `msg` is a
-  fixed text per `type` (such as `Input should be a valid UUID`) that never quotes a
-  value you sent, not even one character of it. `loc` names the field, so for an
-  unknown field (extra fields are refused, `extra_forbidden`) or a key of a map it is
-  the name you sent. A blank message (empty, or nothing but
+  fixed text per `type` (such as `Input should be a valid UUID`). When one of admino's
+  own checks refused the request, `msg` is that check's message instead (`type` is
+  `value_error`), such as `Give at least one setting to change.` for a settings change
+  that changes nothing. These messages are written in admino's code and never built
+  from what you sent; any other `value_error` (a library's check, for instance) keeps
+  the fixed text `Invalid value`. Either way, `msg`
+  never quotes a value you sent, not even one character of it. `loc` names the field,
+  so for an unknown field (extra fields are refused, `extra_forbidden`) or a key of a
+  map it is the name you sent. A blank message (empty, or nothing but
   spaces, tabs, line breaks and other whitespace) that sends no files answers `422`
   `{"detail": "Message is empty", "reason": "message_empty"}` on both message routes,
   before any chat is read, so every chat ID gets the same answer; it still counts
