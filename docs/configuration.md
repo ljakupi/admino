@@ -590,21 +590,22 @@ any of its fields; both only ever reach your own account.
 Changes to your name, languages, timezone and personal instructions aren't recorded in the
 audit log, and their content is never logged.
 
-**Invitations.** An Org Admin invites people into their organization with an email
-address and a role (Org Admin, Editor or Viewer): `POST /api/org/invitations`. The
-address can't belong to any account on the platform yet, in any capitalization. admino
-emails the invitee a link to `/accept-invitation` that works once, for 72 hours. Opening
-it shows the organization, the role and the email address; accepting it with a name and a
-password (which follows the password rules above) activates the account and logs the
-invitee in. The email goes out in the inviting admin's language, which also becomes the
-new account's language. A pending invitation takes a seat, even after its link expired,
-until it's revoked or accepted, so an organization with no free seat can't invite anyone
-else. Org Admins list the pending invitations (`GET /api/org/invitations`, expired ones
-marked), revoke one (`DELETE /api/org/invitations/{id}`, which frees the address and the
-seat) or send it again with a new link (`POST /api/org/invitations/{id}/resend`, the old
-link stops working, an email with it that hasn't gone out yet is cancelled, and the 72
-hours start over). Sending, revoking, resending and accepting are recorded in the audit
-log, without the email address. Only a hash of the link's token is stored.
+**Invitations.** An Org Admin invites people into their organization with an email address
+and a role, Org Admin or Editor (any other role answers `422`): `POST
+/api/org/invitations`. The address can't belong to any account on the platform yet, in any
+capitalization. admino emails the invitee a link to `/accept-invitation` that works once,
+for 72 hours. Opening it shows the organization, the role and the email address; accepting
+it with a name and a password (which follows the password rules above) activates the
+account and logs the invitee in. The email goes out in the inviting admin's language,
+which also becomes the new account's language. A pending invitation takes a seat, even
+after its link expired, until it's revoked or accepted, so an organization with no free
+seat can't invite anyone else. Org Admins list the pending invitations (`GET
+/api/org/invitations`, expired ones marked), revoke one (`DELETE
+/api/org/invitations/{id}`, which frees the address and the seat) or send it again with a
+new link (`POST /api/org/invitations/{id}/resend`, the old link stops working, an email
+with it that hasn't gone out yet is cancelled, and the 72 hours start over). Sending,
+revoking, resending and accepting are recorded in the audit log, without the email
+address. Only a hash of the link's token is stored.
 
 A send refused because the address is already taken, or because there's no free seat,
 answers `409` and is recorded in the audit log too (without the address). Refused sends
@@ -617,7 +618,7 @@ front of it must not log request paths either. The bundled Caddy proxy doesn't (
 [Production deployment](#production-deployment-tls-reverse-proxy)).
 
 **Managing users.** Org Admins manage the people in their organization with these
-routes. Editors, Viewers and the Super Admin get `403`.
+routes. Editors and the Super Admin get `403`.
 
 - `GET /api/org/users` lists the organization's active and deactivated users, oldest
   first: name, email address, role, status, when the account was created and when the user
@@ -626,18 +627,17 @@ routes. Editors, Viewers and the Super Admin get `403`.
   `seats: {"used", "limit"}`: `limit` is the organization's seats, and `used` counts active
   users and pending invitations (expired ones included), the same count an invitation is
   checked against.
-- `PATCH /api/org/users/{id}` changes a user's role, name or email address. The new address
-  can't belong to any account on the platform yet, in any capitalization. When the address
-  changes, admino emails the old address a short notice (without either address), and a
-  password reset link the user already got stops working. A new role applies from the
-  user's next request: once they're made a Viewer, an approval of theirs still waiting in
-  a chat is refused too (`403`). A Viewer keeps their chats, connections and notes,
-  unused.
+- `PATCH /api/org/users/{id}` changes a user's role, name or email address. The new
+  address can't belong to any account on the platform yet, in any capitalization. When the
+  address changes, admino emails the old address a short notice (without either address),
+  and a password reset link the user already got stops working. The role is Org Admin or
+  Editor (any other role answers `422`). A new role applies from the user's next request.
 - `POST /api/org/users/{id}/deactivate` ends every session of the user at once (an
   approval of theirs still waiting in a chat is refused too) and emails them that their
   account was deactivated. Their chats, connections, notes and settings are kept.
-- `POST /api/org/users/{id}/reactivate` needs a free seat (active and invited users take
-  one), and emails the user a link to log in.
+- `POST /api/org/users/{id}/reactivate` restores the account with the role it has stored,
+  needs a free seat (active and invited users take one), and emails the user a link to log
+  in.
 - `DELETE /api/org/users/{id}` deletes the account with its sessions, chats, connections,
   notes and settings, and its [attachments](#attachments) with their files. The email
   address is free again.
@@ -682,7 +682,6 @@ What you see depends on your role:
 | --- | --- |
 | Org Admin | Chat, Tools, Organization, Settings |
 | Editor | Chat, Tools, Permissions (read-only), Settings |
-| Viewer | Chat (read-only: projects shared with you, with no message box), Permissions (read-only) and Settings |
 | Super Admin | Platform, and Settings with only My account and About (no chat) |
 
 The Organization page has three tabs. **Users** lists the organization's users and pending
@@ -693,13 +692,12 @@ deactivates or reactivates them, sends a password reset link, logs them out ever
 deletes them. Each pending invitation can be sent again or revoked. Every action except
 resending asks for confirmation first, and a refused action shows why, such as "an
 organization needs at least one active Org Admin". The role choices are Org Admin and
-Editor: the Viewer role isn't offered yet, because there's nothing to share with a Viewer
-in this release. **Settings** holds the organization's profile, instructions, session
-policy, trash retention and services (which tools the agent may use), with its data
-residency and plan read-only (see [Organization settings](#organization-settings)).
+Editor. **Settings** holds the organization's profile, instructions, session policy, trash
+retention and services (which tools the agent may use), with its data residency and plan
+read-only (see [Organization settings](#organization-settings)).
 **Permissions** holds the tool permissions and critical permissions.
 The Tools page is **My connections**: each user connects their own Google and Microsoft
-accounts there (see [Tools → Authentication](tools.md#authentication)). The Permissions page shows Editors and Viewers
+accounts there (see [Tools → Authentication](tools.md#authentication)). The Permissions page shows Editors
 what the agent may do in their organization. The Platform page is the Super Admin's console (see
 [Organizations](#organizations-super-admin)). The server checks every request on its own, so a hidden page's API still
 refuses a role that isn't allowed to use it.
@@ -708,8 +706,7 @@ refuses a role that isn't allowed to use it.
 
 Chats are stored in PostgreSQL, in their organization, and they're private to the member
 who started them. Nobody else can read them in this release, not even an Org Admin. Org
-Admins and Editors chat. Viewers and the Super Admin get `403` on every chat route. A
-Viewer's chats from before a role change stay stored, unused.
+Admins and Editors chat; the Super Admin gets `403` on every chat route.
 
 | Route | What it does |
 | --- | --- |
@@ -910,9 +907,8 @@ Viewer's chats from before a role change stay stored, unused.
   [permissions](permissions.md#per-organization) as they are when the approval runs.
   An approval or a denial that waited behind a reply still running in the chat is refused
   like any later request when, meanwhile, your account was deactivated or deleted or your
-  organization deactivated (`401`), or you were made a Viewer (`403`). Nothing runs. The
-  confirmation stays pending until it expires, unless your account was deleted: its
-  confirmations and chats go with it.
+  organization deactivated (`401`). Nothing runs. The confirmation stays pending until it
+  expires, unless your account was deleted: its confirmations and chats go with it.
 - **At most 3 pending confirmations per user.** You can have up to
   `max_pending_confirmations` (a [platform default](#platform-defaults), 3 by default)
   confirmations waiting at once, across your chats. When you're at the limit, a message
@@ -1086,7 +1082,7 @@ turn is still stored and titled as described below, even with nobody reading.
   `{"stopped": false}`, and the request answers when the message ends.
 - **Errors** are those of the other chat routes: `404` `{"detail": "Chat not found",
   "reason": "chat_not_found"}` for a chat that doesn't exist, is in the trash or isn't
-  yours, `422` for an ID that isn't a UUID, and `403` for Viewers and the Super Admin.
+  yours, `422` for an ID that isn't a UUID, and `403` for the Super Admin.
   Stop has its own per-user rate limit, which answers `429`
   `{"detail": "Rate limit exceeded"}`.
 - A stop isn't recorded in the audit log, like sending a message. Every action that ran
@@ -1142,8 +1138,8 @@ within a reply.
   read external content, such as an email (a failed reply included), actions that change
   something keep asking first in that chat, and a retry doesn't reset that (see
   [Permissions → External content](permissions.md#external-content-makes-side-effects-ask-first)).
-- **Like a send in everything else.** Org Admins and Editors retry their own chats;
-  Viewers and the Super Admin get `403`. Your message isn't checked against the message
+- **Like a send in everything else.** Org Admins and Editors retry their own chats; the
+  Super Admin gets `403`. Your message isn't checked against the message
   length limit again: it was accepted when you sent it. The answer is a send's: the JSON
   reply with its `status`, `tool_calls`, `pending_confirmation`, `error_code`,
   `context_usage`, `context_notice` and `chat_id`, or with `Accept: text/event-stream` the
@@ -1185,8 +1181,8 @@ within a reply.
 ### Attachments
 
 You upload files into one of your chats, one file per request, then send them with a
-message. Org Admins and Editors upload; Viewers and the Super Admin get `403` on every
-attachment route. Like a chat, an attachment is private to the chat's owner.
+message. Org Admins and Editors upload; the Super Admin gets `403` on every attachment
+route. Like a chat, an attachment is private to the chat's owner.
 
 | Route | What it does |
 | --- | --- |
@@ -1545,7 +1541,7 @@ chat's later messages, and `{"active": true}` includes it again. The body is exa
 - **Errors and access.** Another user's attachment, another organization's, one in the
   trash and an unknown one answer `404` `{"detail": "Attachment not found", "reason":
   "attachment_not_found"}`, and nothing changes; an ID that isn't a UUID answers `422`.
-  Org Admins and Editors exclude their own files; Viewers and the Super Admin get `403`.
+  Org Admins and Editors exclude their own files; the Super Admin gets `403`.
   The route has its own per-user rate limit (see **Rate limits** above) and refuses
   cross-site requests, like every route that changes something.
 - **Upgrading.** Every attachment stored before this release is active.
@@ -1571,8 +1567,8 @@ never its content.
   and an unknown one answer the chats' `404` `{"detail": "Chat not found", "reason":
   "chat_not_found"}`. A chat ID that isn't a UUID, a `limit` out of range, an unknown
   `status`, an `active` that isn't a boolean and a cursor over 200 characters answer
-  `422`, without echoing them. Org Admins and Editors list their own chats' files;
-  Viewers and the Super Admin get `403`. The route has its own per-user rate limit (see
+  `422`, without echoing them. Org Admins and Editors list their own chats' files; the
+  Super Admin gets `403`. The route has its own per-user rate limit (see
   **Rate limits** above).
 
 ### Context budget
@@ -1727,7 +1723,7 @@ Deleting a chat (`DELETE /api/chats/{id}`, see [Chats](#chats)) or a file
 (`DELETE /api/attachments/{id}`, see [Attachments](#attachments)) moves it to your trash,
 where you can restore it until it expires. Your trash is yours alone in this release:
 nobody else sees or restores it, not even an Org Admin. Org Admins and Editors use it;
-Viewers and the Super Admin get `403` on every trash route.
+the Super Admin gets `403` on every trash route.
 
 | Route | What it does |
 | --- | --- |

@@ -33,9 +33,9 @@ Each organization has its own permission matrix:
 - Only **Org Admins** change it, on the **Organization** page (`GET` / `PATCH
   /api/org/permissions`). Every change is recorded in the organization's audit log
   (`org.permission_change`) with the tool, the action and the old and new state.
-- **Editors and Viewers** see a read-only summary of what the agent may do on the
-  **Permissions** page (`GET /api/permissions/summary`): what runs on its own, what asks
-  first, what is denied, and which services the organization switched off.
+- **Editors** see a read-only summary of what the agent may do on the **Permissions**
+  page (`GET /api/permissions/summary`): what runs on its own, what asks first, what is
+  denied, and which services the organization switched off.
 - Every chat run uses its own organization's matrix, critical promotions and tool services.
   One organization's changes never reach another organization's chats.
 - An approval uses the matrix as it is when it runs, even one changed while the approval

@@ -245,9 +245,9 @@ account or the address is locked for 15 minutes, and the lockout is audit-logged
   confirmation), and the Super Admin's chat count. Another user's chat, another
   organization's chat, a chat in the trash and an unknown ID all answer the same `404`
   `{"detail": "Chat not found", "reason": "chat_not_found"}`. In this release nobody else
-  reads a chat, not even an Org Admin; Viewers and the Super Admin get `403` on every chat
-  route. A tool call's `tool.call` audit row names the chat's ID as its target, never its
-  title or a message.
+  reads a chat, not even an Org Admin; the Super Admin gets `403` on every chat route. A
+  tool call's `tool.call` audit row names the chat's ID as its target, never its title or
+  a message.
 - **Attachments are private to their chat's owner** too. The data layer
   (`attachments.py`) reads or trashes an attachment only within the caller's
   organization and as its owner, and `chats.py` links one to a message or trashes it only
@@ -255,7 +255,7 @@ account or the address is locked for 15 minutes, and the lockout is audit-logged
   unknown attachment all answer the same `404` `{"detail": "Attachment not found",
   "reason": "attachment_not_found"}`, on the reads, an exclusion and a delete alike; a
   chat's attachment list answers the chat's `404` for any chat that isn't the caller's
-  own. Viewers and the Super Admin get `403`. See [Attachments](#attachments).
+  own. The Super Admin gets `403`. See [Attachments](#attachments).
 - **The trash is its owner's.** The data layer (`trash.py`) lists, restores and deletes
   for good only the caller's own chats and files, within the caller's organization:
   another user's item (an Org Admin's request on an Editor's item included), another
