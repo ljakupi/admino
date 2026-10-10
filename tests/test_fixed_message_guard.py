@@ -13,7 +13,10 @@ the source. Pinned:
    An f-string, ``%``, ``+``, ``.format`` or any other expression fails, and so does a
    parameter, a name bound twice (each message gets its own binding or is passed as the
    literal), a name bound to anything but a string literal, and a name declared ``global`` or
-   ``nonlocal``.
+   ``nonlocal``. The name resolves through the call's real scope chain, comprehensions
+   included: a name bound to a literal but rebound in an inner scope between that binding and
+   the call (a comprehension's loop variable, a lambda parameter, a nested function's
+   parameter or local) fails, because at runtime the call sees the inner binding.
 2. Nothing under ``src/admino`` raises the bare class, subclasses it, or imports or assigns
    it under another name (each would evade the call scan).
 3. The real scan is not vacuous: in ``src/admino/models.py`` it finds the 20 call sites of
@@ -42,6 +45,8 @@ _MODELS_PATH: Final = "src/admino/models.py"
 _CLASS_NAME: Final = "FixedMessageError"
 _FUNCTION_SCOPES: Final = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 _SCOPES: Final = (*_FUNCTION_SCOPES, ast.ClassDef)
+# Python 3 comprehensions run in their own scope: their loop variables are local to them.
+_COMPREHENSIONS: Final = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 # Nodes that bind their ``name`` attribute (a def, class, ``except ... as``, match capture).
 _NAMED_BINDERS: Final = (
     ast.FunctionDef,
@@ -122,16 +127,16 @@ def _is_str_constant(node: ast.AST | None) -> bool:
 
 def _snippet(node: ast.AST) -> str:
     """The node's source, cut to a readable length for the violation text."""
-    text = ast.unparse(node)
+    text = ast.unparse(node).strip()
     return text if len(text) <= _SNIPPET_LENGTH else text[: _SNIPPET_LENGTH - 3] + "..."
 
 
-def _parameters(scope: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> set[str]:
-    """Every parameter name of a function or lambda."""
+def _parameters(scope: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> dict[str, ast.arg]:
+    """Every parameter of a function or lambda, by name."""
     args = scope.args
-    names = {arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
-    names.update(arg.arg for arg in (args.vararg, args.kwarg) if arg is not None)
-    return names
+    every = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+    every.extend(arg for arg in (args.vararg, args.kwarg) if arg is not None)
+    return {arg.arg: arg for arg in every}
 
 
 def _scope_roots(scope: ast.AST) -> list[ast.AST]:
@@ -160,8 +165,8 @@ def _bindings(scope: ast.AST, name: str) -> list[tuple[ast.AST, ast.AST]]:
     """Every binding of ``name`` in the scope's own namespace, as (binder, its parent).
 
     Nested functions, lambdas and classes are their own scopes (only their name binds
-    here), and a comprehension's loop variable is local to the comprehension; an
-    assignment expression inside a comprehension does bind here.
+    here), and a comprehension's loop variable is local to the comprehension (see
+    ``_target_bindings``); an assignment expression inside a comprehension does bind here.
     """
     found: list[tuple[ast.AST, ast.AST]] = []
     stack: list[tuple[ast.AST, ast.AST]] = [(root, scope) for root in _scope_roots(scope)]
@@ -197,6 +202,70 @@ def _literal_binding(binder: ast.AST, parent: ast.AST) -> str | None:
     return None
 
 
+def _target_bindings(
+    comprehension: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp, name: str
+) -> list[tuple[ast.AST, ast.AST]]:
+    """Every loop variable ``name`` of a comprehension, as (binder, its ``for`` clause)."""
+    return [
+        (node, clause)
+        for clause in comprehension.generators
+        for node in ast.walk(clause.target)
+        if _binds(node, name)
+    ]
+
+
+@dataclass(frozen=True)
+class _Binder:
+    """A scope on a call's scope chain that binds the message name: its parameter, if the
+    name is one, and its bindings of the name (as (binder, its parent))."""
+
+    scope: ast.AST
+    parameter: ast.arg | None
+    bindings: tuple[tuple[ast.AST, ast.AST], ...]
+
+    def literal_line(self) -> int | None:
+        """The line where this scope binds the name to a string literal, if it does."""
+        for binder, parent in self.bindings:
+            if _literal_binding(binder, parent) is not None:
+                return getattr(binder, "lineno", 0)
+        return None
+
+    def describe(self) -> str:
+        """What binds the name here, for a violation text."""
+        scope, parameter = self.scope, self.parameter
+        if isinstance(scope, ast.Lambda):
+            kind = "a lambda parameter" if parameter else "a name bound in a lambda"
+        elif isinstance(scope, ast.FunctionDef | ast.AsyncFunctionDef):
+            kind = f"a parameter of {scope.name}" if parameter else f"a local of {scope.name}"
+        elif isinstance(scope, ast.ClassDef):
+            kind = f"a name in the body of class {scope.name}"
+        else:
+            kind = "a comprehension's loop variable"
+        node = parameter if parameter is not None else self.bindings[0][0]
+        return f"{kind}, line {getattr(node, 'lineno', '?')}"
+
+
+def _binders(scopes: tuple[ast.AST, ...], name: str) -> list[_Binder]:
+    """The scopes a call can see (``scopes``, outermost first) that bind ``name``, innermost
+    first. A class body is visible only to code directly in it, not to its methods or its
+    comprehensions."""
+    found: list[_Binder] = []
+    innermost = scopes[-1]
+    for scope in reversed(scopes):
+        if scope is not innermost and isinstance(scope, ast.ClassDef):
+            continue
+        parameter = None
+        if isinstance(scope, _FUNCTION_SCOPES):
+            parameter = _parameters(scope).get(name)
+        if isinstance(scope, _COMPREHENSIONS):
+            bindings = _target_bindings(scope, name)
+        else:
+            bindings = _bindings(scope, name)
+        if parameter is not None or bindings:
+            found.append(_Binder(scope, parameter, tuple(bindings)))
+    return found
+
+
 class _Scanner:
     """AST scan of one module for the C4 rules."""
 
@@ -222,12 +291,29 @@ class _Scanner:
 
     def _visit(self, node: ast.AST, qual: tuple[str, ...], scopes: tuple[ast.AST, ...]) -> None:
         for child in ast.iter_child_nodes(node):
-            self._check(child, qual, scopes)
-            if isinstance(child, _SCOPES):
-                name = child.name if not isinstance(child, ast.Lambda) else "<lambda>"
-                self._visit(child, (*qual, name), (*scopes, child))
-            else:
-                self._visit(child, qual, scopes)
+            self._walk(child, qual, scopes)
+
+    def _walk(self, node: ast.AST, qual: tuple[str, ...], scopes: tuple[ast.AST, ...]) -> None:
+        """Check ``node`` and everything under it; ``scopes`` is its scope chain."""
+        self._check(node, qual, scopes)
+        if isinstance(node, _SCOPES):
+            name = node.name if not isinstance(node, ast.Lambda) else "<lambda>"
+            self._visit(node, (*qual, name), (*scopes, node))
+        elif isinstance(node, _COMPREHENSIONS):
+            # Its own scope (not part of the qualified name), except for the first iterable,
+            # which runs in the enclosing scope.
+            inner = (*scopes, node)
+            first = node.generators[0]
+            for child in ast.iter_child_nodes(node):
+                if child is first:
+                    self._walk(first.target, qual, inner)
+                    self._walk(first.iter, qual, scopes)
+                    for condition in first.ifs:
+                        self._walk(condition, qual, inner)
+                else:
+                    self._walk(child, qual, inner)
+        else:
+            self._visit(node, qual, scopes)
 
     def _check(self, node: ast.AST, qual: tuple[str, ...], scopes: tuple[ast.AST, ...]) -> None:
         if isinstance(node, ast.Call) and _is_class_ref(node.func):
@@ -299,25 +385,35 @@ class _Scanner:
                 "string literal or a name bound once to one",
             )
             return None
-        innermost = scopes[-1]
-        for scope in reversed(scopes):
-            if scope is not innermost and isinstance(scope, ast.ClassDef):
-                continue  # a class body's names aren't visible inside its methods
-            if isinstance(scope, _FUNCTION_SCOPES) and name in _parameters(scope):
-                self._report(
-                    call.lineno,
-                    f"the message `{name}` is a parameter; use a string literal or a name "
-                    "bound once to one",
-                )
-                return None
-            bindings = _bindings(scope, name)
-            if bindings:
-                return self._single_literal(call, name, bindings)
-        self._report(
-            call.lineno,
-            f"the message `{name}` is not bound to a string literal in this module",
+        binders = _binders(scopes, name)
+        if not binders:
+            self._report(
+                call.lineno,
+                f"the message `{name}` is not bound to a string literal in this module",
+            )
+            return None
+        # At runtime the call sees the innermost binding. When that one isn't a literal but
+        # an outer scope binds the name to one, the inner scope hides the literal.
+        inner = binders[0]
+        outer_line = next(
+            (line for binder in binders[1:] if (line := binder.literal_line()) is not None), None
         )
-        return None
+        if inner.literal_line() is None and outer_line is not None:
+            self._report(
+                call.lineno,
+                f"the message `{name}` is rebound in an inner scope ({inner.describe()}), "
+                f"which hides its string literal at line {outer_line}; don't rebind the "
+                "message's name between its binding and the call",
+            )
+            return None
+        if inner.parameter is not None:
+            self._report(
+                call.lineno,
+                f"the message `{name}` is a parameter; use a string literal or a name "
+                "bound once to one",
+            )
+            return None
+        return self._single_literal(call, name, list(inner.bindings))
 
     def _single_literal(
         self, call: ast.Call, name: str, bindings: list[tuple[ast.AST, ast.AST]]
@@ -553,6 +649,73 @@ _FAILING_FORMS: Final = [
         "binds FixedMessageError to another name",
         id="assigned_alias",
     ),
+    # A name the function binds to a literal, rebound in a scope between it and the call:
+    # at runtime the call sees the inner binding (Python 3 comprehensions have their own scope).
+    pytest.param(
+        _validator(
+            'msg = "The name is not printable."',
+            "errors = [FixedMessageError(msg) for msg in value.split()]  # flagged",
+            "if errors:",
+            "    raise errors[0]",
+        ),
+        "rebound in an inner scope",
+        id="list_comprehension_target",
+    ),
+    pytest.param(
+        _validator(
+            'msg = "The name is not printable."',
+            "if not value.isprintable():",
+            "    raise next(FixedMessageError(msg) for msg in value.split())  # flagged",
+        ),
+        "rebound in an inner scope",
+        id="generator_expression_target",
+    ),
+    pytest.param(
+        _validator(
+            'msg = "The name is not printable."',
+            "errors = {i: FixedMessageError(msg) for i, msg in enumerate(value)}  # flagged",
+            "if errors:",
+            "    raise errors[0]",
+        ),
+        "rebound in an inner scope",
+        id="dict_comprehension_tuple_target",
+    ),
+    pytest.param(
+        _module(
+            "def _check(names: list[str]) -> None:",
+            '    msg = "The name is not printable."',
+            "    errors = [[FixedMessageError(msg) for _ in range(2)] for msg in names]  # flagged",
+            "    if errors:",
+            "        raise errors[0][0]",
+        ),
+        "rebound in an inner scope",
+        id="nested_comprehension_outer_target",
+    ),
+    pytest.param(
+        _validator(
+            'msg = "The name is not printable."',
+            "refuse = lambda msg: FixedMessageError(msg)  # flagged",
+            "if not value.isprintable():",
+            "    raise refuse(value)",
+        ),
+        "rebound in an inner scope",
+        id="lambda_parameter",
+    ),
+    pytest.param(
+        _module(
+            "def _check(value: str) -> None:",
+            '    msg = "The name is not printable."',
+            "",
+            "    def _refuse(text: str) -> None:",
+            "        msg = text",
+            "        raise FixedMessageError(msg)  # flagged",
+            "",
+            "    if not value.isprintable():",
+            "        _refuse(value)",
+        ),
+        "rebound in an inner scope",
+        id="nested_function_local",
+    ),
 ]
 
 
@@ -635,6 +798,17 @@ _PASSING_FORMS: Final = [
         _validator("if not value.isprintable():", f'    raise models.FixedMessageError("{_TEXT}")'),
         (_Site("Sample._check_name", _TEXT),),
         id="attribute_callee",
+    ),
+    pytest.param(
+        _module(
+            "def _check_names(names: list[str]) -> None:",
+            f'    msg = "{_TEXT}"',
+            "    errors = [FixedMessageError(msg) for name in names if not name.isprintable()]",
+            "    if errors:",
+            "        raise errors[0]",
+        ),
+        (_Site("_check_names", _TEXT),),
+        id="comprehension_target_with_other_name",
     ),
     pytest.param(
         _module(
