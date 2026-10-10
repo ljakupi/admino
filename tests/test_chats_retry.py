@@ -58,6 +58,24 @@ What these tests pin down:
   final_status="error")``, then retried again).
 - A retry of a retry through the three functions (Decision 2: V1 keeps nothing of a
   failed turn).
+- GH-302 (Decision 1, contract C1): R1 is R1', R1 plus ONE select item
+  ``turn_well_formed``, migration 0031's fifth check (the turn's shape) as a ``NOT
+  EXISTS`` over the rows strictly between the turn's user row and the latest row.
+  ``read_retry_target`` is still ONE ``fetchrow`` of R1''s exact text bound
+  ``(chat, org, owner)``, writing nothing, and returns None for a failed turn the store
+  can't replace: a stopped turn whose tool-call row has no tool_use blocks (NULL or
+  ``[]``: the provider sent no call ids), an approval turn whose ``awaiting_confirmation``
+  row has none (ending ``error`` or ``stopped``), a ``complete`` no-block answer before an
+  ``error`` row (forged), a ``limit_reached`` row mid-turn, a ``tool`` row ``error`` or
+  ``stopped`` mid-turn. A full ``RetryTarget`` for every well-formed failed turn (the
+  GH-245 shapes plus a tool turn ending ``stopped``, ``error`` on the user row and on a
+  ``tool`` row, an approval row WITH blocks then ``error``, and an earlier malformed turn
+  followed by a new well-formed failed turn). One rule: over every shape of this file the
+  retry finds a target exactly when ``delete_failed_turn`` (the store-time gate) accepts
+  the turn through the chat's latest row, and the ``NOT (...)`` shape predicate inside
+  ``chats._RETRY_TARGET_SQL`` is migration 0031's, text for text (whitespace and case
+  aside). The forged ``error`` after a completed turn has no target any more (the
+  store-time refusal, called directly, still holds).
 - Tenant isolation (§5): every statement binds the caller's org, every statement on
   the chat or the function binds the caller as owner, and no foreign id is bound.
 - No content in logs or errors (§1): message, answer, tool-output, file-name and title
@@ -65,7 +83,8 @@ What these tests pin down:
 
 ``chats.RETRYABLE_STATUSES``, ``chats.RetryTarget``, ``chats.read_retry_target`` and
 the new keywords are looked up when a test runs, so this file collects before they
-exist and every test fails on its own.
+exist and every test fails on its own. GH-302's R1' runs on tests/db_fakes.py's
+reader (its ``NOT EXISTS`` sub-select with the shape predicate).
 """
 
 from __future__ import annotations
@@ -260,7 +279,157 @@ _NOT_RETRYABLE_SHAPES: Final[dict[str, tuple[_Spec, ...]]] = {
     "no-user-message": (("a1", "assistant", ANSWER_CANARY, "error", {}),),
 }
 
-# Contract C2, as verified on postgres:16 (compared whitespace-free, tokens kept).
+_U2: Final[_Spec] = ("u2", "user", MESSAGE_CANARY, "complete", {})
+_CALENDAR_TURN: Final[_Spec] = (
+    "a2",
+    "assistant",
+    "Checking.",
+    "complete",
+    {"tool_use_blocks": [CALENDAR_CALL]},
+)
+_PARTIAL: Final = "A half-written ans"
+
+# GH-302 (Decision 1, contract C1): failed turns the retry still replaces, beyond
+# _TARGET_SHAPES; each (specs, through label, status, user label) like _TARGET_SHAPES.
+_WELL_FORMED_SHAPES: Final[dict[str, tuple[tuple[_Spec, ...], str, str, str]]] = {
+    "tool-turn-ending-stopped": (
+        (
+            _U1,
+            _A1,
+            _U2,
+            _CALENDAR_TURN,
+            ("t2", "tool", TOOL_CANARY, "complete", {"tool_call_id": "call_cal_1"}),
+            ("a3", "assistant", _PARTIAL, "stopped", {}),
+        ),
+        "a3",
+        "stopped",
+        "u2",
+    ),
+    "error-on-the-user-row": (
+        (_U1, _A1, ("u2", "user", MESSAGE_CANARY, "error", {})),
+        "u2",
+        "error",
+        "u2",
+    ),
+    "error-on-a-tool-row": (
+        (
+            _U1,
+            _A1,
+            _U2,
+            _CALENDAR_TURN,
+            ("t2", "tool", TOOL_CANARY, "error", {"tool_call_id": "call_cal_1"}),
+        ),
+        "t2",
+        "error",
+        "u2",
+    ),
+    "approval-with-blocks-then-error": (
+        (
+            _U1,
+            _A1,
+            _U2,
+            (
+                "a2",
+                "assistant",
+                "I'll add it.",
+                "awaiting_confirmation",
+                {"tool_use_blocks": [CREATE_CALL]},
+            ),
+            ("t2", "tool", "Added.", "complete", {"tool_call_id": "call_create_3"}),
+            ("a3", "assistant", ANSWER_CANARY, "error", {}),
+        ),
+        "a3",
+        "error",
+        "u2",
+    ),
+    # Only the latest turn's shape counts: a malformed earlier turn (a complete no-block
+    # answer, then a stop) doesn't block the new failed one.
+    "earlier-malformed-turn-then-a-new-failed-turn": (
+        (
+            _U1,
+            ("a1", "assistant", "First answer", "complete", {}),
+            ("a1b", "assistant", "A forged stop", "stopped", {}),
+            _U2,
+            ("a2", "assistant", ANSWER_CANARY, "error", {}),
+        ),
+        "a2",
+        "error",
+        "u2",
+    ),
+}
+
+# GH-302 (Decision 1, contract C1): the latest row ended error/stopped and a user row
+# precedes it, but a row between them isn't what a real failed turn holds there
+# (migration 0031's fifth check): the store can't replace the turn, so no target.
+_MALFORMED_SHAPES: Final[dict[str, tuple[_Spec, ...]]] = {
+    # The provider sent no call ids: the tool-call row was stored without tool_use blocks.
+    "stopped-tool-call-without-blocks": (
+        _U1,
+        _A1,
+        _U2,
+        ("a2", "assistant", "", "complete", {}),
+        ("t2", "tool", TOOL_CANARY, "complete", {}),
+        ("a3", "assistant", _PARTIAL, "stopped", {}),
+    ),
+    "stopped-tool-call-with-empty-blocks": (
+        _U1,
+        _A1,
+        _U2,
+        ("a2", "assistant", "", "complete", {"tool_use_blocks": []}),
+        ("t2", "tool", TOOL_CANARY, "complete", {}),
+        ("a3", "assistant", _PARTIAL, "stopped", {}),
+    ),
+    "approval-without-blocks-then-error": (
+        _U1,
+        _A1,
+        _U2,
+        ("a2", "assistant", "I'll add it.", "awaiting_confirmation", {}),
+        ("t2", "tool", "Added.", "complete", {}),
+        ("a3", "assistant", ANSWER_CANARY, "error", {}),
+    ),
+    "approval-without-blocks-then-stopped": (
+        _U1,
+        _A1,
+        _U2,
+        ("a2", "assistant", "I'll add it.", "awaiting_confirmation", {}),
+        ("t2", "tool", "Added.", "complete", {}),
+        ("a3", "assistant", _PARTIAL, "stopped", {}),
+    ),
+    # Forged: an error row after a completed answer (admino_app can INSERT, not UPDATE).
+    "complete-answer-before-an-error": (
+        _U1,
+        _A1,
+        _U2,
+        ("a2", "assistant", "You see the dentist on Monday.", "complete", {}),
+        ("a3", "assistant", ANSWER_CANARY, "error", {}),
+    ),
+    "limit-reached-mid-turn": (
+        _U1,
+        _A1,
+        _U2,
+        ("a2", "assistant", "Partial", "limit_reached", {}),
+        ("a3", "assistant", ANSWER_CANARY, "error", {}),
+    ),
+    "tool-row-error-mid-turn": (
+        _U1,
+        _A1,
+        _U2,
+        _CALENDAR_TURN,
+        ("t2", "tool", TOOL_CANARY, "error", {"tool_call_id": "call_cal_1"}),
+        ("a3", "assistant", _PARTIAL, "stopped", {}),
+    ),
+    "tool-row-stopped-mid-turn": (
+        _U1,
+        _A1,
+        _U2,
+        _CALENDAR_TURN,
+        ("t2", "tool", TOOL_CANARY, "stopped", {"tool_call_id": "call_cal_1"}),
+        ("a3", "assistant", _PARTIAL, "stopped", {}),
+    ),
+}
+
+# GH-302 contract C1: R1' (GH-245's R1 plus turn_well_formed, migration 0031's fifth
+# check), as verified on postgres:16 as admino_app (compared whitespace-free, tokens kept).
 R1: Final = """
     SELECT c.id,
            latest.seq AS through_seq, latest.status,
@@ -270,7 +439,17 @@ R1: Final = """
                WHERE a.message_id = turn.id AND a.chat_id = c.id AND a.org_id = c.org_id
                  AND a.owner_user_id = c.owner_user_id AND a.deleted_at IS NULL
                ORDER BY a.created_at, a.id
-           ) AS attachment_ids
+           ) AS attachment_ids,
+           NOT EXISTS (
+               SELECT 1 FROM chat_messages
+               WHERE chat_id = c.id AND org_id = c.org_id
+                 AND seq > turn.seq AND seq < latest.seq
+                 AND NOT ((status IN ('complete', 'awaiting_confirmation')
+                         AND (role = 'tool'
+                             OR (role = 'assistant'
+                                 AND coalesce(jsonb_array_length(tool_use_blocks), 0) > 0)))
+                     OR (role = 'assistant' AND status = 'error'))
+           ) AS turn_well_formed
     FROM chats c
     LEFT JOIN LATERAL (
         SELECT seq, status FROM chat_messages
@@ -657,7 +836,8 @@ def test_chats_retry_docstrings_name_what_gh245_adds(chats: ModuleType) -> None:
 async def test_chats_retry_read_runs_exactly_r1_bound_to_chat_org_and_owner(
     chats: ModuleType, seeded: _Seeded, case: str
 ) -> None:
-    """One fetchrow of R1's exact text, (chat, org, owner) in that order, whatever the answer."""
+    """One fetchrow of R1's exact text (GH-302: R1', contract C1), (chat, org, owner) in
+    that order, whatever the answer."""
     db = seeded.db
     chat_id = {
         "target": seeded.main,
@@ -786,6 +966,118 @@ async def test_chats_retry_read_refuses_any_chat_but_the_callers_own_live_one(
     assert str(caught.value) == str(chats.ChatNotFoundError())
     assert len(db.calls) - calls_before == 1
     assert db.snapshot() == before
+
+
+# ---------------------------------------------------------------------------
+# 3b. read_retry_target: the failed turn's shape (GH-302 Decision 1, contract C1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shape", list(_MALFORMED_SHAPES))
+async def test_chats_retry_read_failed_turn_the_store_cannot_replace_is_none(
+    chats: ModuleType, seeded: _Seeded, shape: str
+) -> None:
+    """The latest row ended error/stopped after a user row, but a row between them is not
+    a tool call with tool_use blocks, its result (complete or awaiting) or an assistant
+    error row: no target, from the one R1' fetchrow, nothing written."""
+    db = seeded.db
+    chat_id, _ = _shape_chat(seeded, _MALFORMED_SHAPES[shape])
+    before = db.snapshot()
+    calls_before = len(db.calls)
+
+    target = await chats.read_retry_target(db.pool, seeded.editor, chat_id)
+
+    calls = db.calls[calls_before:]
+    assert target is None
+    assert [(call.method, _form(call)) for call in calls] == [("fetchrow", "R1")]
+    assert db.snapshot() == before
+
+
+@pytest.mark.parametrize("shape", list(_WELL_FORMED_SHAPES))
+async def test_chats_retry_read_well_formed_failed_turn_is_a_target(
+    chats: ModuleType, seeded: _Seeded, shape: str
+) -> None:
+    """The shape check refuses only what the store refuses: these failed turns are still
+    retried, the latest user row with the turn's last row."""
+    specs, through, status, user = _WELL_FORMED_SHAPES[shape]
+    chat_id, stored = _shape_chat(seeded, specs)
+
+    target = await chats.read_retry_target(seeded.db.pool, seeded.editor, chat_id)
+
+    assert target == chats.RetryTarget(
+        through_seq=stored[through].seq,
+        status=status,
+        user_seq=stored[user].seq,
+        message=MESSAGE_CANARY,
+        attachment_ids=(),
+    )
+
+
+async def test_chats_retry_read_target_exists_exactly_when_delete_failed_turn_accepts_the_turn(
+    chats: ModuleType, seeded: _Seeded
+) -> None:
+    """Decision 1's one rule (RUN_DIR/pg-probe-r1prime: 22 shapes on postgres:16, 0
+    mismatches): over every shape of this file, read_retry_target finds a target exactly
+    when migration 0031's delete_failed_turn (the store-time gate) accepts the turn
+    through the chat's latest row; that is every target and well-formed shape, and no
+    malformed or not-retryable one."""
+    db, editor = seeded.db, seeded.editor
+    shapes = {
+        **{name: specs for name, (specs, *_) in _TARGET_SHAPES.items()},
+        **{name: specs for name, (specs, *_) in _WELL_FORMED_SHAPES.items()},
+        **_MALFORMED_SHAPES,
+        **_NOT_RETRYABLE_SHAPES,
+    }
+    replaceable = {*_TARGET_SHAPES, *_WELL_FORMED_SHAPES}
+    outcome: dict[str, tuple[bool, bool]] = {}
+    for name, specs in shapes.items():
+        chat_id, _ = _shape_chat(seeded, specs)
+        found = await chats.read_retry_target(db.pool, editor, chat_id) is not None
+        rows = db.messages_of(chat_id)
+        accepted = False
+        if rows:
+            try:
+                await db.pool.fetchval(R2, chat_id, editor.org_id, editor.user_id, rows[-1]["seq"])
+            except asyncpg.InsufficientPrivilegeError:
+                pass
+            else:
+                accepted = True
+        outcome[name] = (found, accepted)
+
+    assert len(shapes) == len(_TARGET_SHAPES) + len(_WELL_FORMED_SHAPES) + len(
+        _MALFORMED_SHAPES
+    ) + len(_NOT_RETRYABLE_SHAPES)
+    assert outcome == {name: (name in replaceable,) * 2 for name in shapes}
+
+
+def _shape_predicate(sql: str) -> str:
+    """The one turn-shape predicate ``NOT ((status IN ...) ... tool_use_blocks ...)`` of a
+    statement or a migration (comments dropped), lowercased with every whitespace removed."""
+    text = re.sub(r"--[^\n]*", "", sql).lower()
+    found: list[str] = []
+    for match in re.finditer(r"\bnot\s*\(", text):
+        depth = 0
+        for index in range(match.end() - 1, len(text)):
+            depth += {"(": 1, ")": -1}.get(text[index], 0)
+            if depth == 0:
+                group = text[match.start() : index + 1]
+                if "tool_use_blocks" in group:
+                    found.append(re.sub(r"\s+", "", group))
+                break
+    assert len(found) == 1, found
+    return found[0]
+
+
+def test_chats_retry_read_shape_predicate_is_delete_failed_turns(chats: ModuleType) -> None:
+    """Decision 1: "copied verbatim", so the retry and the store-time gate can't drift: the
+    NOT (...) inside chats._RETRY_TARGET_SQL is the one in migration 0031's function."""
+    from pathlib import Path
+
+    migration = Path(chats.__file__).parent / "migrations" / "0031_chat_retry.sql"
+
+    assert _shape_predicate(chats._RETRY_TARGET_SQL) == _shape_predicate(
+        migration.read_text(encoding="utf-8")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1230,9 +1522,10 @@ async def test_chats_retry_append_forged_error_after_a_completed_turn_is_refused
 ) -> None:
     """C1' (security audit M-1): an ``error`` row stored after a completed tool turn (an
     INSERT is all a compromised runtime role needs) makes the chat's latest row look
-    failed, but the replacing store is refused: InsufficientPrivilegeError, the
-    transaction rolled back, nothing deleted, inserted or linked (the turn's file stays on
-    its user row)."""
+    failed. GH-302 (Decision 1): R1' finds no target for it either; the replacing store,
+    called directly, is still refused: InsufficientPrivilegeError, the transaction
+    rolled back, nothing deleted, inserted or linked (the turn's file stays on its user
+    row)."""
     db = seeded.db
     chat_id, stored = _shape_chat(
         seeded,
@@ -1264,7 +1557,7 @@ async def test_chats_retry_append_forged_error_after_a_completed_turn_is_refused
         )
 
     calls = db.calls[calls_before:]
-    assert (target.through_seq, target.status) == (stored["forged"].seq, "error")
+    assert target is None
     assert [_form(call) for call in calls] == ["S7", "R2"]
     assert db.snapshot() == before
     assert db.transactions[-1] == (calls[0].tx, "rollback:InsufficientPrivilegeError")

@@ -74,7 +74,8 @@ Routes:
   (the latest first, ``cursor`` to earlier ones; each with its attachments'
   ids, GH-190), its confirmation state, ``context_usage`` (GH-190: how full
   the chat's context is as its next turn starts) and ``retryable`` (GH-245:
-  its latest message ended as ``error`` or ``stopped``).
+  its latest message ended as ``error`` or ``stopped``; GH-302: and the retry
+  finds a failed turn it can replace, the retry's own check).
 - PATCH /api/chats/{chat_id} — Renames the chat.
 - DELETE /api/chats/{chat_id} — Moves the chat and its live files to the trash
   (204; GH-194: purged in the same request when the org's trash retention is
@@ -103,9 +104,10 @@ Routes:
   (``{"stopped": bool}``, GH-8).
 - POST /api/chats/{chat_id}/retry — Runs the chat's failed last turn again
   and replaces it (GH-245): its latest user message, when the latest message
-  ended as ``error`` or ``stopped`` (else the 409 ``not_retryable``); no
-  request body. Answers like a turn (ChatResponse, or the event stream), with
-  a send's refusals, bucket and title rule.
+  ended as ``error`` or ``stopped`` and the failed turn has a shape the store
+  can replace (GH-302; else the 409 ``not_retryable``); no request body.
+  Answers like a turn (ChatResponse, or the event stream), with a send's
+  refusals, bucket and title rule.
 - POST /api/chats/{chat_id}/attachments — Stores one file (the raw request
   body, its name in ``X-Attachment-Name``) in a chat of the caller (201
   AttachmentSummary, GH-187); audited.
@@ -327,9 +329,11 @@ Security notes:
   the CSRF check, the ``/api/message`` bucket shared with sends, the owner
   check (the same 404), the chat's hold and a send's refusals, then the
   chat's failed last turn (``chats.read_retry_target``: its latest message
-  ended ``error`` or ``stopped``, else the 409 ``not_retryable``) runs again
-  with the history before it and no pending confirmation, so every tool call
-  meets the permission engine again. The new turn replaces the failed one in
+  ended ``error`` or ``stopped`` and, GH-302, the turn has the shape
+  ``delete_failed_turn`` accepts, else the 409 ``not_retryable`` before the
+  history read, the files, the model or any tool) runs again with the
+  history before it and no pending confirmation, so every tool call meets
+  the permission engine again. The new turn replaces the failed one in
   one transaction through migration 0031's owner-run ``delete_failed_turn``:
   ``chat_messages`` stays append-only for the runtime role, and the failed
   message's files move to its copy, never deleted. No audit event (a retry
@@ -686,6 +690,10 @@ Security notes:
   random cookies is refused (429) before it costs database lookups.
 - No raw user content, assistant text, or tool args logged at INFO or below.
 - Error responses use generic messages; never leak internal paths or config.
+  The 422 validation list (both validation handlers, GH-302) carries each
+  error's ``loc``, its ``type`` and the fixed message of that type
+  (``_VALIDATION_MESSAGES``): pydantic's message, input, context and URL,
+  which can quote what was sent, never reach the body.
 - ``SecurityHeadersMiddleware`` is pure ASGI (GH-8): it sets the headers on
   the response start and passes ``receive`` and every body message through,
   so a stream reaches the client frame by frame and its disconnect reaches
@@ -780,6 +788,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path as PathLib
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Final, Literal, NamedTuple, cast
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4  # UUID at runtime: FastAPI resolves path parameter annotations
@@ -948,10 +957,11 @@ from admino.streaming import DisplayDeltas, RunStream, display_pieces
 from admino.tenancy import TenantContext
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 
     import asyncpg
     from pydantic import BaseModel
+    from pydantic_core import ErrorDetails
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
     from admino.agent import Agent
@@ -4163,11 +4173,15 @@ async def get_chat_detail(
     org's tool policy) and the turn read (``chats.load_turn``: the latest
     messages as a turn loads them, ``max_context_messages`` or 200 without a
     cap, and the active attachments' stored estimates; no derived file is
-    read). GH-245 (Decision 6): ``retryable`` is true exactly when the latest
-    status is ``error`` or ``stopped`` (``chats.RETRYABLE_STATUSES``, the rule
-    of POST /api/chats/{chat_id}/retry's 409 ``not_retryable``), whatever page
-    is read; it comes from the latest status already read, no other
-    statement. Reading changes nothing.
+    read). GH-245 (Decision 6), GH-302 (Decision 2): ``retryable`` is the
+    retry's own check, true exactly when POST /api/chats/{chat_id}/retry
+    wouldn't answer its 409 ``not_retryable`` for the chat's state, whatever
+    page is read. Only when the latest status already read is ``error`` or
+    ``stopped`` (``chats.RETRYABLE_STATUSES``) does it run one statement more,
+    ``chats.read_retry_target`` (R1': a user message before it and the failed
+    turn's shape), right after the detail read; any other status is false with
+    no other statement. A chat trashed in between is the 404 from that read.
+    Reading changes nothing.
 
     Args:
         principal: The logged-in principal (needs ``chat.send``).
@@ -4198,6 +4212,10 @@ async def get_chat_detail(
     tenant = TenantContext.from_principal(principal)
     detail = await chats.read_chat_detail(pool, tenant, chat_id, limit=limit, cursor=cursor)
     chat, page = detail.chat, detail.page
+    retryable = (
+        detail.latest_status in chats.RETRYABLE_STATUSES
+        and await chats.read_retry_target(pool, tenant, chat_id) is not None
+    )
     platform = await _platform_run_settings()
     setup = await turn_setup.load_turn_setup(pool, tenant, chat.id)
     turn = await chats.load_turn(pool, tenant, chat.id, limit=_history_limit(platform))
@@ -4228,7 +4246,7 @@ async def get_chat_detail(
         pending_confirmation=None if pending is None else _summarise_pending(pending),
         confirmation_status=confirmation_status,
         context_usage=usage,
-        retryable=detail.latest_status in chats.RETRYABLE_STATUSES,
+        retryable=retryable,
     )
 
 
@@ -4819,7 +4837,8 @@ _RETRY_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
     409: {
         "description": (
             "run_active: a run of the chat is going; or not_retryable: the chat's latest "
-            "message didn't end as error or stopped (nothing to retry)."
+            "message didn't end as error or stopped, or its failed turn can't be replaced "
+            "(nothing to retry)."
         ),
         "content": {
             "application/json": {
@@ -5627,7 +5646,13 @@ async def post_chat_retry(
     that left; a stop before any output stores ``stopped`` on the user
     message itself). Anything else (``complete``, ``awaiting_confirmation``,
     ``limit_reached``, an empty chat, a failed answer followed by an org
-    notice) is the 409 ``not_retryable``. No request body is read.
+    notice) is the 409 ``not_retryable``. GH-302 (Decision 1): so is a failed
+    turn the store couldn't replace (``chats.read_retry_target`` applies
+    ``delete_failed_turn``'s shape check, e.g. a stopped or approval turn
+    whose tool call came without call ids): the 409 comes under the hold,
+    before the history read, the files, the model or any tool, with nothing
+    stored or deleted, instead of a run whose store then fails. No request
+    body is read.
 
     Decision 2: the retried message is the chat's latest user message, and the
     failed turn is that message through the latest one (the answer, its tool
@@ -7947,14 +7972,94 @@ async def oauth_microsoft_disconnect(principal: _PrincipalDep) -> dict[str, str]
 # ---------------------------------------------------------------------------
 
 
+# GH-302 (Decision 4): the one text a 422 validation error carries per pydantic error
+# type. pydantic's own msg can quote the input (a malformed UUID's character, a model
+# validator's text, a bound), so it never reaches the body: the type and loc say which
+# check failed, and the API's clients translate the type, not this text.
+_VALIDATION_MESSAGES: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "missing": "Field required",
+        "extra_forbidden": "Extra inputs are not permitted",
+        "uuid_parsing": "Input should be a valid UUID",
+        "uuid_type": "Input should be a valid UUID",
+        "uuid_version": "Input should be a valid UUID",
+        "int_parsing": "Input should be a valid integer",
+        "int_type": "Input should be a valid integer",
+        "int_from_float": "Input should be a valid integer",
+        "float_parsing": "Input should be a valid number",
+        "float_type": "Input should be a valid number",
+        "bool_parsing": "Input should be a valid boolean",
+        "bool_type": "Input should be a valid boolean",
+        "string_type": "Input should be a valid string",
+        "string_too_short": "String is too short",
+        "string_too_long": "String is too long",
+        "string_pattern_mismatch": "String doesn't match the expected pattern",
+        "too_short": "Too few items",
+        "too_long": "Too many items",
+        "greater_than": "Input is too small",
+        "greater_than_equal": "Input is too small",
+        "less_than": "Input is too large",
+        "less_than_equal": "Input is too large",
+        "literal_error": "Input isn't one of the allowed values",
+        "enum": "Input isn't one of the allowed values",
+        "list_type": "Input should be a valid list",
+        "dict_type": "Input should be a valid object",
+        "model_type": "Input should be a valid object",
+        "model_attributes_type": "Input should be a valid object",
+        "json_invalid": "Invalid JSON",
+        "json_type": "Input should be valid JSON",
+        "datetime_parsing": "Input should be a valid datetime",
+        "datetime_type": "Input should be a valid datetime",
+        "datetime_from_date_parsing": "Input should be a valid datetime",
+        "timezone_aware": "Input should have a timezone",
+        "value_error": "Invalid value",
+        "assertion_error": "Invalid value",
+    }
+)
+_VALIDATION_FALLBACK_MESSAGE: Final = "Invalid input"
+
+
+def _validation_response(errors: Sequence[ErrorDetails]) -> JSONResponse:
+    """The 422 validation list: per error, its ``loc``, a fixed ``msg`` and its ``type``.
+
+    No input value is echoed: ``msg`` comes from ``_VALIDATION_MESSAGES`` by
+    ``type`` (the fallback for a type outside the table), never from
+    pydantic, whose ``msg``, ``ctx``, ``input`` and ``url`` can carry the
+    request's input and are dropped. ``loc`` is kept as FastAPI gives it, so
+    it names the field: for an unknown field (``extra_forbidden``) or a map
+    key, that is the name as the client sent it. ``loc`` items are
+    ``str()``-ed; a missing ``type`` is ``value_error``.
+
+    Args:
+        errors: The validation errors, in pydantic's (FastAPI's) order.
+
+    Returns:
+        JSONResponse: ``422 {"detail": [{"loc", "msg", "type"}, ...]}``.
+    """
+    safe_errors = []
+    for err in errors:
+        error_type = err.get("type", "value_error")
+        safe_errors.append(
+            {
+                "loc": [str(loc) for loc in err.get("loc", ())],
+                "msg": _VALIDATION_MESSAGES.get(error_type, _VALIDATION_FALLBACK_MESSAGE),
+                "type": error_type,
+            }
+        )
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
+
+
 async def _validation_error_handler(
     request: Request,
     exc: ValidationError,
 ) -> JSONResponse:
-    """Handle Pydantic validation errors without leaking input values.
+    """Handle Pydantic validation errors without echoing any input value.
 
-    Returns a generic 422 response. Raw input values are never included
-    in the response body.
+    The 422 validation list (``_validation_response``): each error's
+    ``loc``, ``type`` and the fixed message of its type (GH-302). Neither an
+    input value nor pydantic's message, context or URL is in the body;
+    ``loc`` names the field, which for an unknown field or a map key is the
+    name as sent.
 
     Args:
         request: The incoming request (unused but required by FastAPI).
@@ -7963,46 +8068,33 @@ async def _validation_error_handler(
     Returns:
         JSONResponse with safe error details.
     """
-    safe_errors = []
-    for err in exc.errors(include_input=False):
-        safe_errors.append(
-            {
-                "loc": [str(loc) for loc in err["loc"]],
-                "msg": err["msg"],
-                "type": err["type"],
-            }
-        )
-    return JSONResponse(status_code=422, content={"detail": safe_errors})
+    return _validation_response(exc.errors(include_input=False))
 
 
 async def _request_validation_error_handler(
     request: Request,
     exc: RequestValidationError,
 ) -> JSONResponse:
-    """Handle FastAPI request validation errors without leaking input values.
+    """Handle FastAPI request validation errors without echoing any input value.
 
     FastAPI raises RequestValidationError (not pydantic.ValidationError)
-    for request body/query/path validation failures. We extract only the
-    safe fields (loc, msg, type) and explicitly exclude 'input', 'ctx',
-    and 'url' to prevent raw user values from appearing in the response.
+    for request body/query/path validation failures. The 422 validation list
+    (``_validation_response``) keeps each error's ``loc`` and ``type`` and
+    answers the fixed message of its type (GH-302): pydantic's ``msg`` (which
+    quoted a malformed UUID's character), ``input``, ``ctx`` and ``url`` never
+    reach the response. ``loc`` names the field: for an unknown field
+    (``extra_forbidden``) or a map key, that is the name as the client sent
+    it. Reason-coded 422s are other handlers' and unchanged.
 
     Args:
         request: The incoming request (unused but required by FastAPI).
         exc: The FastAPI RequestValidationError wrapping Pydantic errors.
 
     Returns:
-        JSONResponse with safe error details (no raw input values).
+        JSONResponse with safe error details (no input values; ``loc`` as
+        FastAPI gives it).
     """
-    safe_errors = []
-    for err in exc.errors():
-        safe_errors.append(
-            {
-                "loc": [str(loc) for loc in err.get("loc", [])],
-                "msg": err.get("msg", "Validation error"),
-                "type": err.get("type", "value_error"),
-            }
-        )
-    return JSONResponse(status_code=422, content={"detail": safe_errors})
+    return _validation_response(exc.errors())
 
 
 # The chat routes' documented errors (GH-176), one body each wherever they are

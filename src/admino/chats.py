@@ -28,13 +28,14 @@ excluded ones too (S9' / S11'), and the detail no longer counts the messages
 (Decision 13). The upload, reads and files are ``admino.attachments``, which
 imports this module (never the reverse); their derived files are read by
 ``admino.attachment_context``.
-GH-245 retries a failed answer: ``read_retry_target`` (R1) reads the chat's
+GH-245 retries a failed answer: ``read_retry_target`` (R1') reads the chat's
 failed last turn (its latest message ended ``error`` or ``stopped``,
-``RETRYABLE_STATUSES``) as a ``RetryTarget``, ``load_turn(before_seq=...)``
-(T2b) loads the history before the retried user message, and
+``RETRYABLE_STATUSES``, and the turn has the shape ``delete_failed_turn``
+accepts, GH-302) as a ``RetryTarget``, ``load_turn(before_seq=...)`` (T2b)
+loads the history before the retried user message, and
 ``append_messages(replace_through=...)`` deletes the failed turn through
 migration 0031's ``delete_failed_turn`` (R2) in the transaction that stores
-the new one.
+the new one. The chat detail's ``retryable`` is the same read (GH-302).
 
 Inputs: an executor (an asyncpg pool or connection) or, for the three
 transactional writes (``trash_chat``, ``append_messages`` and
@@ -159,8 +160,10 @@ Security notes:
   0031's backfill set to ``error``; it can't remove a completed turn
   otherwise (only with its whole chat). Fail-closed: a stopped or approval
   turn whose tool-call message came without call ids (no tool_use blocks)
-  can't be replaced (the function refuses it; the retry answers 500, a
-  stream ``internal_error``, and leaves the turn). A GH-25 D9 partial (the
+  can't be replaced. R1' applies the function's shape check with the same
+  predicate (GH-302), so such a turn has no retry target: the retry answers
+  409 ``not_retryable`` before the model or any tool runs and leaves the
+  turn, and the function stays the gate at store time. A GH-25 D9 partial (the
   text a streamed run showed before it timed out) is part of the failed
   answer: an ``error`` run stores it ``error`` (migration 0031 backfills the
   older ones). The function unlinks the turn's files first: a file is never
@@ -466,11 +469,15 @@ _TURN_BEFORE_SQL: Final = """
     WHERE c.id = $1 AND c.org_id = $2 AND c.owner_user_id = $3 AND c.deleted_at IS NULL
     ORDER BY m.seq DESC
 """
-# R1 (GH-245, Decisions 1 and 2): the caller's live chat with its latest message (any
-# role: an org notice after a failed answer makes it not retryable) and its latest user
-# message (the retried one) with that message's live files, excluded ones too, in the
-# order they were uploaded. No row means not found; NULL message columns mean no message
-# (or no user message) to retry.
+# R1' (GH-245, Decisions 1 and 2; GH-302 Decision 1): the caller's live chat with its
+# latest message (any role: an org notice after a failed answer makes it not retryable)
+# and its latest user message (the retried one) with that message's live files, excluded
+# ones too, in the order they were uploaded, plus whether the turn between them has the
+# shape delete_failed_turn accepts. turn_well_formed is migration 0031's fifth check with
+# its predicate copied verbatim (a test pins the two texts together), so a retry never
+# runs a turn the store would refuse to replace. It is true when no row lies strictly
+# between the two (also when either is NULL: no row qualifies). No row means not found;
+# NULL message columns mean no message (or no user message) to retry.
 _RETRY_TARGET_SQL: Final = """
     SELECT c.id,
            latest.seq AS through_seq, latest.status,
@@ -480,7 +487,17 @@ _RETRY_TARGET_SQL: Final = """
                WHERE a.message_id = turn.id AND a.chat_id = c.id AND a.org_id = c.org_id
                  AND a.owner_user_id = c.owner_user_id AND a.deleted_at IS NULL
                ORDER BY a.created_at, a.id
-           ) AS attachment_ids
+           ) AS attachment_ids,
+           NOT EXISTS (
+               SELECT 1 FROM chat_messages
+               WHERE chat_id = c.id AND org_id = c.org_id
+                 AND seq > turn.seq AND seq < latest.seq
+                 AND NOT ((status IN ('complete', 'awaiting_confirmation')
+                         AND (role = 'tool'
+                             OR (role = 'assistant'
+                                 AND coalesce(jsonb_array_length(tool_use_blocks), 0) > 0)))
+                     OR (role = 'assistant' AND status = 'error'))
+           ) AS turn_well_formed
     FROM chats c
     LEFT JOIN LATERAL (
         SELECT seq, status FROM chat_messages
@@ -1251,10 +1268,16 @@ async def read_retry_target(
 ) -> RetryTarget | None:
     """Return the caller's chat's failed last turn, which a retry replaces (GH-245).
 
-    One statement (R1), which writes nothing. A chat can be retried when its
+    One statement (R1'), which writes nothing. A chat can be retried when its
     latest message (highest seq, any role) ended ``error`` or ``stopped``
-    (Decision 1); the retried message is its latest user message, which may
-    be that latest message itself (a stop before any output).
+    (Decision 1) and its failed turn has the shape migration 0031's
+    ``delete_failed_turn`` accepts (GH-302 Decision 1): between the turn's
+    user row and its last row only tool calls with tool_use blocks, their
+    results (``complete`` or ``awaiting_confirmation``) and assistant
+    ``error`` rows. The retried message is its latest user message, which
+    may be that latest message itself (a stop before any output). The retry
+    route and the chat detail's ``retryable`` both use this read, so they
+    agree on every chat.
 
     Args:
         executor: The pool or a connection.
@@ -1263,7 +1286,9 @@ async def read_retry_target(
 
     Returns:
         The ``RetryTarget``; None when the chat can't be retried (no message,
-        a latest message with another status, or no user message).
+        a latest message with another status, no user message, or a failed
+        turn the store couldn't replace, such as a stopped or approval turn
+        whose tool call came without call ids).
 
     Raises:
         ChatNotFoundError: Unless the chat is the caller's and not trashed.
@@ -1275,6 +1300,7 @@ async def read_retry_target(
         row["through_seq"] is None
         or row["status"] not in RETRYABLE_STATUSES
         or row["user_seq"] is None
+        or not row["turn_well_formed"]
     ):
         return None
     return RetryTarget(

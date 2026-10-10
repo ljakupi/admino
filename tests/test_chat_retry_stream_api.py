@@ -58,6 +58,16 @@ What is pinned:
   ``storage_unavailable``. Each documented example is the body the route answers in
   that case, for a JSON and a streamed request alike (always ``application/json``),
   with no run and nothing changed: no message, no attachment row, no file.
+- GH-302 (Decision 1, contract C1 and C3): a streamed retry of a failed turn the
+  store can't replace (a stopped turn, or an approval turn ending ``error``, whose
+  tool-call message was stored without tool_use blocks: the provider sent no call ids)
+  answers the JSON 409 ``not_retryable`` (``application/json``, no stream): no run,
+  the chat row, its messages, its attachment rows (links included), every chat's
+  message count and the files on disk as they were, the chat's pending confirmation
+  kept, no audit row, and R1' (contract C1's exact text) is the request's last
+  statement. The route's OpenAPI 409 description is contract C3's text. The same
+  turn with its tool_use blocks (a tool turn that ended ``stopped``) is still
+  retried as a stream and replaced.
 
 The route is reached over HTTP only (``admino.chat_runtime`` and ``admino.streaming``
 exist since GH-8), so the file collects before GH-245 is implemented and every test
@@ -113,6 +123,8 @@ from tests.tenancy_world import (
     use_fast_passwords,
     use_roomy_rate_limits,
 )
+from tests.test_chats_retry import R1 as R1_PRIME
+from tests.test_chats_retry import _canon
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
@@ -1353,3 +1365,124 @@ async def test_chat_retry_refusal_is_the_documented_json_body_in_both_modes(
         assert example == _LITERAL_BODIES[code]
     assert agent.run.await_count == 0
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# 6. A failed turn the store can't replace (GH-302 Decision 1, contract C1 and C3)
+# ---------------------------------------------------------------------------
+
+# Contract C3: the route's 409 description.
+_DESCRIPTION_409: Final = (
+    "run_active: a run of the chat is going; or not_retryable: the chat's latest message "
+    "didn't end as error or stopped, or its failed turn can't be replaced (nothing to retry)."
+)
+_R1_PRIME_FORM: Final = _canon(R1_PRIME)
+
+# A seeded row: (role, content, status, tool_use_blocks, tool_call_id).
+_TurnRow = tuple[str, str, str, list[dict[str, Any]] | None, str | None]
+
+# Without call ids the tool-call message is stored with no tool_use blocks (its result
+# without a call id): migration 0031's shape check refuses such a stopped or approval turn.
+_NO_IDS_TURNS: Final[dict[str, tuple[_TurnRow, ...]]] = {
+    "stopped_without_call_ids": (
+        ("user", _MESSAGE, "complete", None, None),
+        ("assistant", "", "complete", None, None),
+        ("tool", "Result 302", "complete", None, None),
+        ("assistant", "Here ", "stopped", None, None),
+    ),
+    "approval_without_call_ids": (
+        ("user", _MESSAGE, "complete", None, None),
+        ("assistant", "", "awaiting_confirmation", None, None),
+        ("tool", "Result 302", "complete", None, None),
+        ("assistant", _FAILURE, "error", None, None),
+    ),
+}
+# Its well-formed twin: a tool turn with its tool_use block that ended stopped.
+_STOPPED_WITH_CALL_IDS: Final[tuple[_TurnRow, ...]] = (
+    ("user", _MESSAGE, "complete", None, None),
+    ("assistant", "", "complete", [_block(_CALL_A)], None),
+    ("tool", "Result call-245-a", "complete", None, _CALL_A.tool_call_id),
+    ("assistant", "Here ", "stopped", None, None),
+)
+
+
+def _turn_chat(db: FakeDb, account: Account, turn: tuple[_TurnRow, ...]) -> uuid.UUID:
+    """A user-titled chat of ``account``: the earlier exchange, then ``turn`` row by row
+    with its statuses, and a ready file (derived text on disk) sent with its user row."""
+    chat_id = db.add_chat(account.user_id, title=_USER_TITLE, title_source="user")
+    db.add_chat_message(chat_id, "user", _EARLIER_QUESTION)
+    db.add_chat_message(chat_id, "assistant", _EARLIER_ANSWER)
+    ids = [
+        db.add_chat_message(
+            chat_id, role, content, status=status, tool_use_blocks=blocks, tool_call_id=call_id
+        )
+        for role, content, status, blocks, call_id in turn
+    ]
+    _file(db, chat_id, minute=1, message_id=ids[0])
+    return chat_id
+
+
+@pytest.mark.parametrize("shape", list(_NO_IDS_TURNS))
+def test_chat_retry_stream_failed_turn_the_store_cannot_replace_gets_the_json_409(
+    world: World, client: TestClient, agent: MagicMock, shape: str
+) -> None:
+    """``Accept: text/event-stream``: the JSON 409 ``not_retryable`` (no stream), no run,
+    nothing of the chat, its messages, its attachment rows and links or the files on disk
+    changed, the chat's pending confirmation kept, no audit row; R1' is the last
+    statement (nothing read or written after the refusing read)."""
+    editor = world.a["editor"]
+    db = world.db
+    chat_id = _turn_chat(db, editor, _NO_IDS_TURNS[shape])
+    seed_pending_confirmation(editor, chat_id, "confirm-302-kept")
+    before = _state(db, chat_id)
+    pending = server._chat_runtime.get_pending(chat_id)
+    audit = db.audit_rows()
+    since = len(db.calls)
+
+    response = _retry(client, editor, chat_id)
+
+    assert (response.status_code, response.headers.get("content-type"), response.json()) == (
+        409,
+        _JSON,
+        _NOT_RETRYABLE,
+    )
+    assert agent.run.await_count == 0
+    assert _state(db, chat_id) == before
+    assert pending is not None
+    assert server._chat_runtime.get_pending(chat_id) == pending
+    assert db.audit_rows() == audit
+    assert [_canon(call.sql) == _R1_PRIME_FORM for call in db.calls[since:]][-1:] == [True]
+
+
+def test_chat_retry_openapi_409_describes_a_failed_turn_the_store_cannot_replace(
+    client: TestClient,
+) -> None:
+    """Contract C3: the 409's description names both codes and the turn that can't be
+    replaced."""
+    operation = _retry_operation(client.app)  # type: ignore[arg-type]
+    responses: dict[str, Any] = operation.get("responses", {})
+
+    assert responses.get("409", {}).get("description") == _DESCRIPTION_409
+
+
+def test_chat_retry_stream_well_formed_tool_turn_that_ended_stopped_is_still_retried(
+    world: World, client: TestClient, script: _Script
+) -> None:
+    """The shape check refuses only what the store refuses: a stopped tool turn WITH its
+    tool_use block streams a run (``run_started`` ... ``message_saved`` ``done``) and is
+    replaced: the earlier exchange, the user message again, the new reply."""
+    editor = world.a["editor"]
+    db = world.db
+    chat_id = _turn_chat(db, editor, _STOPPED_WITH_CALL_IDS)
+    failed = _ids(db, chat_id)[2:]
+
+    frames = _stream(_retry(client, editor, chat_id))
+
+    assert (frames[0], _names(frames)[-2:]) == (_started(chat_id), ["message_saved", "done"])
+    assert _stored(db, chat_id) == [
+        *_EARLIER_ROWS,
+        ("user", _MESSAGE, "complete"),
+        ("assistant", _REPLY, "complete"),
+    ]
+    assert set(failed).isdisjoint(_ids(db, chat_id))
+    assert [run.user_message for run in script.runs] == [_MESSAGE]

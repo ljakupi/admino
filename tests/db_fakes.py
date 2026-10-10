@@ -604,6 +604,34 @@ Retrying a failed answer (GH-245, migration 0031; contract C1, C2, C5):
   the migrations plus the contract's 0031>))`` (tests/test_fakedb_retry.py
   builds 0030's and 0031's that way), before it calls the function. 0031
   changes nothing ``shipped_schema()`` reads.
+- GH-302 (contract C1): R1' (R1 plus the select item ``NOT EXISTS (SELECT 1
+  FROM chat_messages WHERE chat_id = c.id AND org_id = c.org_id AND seq >
+  turn.seq AND seq < latest.seq AND NOT (<0031's shape predicate>)) AS
+  turn_well_formed``) runs on the reader as postgres:16 answered it (22 turn
+  shapes, RUN_DIR/pg-probe-r1prime.txt): ``turn_well_formed`` is a bool, true
+  when no row of the chat (and org) strictly between the turn's user row and
+  the latest row fails the predicate, also when ``turn`` or ``latest`` is NULL
+  (the comparisons are NULL, no row qualifies). Three general reader features,
+  no statement-specific code (R1, and every statement before, run as before):
+  - ``[NOT] EXISTS (SELECT ...)`` wherever a value goes (a select item):
+    correlated like a scalar subquery (an unqualified column resolves in the
+    sub-select's own FROM first, so ``seq`` is the sub-select's and
+    ``turn.seq`` the enclosing row's), a bool, never NULL. EXISTS in a WHERE or
+    ON stays unsupported (AssertionError, as before).
+  - ``NOT <predicate>`` as a WHERE / ON predicate (``_Statement.truth``):
+    PostgreSQL's precedence (OR, AND, NOT) and three-valued logic (NOT NULL is
+    NULL; a row is kept only when the whole predicate is true), OR and AND
+    inside it, and the leaves ``x IS [NOT] NULL``, ``x [NOT] IN (<values>)``
+    (NULL when x is NULL, or when nothing matches and a value is NULL),
+    ``x <op> y`` (NULL when a side is NULL) and a bare boolean. Any other leaf
+    under NOT (EXISTS, LIKE, BETWEEN, ANY, IN (SELECT ...), a row comparison,
+    IS DISTINCT FROM, ...) fails the test with an AssertionError; OR outside a
+    NOT stays unsupported, as before.
+  - ``jsonb_array_length(<jsonb>)``: the array's length (the column holds its
+    JSON text); NULL stays NULL (so ``coalesce(jsonb_array_length(
+    tool_use_blocks), 0)`` counts NULL and ``[]`` as no block); a scalar or an
+    object is InvalidParameterValueError ("cannot get array length of a scalar"
+    / "of a non-array"), as on postgres:16.
 
 The login throttle (GH-157):
 - ``throttle`` holds the login_throttle rows of migration 0012 (scope,
@@ -5735,6 +5763,26 @@ class _Statement:
             # GH-244: an ARRAY[a, b, ...] constructor (a list, as asyncpg decodes it).
             inner = expr[expr.index("[") + 1 : -1].strip()
             return [self.value(item, ctx) for item in _top_split(inner, ",")] if inner else []
+        if match := re.fullmatch(r"(not )?exists ?\( *\)", _masked(expr)):
+            # GH-302 (R1''s turn_well_formed): [NOT] EXISTS (SELECT ...) as a value,
+            # correlated like a scalar subquery; a boolean, never NULL.
+            query = expr[expr.index("(") + 1 : -1].strip()
+            assert query.startswith("select "), f"the fake can't evaluate EXISTS({query})"
+            return bool(self.subquery(query, ctx)) != (match.group(1) is not None)
+        if re.fullmatch(r"jsonb_array_length ?\( *\)", _masked(expr)):
+            # GH-302: a JSONB array's length (the value travels and is stored as its
+            # JSON text); NULL stays NULL; a scalar or an object is PostgreSQL's
+            # InvalidParameterValueError.
+            document = self.value(expr[expr.index("(") + 1 : -1], ctx)
+            if document is None:
+                return None
+            assert isinstance(document, str), f"a JSONB value is its JSON text: {expr!r}"
+            parsed = json.loads(document)
+            if not isinstance(parsed, list):
+                kind = "a non-array" if isinstance(parsed, dict) else "a scalar"
+                msg = f"cannot get array length of {kind}"
+                raise asyncpg.exceptions.InvalidParameterValueError(msg)
+            return len(parsed)
         if match := re.fullmatch(r"\$(\d+)(?: ?:: ?\w+(?: \w+)?(?: ?\[ ?\])?)?", expr):
             # GH-187: ``$n::uuid[]`` too (the bound sequence, already encoded-checked).
             return self._arg(match.group(1))
@@ -5951,6 +5999,10 @@ class _Statement:
         if " and " in _masked(atom):
             return self.holds(atom, ctx)
         masked = _masked(atom)
+        if re.match(r"not ", masked):
+            # GH-302: NOT <predicate> (R1''s shape check), with PostgreSQL's
+            # three-valued logic; a WHERE keeps the row only when it is true.
+            return self.truth(atom, ctx) is True
         if match := re.fullmatch(r"(.+?) is (not )?distinct from (.+)", masked):
             # GH-24: NULL-safe; two NULLs are not distinct, one NULL is distinct from
             # anything else.
@@ -5984,7 +6036,6 @@ class _Statement:
                 values = [self.value(item, ctx) for item in _top_split(inner, ",")]
             found = any(_compare("=", left, value) for value in values)
             return left is not None and (found != bool(match.group(2)))
-        assert not re.match(r"not ", masked), f"the fake doesn't evaluate NOT: {atom}"
         if match := re.fullmatch(r"(.+?) ?(=|<>|!=) ?any ?(\( *\))", masked):
             # GH-187: ``col = ANY($n::uuid[])``. A NULL array or left side, or no
             # matching element (NULL elements never match), is not true.
@@ -6016,6 +6067,59 @@ class _Statement:
             right = self.value(atom[match.start(3) :], ctx)
             return _compare(match.group(2), left, right)
         msg = f"the fake can't evaluate the predicate {atom!r}"
+        raise AssertionError(msg)
+
+    def truth(self, text: str, ctx: _Context) -> bool | None:
+        """A predicate's three-valued truth under NOT (GH-302): True, False or None (NULL).
+
+        PostgreSQL's precedence (OR, then AND, then NOT) and Kleene logic: NOT
+        NULL is NULL, TRUE OR NULL is TRUE, FALSE AND NULL is FALSE. The leaves:
+        ``x IS [NOT] NULL``; ``x [NOT] IN (<values>)`` (NULL when x is NULL, or
+        when nothing matches and a value is NULL); ``x <op> y`` (NULL when a side
+        is NULL); a bare boolean column or literal. Any other leaf (EXISTS, ANY,
+        LIKE, BETWEEN, IN (SELECT ...), a row comparison, ...) fails the test.
+        """
+        text = _unwrap(text)
+        disjuncts = _top_split(text, r" or ")
+        if len(disjuncts) > 1:
+            values = [self.truth(item, ctx) for item in disjuncts]
+            return True if True in values else (None if None in values else False)
+        conjuncts = _top_split(text, r" and ")
+        if len(conjuncts) > 1:
+            values = [self.truth(item, ctx) for item in conjuncts]
+            return False if False in values else (None if None in values else True)
+        masked = _masked(text)
+        if re.match(r"not ", masked):
+            inner = self.truth(text[len("not ") :], ctx)
+            return None if inner is None else not inner
+        if match := re.fullmatch(r"(.+?) is (not )?null", masked):
+            value = self.value(text[: match.end(1)], ctx)
+            return (value is not None) if match.group(2) else (value is None)
+        if match := re.fullmatch(r"(.+?) (not )?in ?\( *\)", masked):
+            left = self.value(text[: match.end(1)], ctx)
+            inner = text[masked.rindex("(") + 1 : -1].strip()
+            assert not inner.startswith("select "), f"the fake doesn't do IN (SELECT) here: {text}"
+            values = [self.value(item, ctx) for item in _top_split(inner, ",")]
+            if left is None:
+                return None
+            if any(value is not None and _compare("=", left, value) for value in values):
+                found: bool | None = True
+            else:
+                found = None if None in values else False
+            return found if found is None or not match.group(2) else not found
+        if not re.search(r"(?<![\w.])(?:any|all|some)(?!\w)|^\(", masked) and (
+            match := re.fullmatch(r"(.+?) ?(<>|!=|<=|>=|=|<|>) ?(.+)", masked)
+        ):
+            left = self.value(text[: match.end(1)], ctx)
+            right = self.value(text[match.start(3) :], ctx)
+            if left is None or right is None:
+                return None
+            return _compare(match.group(2), left, right)
+        if re.fullmatch(r"(?:\w+\.)?\w+", masked):
+            value = self.value(text, ctx)
+            assert value is None or type(value) is bool, f"not a boolean predicate: {text}"
+            return value
+        msg = f"the fake can't evaluate the predicate {text!r} under NOT"
         raise AssertionError(msg)
 
     # -- row sets ----------------------------------------------------------------

@@ -25,6 +25,9 @@ Security notes:
   fall back to the superuser. The password is percent-encoded into the DSN
   and never logged.
 - ``pending_migration_versions()`` is read-only: one SELECT, no DDL.
+- Two shipped migration files with one version number are refused before
+  any statement (``DuplicateMigrationVersionError``, GH-302): its message
+  names the version and the files, never their contents.
 - ``TimedPool`` sees statements, never logs: only their count and duration
   reach ``admino.request_timing`` (never SQL, arguments or results).
 - All SQL uses parameterized queries ($1, $2). No string interpolation.
@@ -228,10 +231,24 @@ _MIGRATION_FILE_RE: re.Pattern[str] = re.compile(r"^(\d{4})_.+\.sql$")
 _MIGRATIONS_DIR: Path = Path(__file__).parent / "migrations"
 
 
+class DuplicateMigrationVersionError(RuntimeError):
+    """Two or more shipped migration files share one version number (GH-302)."""
+
+
 def _migration_files() -> list[tuple[int, Path]]:
     """The shipped migration files as (version, path), sorted by version.
 
-    Only ``NNNN_<name>.sql`` files in ``_MIGRATIONS_DIR`` count.
+    Only ``NNNN_<name>.sql`` files in ``_MIGRATIONS_DIR`` count. Two files
+    with one version would each be applied under it: a fresh database fails
+    midway on the second ``_migrations`` row, an upgraded one skips the
+    second file. So a shared version is refused here, before any caller
+    runs a statement (GH-302, Decision 3). Only the names are listed; no
+    file is read.
+
+    Raises:
+        DuplicateMigrationVersionError: Two or more files share a version;
+            the message names the lowest such version and its files (names
+            only, never their contents).
     """
     migration_files: list[tuple[int, Path]] = []
     if _MIGRATIONS_DIR.is_dir():
@@ -239,21 +256,39 @@ def _migration_files() -> list[tuple[int, Path]]:
             match = _MIGRATION_FILE_RE.match(path.name)
             if match:
                 migration_files.append((int(match.group(1)), path))
+    # The names sort by their four-digit version first, so the dict's first shared
+    # version is the lowest one and each version's names are already sorted.
+    names_by_version: dict[int, list[str]] = {}
+    for version, path in migration_files:
+        names_by_version.setdefault(version, []).append(path.name)
+    for version, names in names_by_version.items():
+        if len(names) > 1:
+            msg = (
+                f"Migration version {version:04d} is used by more than one file: "
+                f"{', '.join(names)}."
+            )
+            raise DuplicateMigrationVersionError(msg)
     return migration_files
 
 
 async def run_migrations(pool: asyncpg.Pool) -> None:
     """Execute pending SQL migrations in order.
 
-    Creates the ``_migrations`` tracking table if it does not exist, then
-    scans the migrations directory for numbered SQL files. Files whose
-    version has not been recorded are executed inside a transaction. Only
-    ``admino.migrate`` calls it, connected as the owner: the runtime role
-    can't run DDL.
+    Lists the shipped migration files first (GH-302: two files with one
+    version stop it there, before any statement, so nothing is created or
+    applied), then creates the ``_migrations`` tracking table if it does not
+    exist. Files whose version has not been recorded are executed inside a
+    transaction each. Only ``admino.migrate`` calls it, connected as the
+    owner: the runtime role can't run DDL.
 
     Args:
         pool: The asyncpg connection pool.
+
+    Raises:
+        DuplicateMigrationVersionError: Two or more files share a version
+            (nothing acquired or executed).
     """
+    migration_files = _migration_files()
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -265,7 +300,6 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
             """
         )
 
-    migration_files = _migration_files()
     if not migration_files:
         logger.info("No migration files found.")
         return
@@ -297,7 +331,8 @@ async def pending_migration_versions(pool: asyncpg.Pool) -> list[int]:
 
     Read-only: runs exactly one ``SELECT version FROM _migrations``, creates
     nothing and executes no DDL, so the runtime role can call it. The app
-    refuses to start on a non-empty result instead of migrating.
+    refuses to start on a non-empty result instead of migrating, and on two
+    shipped files with one version (raised before the SELECT, GH-302).
 
     Args:
         pool: The asyncpg connection pool.
@@ -307,6 +342,8 @@ async def pending_migration_versions(pool: asyncpg.Pool) -> list[int]:
         ``_migrations`` table doesn't exist yet.
 
     Raises:
+        DuplicateMigrationVersionError: Two or more shipped files share a
+            version (before any statement).
         asyncpg.PostgresError: Any database error other than the missing
             ``_migrations`` table (e.g. a missing privilege).
     """

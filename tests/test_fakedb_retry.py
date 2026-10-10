@@ -59,6 +59,20 @@ and C2 (checked on postgres:16 as admino_app during preflight):
 - R1 (``chats.read_retry_target``'s statement) and T2b (``load_turn(...,
   before_seq=...)``) run on the reader with PostgreSQL's results. These pass
   today: they are fake infrastructure the other GH-245 tests build on.
+- GH-302 (contract C1, section 4): R1' (R1 plus 0031's shape check as
+  ``turn_well_formed``) on the reader, through the pool and a connection: for
+  each of the 22 shapes of RUN_DIR/pg-probe-r1prime.txt, ``turn_well_formed`` is
+  a bool and it, the retryable bit and delete_failed_turn's verdict are
+  postgres:16's; rows of another chat or org between the seqs never count (the
+  sub-select's unqualified columns are its own rows'); no row outside the
+  caller's live chats; R1's old text keeps its six columns; and
+  ``chats._RETRY_TARGET_SQL`` is R1' (RED until the implementer applies C1). The
+  reader forms R1' needs, each checked on postgres:16 as admino_app: ``NOT``
+  with three-valued logic, ``[NOT] EXISTS (SELECT ...)`` as a correlated value,
+  ``jsonb_array_length``; a changed R1' gets PostgreSQL's answer for its own
+  text (never C1's) and a form the reader doesn't evaluate fails the test with
+  an AssertionError. The fake-level tests pass once this commit's db_fakes.py
+  is in place (they fail on the db_fakes.py before it).
 """
 
 from __future__ import annotations
@@ -1240,3 +1254,511 @@ class TestTurnBeforeStatement:
 
         with pytest.raises(asyncpg.exceptions.DataError):
             await db.pool.fetch(T2B_SQL, turn.chat, ORG_ID, world.owner, 200, "5")
+
+
+# ---------------------------------------------------------------------------
+# 4. R1' (GH-302, contract C1): the turn's shape in the retry target's read
+# ---------------------------------------------------------------------------
+
+# Contract C1 (GH-302): R1', R1 plus migration 0031's shape check (its predicate
+# verbatim) as ``turn_well_formed``, exactly.
+R1P_SQL = """
+    SELECT c.id,
+           latest.seq AS through_seq, latest.status,
+           turn.seq AS user_seq, turn.content,
+           ARRAY(
+               SELECT a.id FROM attachments a
+               WHERE a.message_id = turn.id AND a.chat_id = c.id AND a.org_id = c.org_id
+                 AND a.owner_user_id = c.owner_user_id AND a.deleted_at IS NULL
+               ORDER BY a.created_at, a.id
+           ) AS attachment_ids,
+           NOT EXISTS (
+               SELECT 1 FROM chat_messages
+               WHERE chat_id = c.id AND org_id = c.org_id
+                 AND seq > turn.seq AND seq < latest.seq
+                 AND NOT ((status IN ('complete', 'awaiting_confirmation')
+                         AND (role = 'tool'
+                             OR (role = 'assistant'
+                                 AND coalesce(jsonb_array_length(tool_use_blocks), 0) > 0)))
+                     OR (role = 'assistant' AND status = 'error'))
+           ) AS turn_well_formed
+    FROM chats c
+    LEFT JOIN LATERAL (
+        SELECT seq, status FROM chat_messages
+        WHERE chat_id = c.id AND org_id = c.org_id
+        ORDER BY seq DESC
+        LIMIT 1
+    ) latest ON true
+    LEFT JOIN LATERAL (
+        SELECT id, seq, content FROM chat_messages
+        WHERE chat_id = c.id AND org_id = c.org_id AND role = 'user'
+        ORDER BY seq DESC
+        LIMIT 1
+    ) turn ON true
+    WHERE c.id = $1 AND c.org_id = $2 AND c.owner_user_id = $3 AND c.deleted_at IS NULL
+"""
+_R1_COLUMNS = ["id", "through_seq", "status", "user_seq", "content", "attachment_ids"]
+_SHAPE_CHECK = R1P_SQL[R1P_SQL.index("           NOT EXISTS (") : R1P_SQL.index("    FROM chats c")]
+
+# RUN_DIR/pg-probe-r1prime.py's SHAPES: (role, status, tool_use_blocks) per row, in
+# seq order; a tool row carries the call id "call_1".
+_PROBE_BLOCKS = [{"type": "tool_use", "id": "call_1", "name": "gmail.search", "input": {"q": "x"}}]
+_PROBE_U = ("user", "complete", None)
+_SHAPES: dict[str, list[tuple[str, str, list[Any] | None]]] = {
+    "error_reply": [_PROBE_U, ("assistant", "error", None)],
+    "tool_turn_error": [
+        _PROBE_U,
+        ("assistant", "complete", _PROBE_BLOCKS),
+        ("tool", "complete", None),
+        ("assistant", "error", None),
+    ],
+    "tool_turn_stopped": [
+        _PROBE_U,
+        ("assistant", "complete", _PROBE_BLOCKS),
+        ("tool", "complete", None),
+        ("assistant", "stopped", None),
+    ],
+    "stop_before_output": [("user", "stopped", None)],
+    "error_on_user_row": [("user", "error", None)],
+    "error_on_tool_row": [
+        _PROBE_U,
+        ("assistant", "complete", _PROBE_BLOCKS),
+        ("tool", "error", None),
+    ],
+    "d9_partial": [_PROBE_U, ("assistant", "error", None), ("assistant", "error", None)],
+    "awaiting_with_blocks_then_error": [
+        _PROBE_U,
+        ("assistant", "awaiting_confirmation", _PROBE_BLOCKS),
+        ("tool", "complete", None),
+        ("assistant", "error", None),
+    ],
+    "stopped_no_ids": [
+        _PROBE_U,
+        ("assistant", "complete", None),
+        ("tool", "complete", None),
+        ("assistant", "stopped", None),
+    ],
+    "stopped_empty_blocks": [
+        _PROBE_U,
+        ("assistant", "complete", []),
+        ("tool", "complete", None),
+        ("assistant", "stopped", None),
+    ],
+    "approval_no_ids_then_error": [
+        _PROBE_U,
+        ("assistant", "awaiting_confirmation", None),
+        ("tool", "complete", None),
+        ("assistant", "error", None),
+    ],
+    "approval_no_ids_stopped": [
+        _PROBE_U,
+        ("assistant", "awaiting_confirmation", None),
+        ("assistant", "stopped", None),
+    ],
+    "forged_after_complete": [
+        _PROBE_U,
+        ("assistant", "complete", None),
+        ("assistant", "error", None),
+    ],
+    "limit_reached_mid": [
+        _PROBE_U,
+        ("assistant", "limit_reached", None),
+        ("assistant", "error", None),
+    ],
+    "tool_error_mid": [
+        _PROBE_U,
+        ("assistant", "complete", _PROBE_BLOCKS),
+        ("tool", "error", None),
+        ("assistant", "stopped", None),
+    ],
+    "tool_stopped_mid": [
+        _PROBE_U,
+        ("assistant", "complete", _PROBE_BLOCKS),
+        ("tool", "stopped", None),
+        ("assistant", "stopped", None),
+    ],
+    "complete_latest": [_PROBE_U, ("assistant", "complete", None)],
+    "error_then_notice": [_PROBE_U, ("assistant", "error", None), ("user", "complete", None)],
+    "earlier_fail_then_complete": [
+        _PROBE_U,
+        ("assistant", "error", None),
+        _PROBE_U,
+        ("assistant", "complete", None),
+    ],
+    "earlier_malformed_then_ok": [
+        _PROBE_U,
+        ("assistant", "complete", None),
+        ("assistant", "stopped", None),
+        _PROBE_U,
+        ("assistant", "error", None),
+    ],
+    "no_user_row": [("assistant", "error", None)],
+    "empty": [],
+}
+# RUN_DIR/pg-probe-r1prime.txt (postgres:16 as admino_app, migrated to 0032): per shape
+# (turn_well_formed, retryable, delete_failed_turn accepts the latest row).
+_PG_R1PRIME: dict[str, tuple[bool, bool, bool]] = {
+    "error_reply": (True, True, True),
+    "tool_turn_error": (True, True, True),
+    "tool_turn_stopped": (True, True, True),
+    "stop_before_output": (True, True, True),
+    "error_on_user_row": (True, True, True),
+    "error_on_tool_row": (True, True, True),
+    "d9_partial": (True, True, True),
+    "awaiting_with_blocks_then_error": (True, True, True),
+    "stopped_no_ids": (False, False, False),
+    "stopped_empty_blocks": (False, False, False),
+    "approval_no_ids_then_error": (False, False, False),
+    "approval_no_ids_stopped": (False, False, False),
+    "forged_after_complete": (False, False, False),
+    "limit_reached_mid": (False, False, False),
+    "tool_error_mid": (False, False, False),
+    "tool_stopped_mid": (False, False, False),
+    "complete_latest": (True, False, False),
+    "error_then_notice": (True, False, False),
+    "earlier_fail_then_complete": (True, False, False),
+    "earlier_malformed_then_ok": (True, True, True),
+    "no_user_row": (True, False, False),
+    "empty": (True, False, False),
+}
+
+# R1' variants the reader evaluates as PostgreSQL does (W0's probe on postgres:16 as
+# admino_app, $S/W0/w0_pg_variants.txt), never as C1: the shape a variant decides
+# differently from C1, then one it decides alike.
+_R1P_VARIANTS: dict[str, tuple[str, dict[str, bool]]] = {
+    "exists_without_not": (
+        R1P_SQL.replace("NOT EXISTS (", "EXISTS ("),
+        {"stopped_no_ids": True, "tool_turn_error": False},
+    ),
+    "changed_status_literal": (
+        R1P_SQL.replace("IN ('complete', 'awaiting_confirmation')", "IN ('complete')"),
+        {"awaiting_with_blocks_then_error": False, "tool_turn_error": True},
+    ),
+    "missing_lower_bound": (
+        R1P_SQL.replace("AND seq > turn.seq AND seq < latest.seq", "AND seq < latest.seq"),
+        {"earlier_malformed_then_ok": False, "stop_before_output": True},
+    ),
+}
+# R1' variants with a form the reader doesn't evaluate: each fails the calling test
+# with an AssertionError naming the form, never an answer.
+_R1P_UNSUPPORTED: dict[str, tuple[str, str]] = {
+    "exists_in_where": (
+        R1_SQL.replace(
+            "AND c.deleted_at IS NULL",
+            "AND c.deleted_at IS NULL AND " + _SHAPE_CHECK.split(" AS turn_well_formed")[0],
+        ),
+        "doesn't evaluate EXISTS",
+    ),
+    "like_under_not": (
+        R1P_SQL.replace("AND status = 'error'", "AND status LIKE 'err%'"),
+        "under NOT",
+    ),
+    "in_select_under_not": (
+        R1P_SQL.replace("IN ('complete', 'awaiting_confirmation')", "IN (SELECT 'complete')"),
+        r"IN \(SELECT\)",
+    ),
+}
+
+# Five rows for the reader's NOT (verified on postgres:16 as admino_app over the same
+# values, $S/W0/w0_pg_3vl.txt): (role, tool_call_id, tool_use_blocks).
+_LOGIC_ROWS: list[tuple[str, str | None, list[Any] | None]] = [
+    ("user", None, None),
+    ("assistant", None, [*_TOOL_USE, {**_TOOL_USE[0], "id": "toolu_2"}]),
+    ("tool", "call_1", None),
+    ("tool", "call_2", None),
+    ("assistant", None, []),
+]
+_NOT_SQL = (
+    "SELECT seq FROM chat_messages WHERE chat_id = $1 AND org_id = $2 AND <predicate> ORDER BY seq"
+)
+_NOT_CASES: dict[str, tuple[str, list[int]]] = {
+    "not_comparison": ("NOT (tool_call_id = 'call_1')", [4]),
+    "not_in_with_null": ("NOT (tool_call_id IN ('call_1', NULL))", []),
+    "not_or": ("NOT (tool_call_id = 'call_1' OR role = 'user')", [4]),
+    "not_and_with_null": ("NOT (tool_call_id = 'call_1' AND role = 'user')", [2, 3, 4, 5]),
+    "not_is_null": ("NOT (tool_call_id IS NULL)", [3, 4]),
+    "not_not_in": ("NOT (tool_call_id NOT IN ('call_1'))", [3]),
+    "not_not": ("NOT NOT (tool_call_id = 'call_2')", [4]),
+    "not_bare_comparison": ("NOT tool_call_id = 'call_2'", [3]),
+}
+
+
+def _shape_chat(db: FakeDb, owner: uuid.UUID, name: str) -> uuid.UUID:
+    """A chat of ``owner`` holding the probe's rows for one shape."""
+    chat = db.add_chat(owner)
+    for role, status, blocks in _SHAPES[name]:
+        db.add_chat_message(
+            chat,
+            role,
+            "t",
+            status=status,
+            tool_use_blocks=blocks,
+            tool_call_id="call_1" if role == "tool" else None,
+        )
+    return chat
+
+
+async def _function_accepts(
+    db: FakeDb, chat: uuid.UUID, owner: uuid.UUID, through_seq: int | None
+) -> bool:
+    """Whether delete_failed_turn (0031, the tree's) accepts the latest row, as the probe."""
+    if through_seq is None:
+        return False
+    try:
+        await db.pool.fetchval(DELETE_SQL, chat, ORG_ID, owner, through_seq)
+    except asyncpg.exceptions.InsufficientPrivilegeError:
+        return False
+    return True
+
+
+def _retryable(row: Any) -> bool:
+    """The probe's retryable bit: a failed latest row, a user row and a well-formed turn."""
+    return bool(
+        row["through_seq"] is not None
+        and row["status"] in ("error", "stopped")
+        and row["user_seq"] is not None
+        and row["turn_well_formed"]
+    )
+
+
+class TestRetryTargetShapeStatement:
+    """R1' answers as PostgreSQL does (contract C1)."""
+
+    @pytest.mark.parametrize("name", list(_SHAPES))
+    async def test_fakedb_r1prime_turn_shape_matches_postgres(
+        self, world: World, name: str
+    ) -> None:
+        """Each of the probe's 22 shapes: turn_well_formed (a bool), the retryable bit
+        and delete_failed_turn's verdict are postgres:16's."""
+        db = world.db
+        chat = _shape_chat(db, world.owner, name)
+
+        row = await db.pool.fetchrow(R1P_SQL, chat, ORG_ID, world.owner)
+
+        assert row is not None
+        accepted = await _function_accepts(db, chat, world.owner, row["through_seq"])
+        assert (
+            type(row["turn_well_formed"]),
+            row["turn_well_formed"],
+            _retryable(row),
+            accepted,
+        ) == (bool, *_PG_R1PRIME[name])
+
+    async def test_fakedb_r1prime_connection_answers_like_the_pool(self, world: World) -> None:
+        """Through a connection (inside its transaction) R1' answers R1's columns plus
+        turn_well_formed, the same as the pool, true and false alike."""
+        db = world.db
+        chats = {
+            name: _shape_chat(db, world.owner, name)
+            for name in ("tool_turn_error", "stopped_no_ids")
+        }
+        conn = db.new_connection()
+
+        async with conn.transaction():
+            on_conn = {
+                name: await conn.fetchrow(R1P_SQL, chat, ORG_ID, world.owner)
+                for name, chat in chats.items()
+            }
+        on_pool = {
+            name: await db.pool.fetchrow(R1P_SQL, chat, ORG_ID, world.owner)
+            for name, chat in chats.items()
+        }
+
+        assert [list(row) for row in on_conn.values()] == [[*_R1_COLUMNS, "turn_well_formed"]] * 2
+        assert (
+            {name: row["turn_well_formed"] for name, row in on_conn.items()}
+            == {name: row["turn_well_formed"] for name, row in on_pool.items()}
+            == {"tool_turn_error": True, "stopped_no_ids": False}
+        )
+
+    async def test_fakedb_r1prime_rows_of_other_chats_between_the_seqs_never_count(
+        self, world: World
+    ) -> None:
+        """A row the shape check rejects, stored between the turn's user row and the
+        latest row in the owner's other chat and in another org's chat, doesn't count."""
+        db = world.db
+        chat = db.add_chat(world.owner)
+        other_chat = db.add_chat(world.owner)
+        other_org_chat = db.add_chat(world.stranger)
+        db.add_chat_message(chat, "user", "t")
+        db.add_chat_message(other_chat, "assistant", "t")
+        db.add_chat_message(other_org_chat, "assistant", "t")
+        db.add_chat_message(chat, "assistant", "t", status="error")
+
+        row = await db.pool.fetchrow(R1P_SQL, chat, ORG_ID, world.owner)
+
+        assert row is not None
+        assert row["turn_well_formed"] is True
+
+    async def test_fakedb_r1prime_sub_select_columns_resolve_to_its_own_rows(
+        self, world: World
+    ) -> None:
+        """The unqualified ``org_id`` of the sub-select is the inner row's: a rejected row
+        of the chat stored under another org (a state the composite foreign key keeps out
+        of PostgreSQL, forged here) doesn't count; the same row under the chat's org does."""
+        db = world.db
+        forged_chat, intact_chat = db.add_chat(world.owner), db.add_chat(world.owner)
+        for chat in (forged_chat, intact_chat):
+            db.add_chat_message(chat, "user", "t")
+            middle = db.add_chat_message(chat, "assistant", "t")
+            db.add_chat_message(chat, "assistant", "t", status="error")
+            if chat == forged_chat:
+                db.chat_messages[middle]["org_id"] = OTHER_ORG_ID
+
+        rows = [
+            await db.pool.fetchrow(R1P_SQL, chat, ORG_ID, world.owner)
+            for chat in (forged_chat, intact_chat)
+        ]
+
+        assert [row["turn_well_formed"] for row in rows] == [True, False]
+
+    @pytest.mark.parametrize("case", ["colleague", "other_org", "trashed", "unknown"])
+    async def test_fakedb_r1prime_no_row_outside_the_callers_live_chats(
+        self, world: World, case: str
+    ) -> None:
+        """As R1: another owner's, another org's, a trashed or an unknown chat (each with
+        a malformed turn): no row."""
+        db = world.db
+        chat = _shape_chat(db, world.owner, "stopped_no_ids")
+        org, owner = ORG_ID, world.owner
+        if case == "colleague":
+            owner = world.colleague
+        elif case == "other_org":
+            chat = _shape_chat(db, world.stranger, "stopped_no_ids")
+            org = OTHER_ORG_ID
+        elif case == "trashed":
+            db.chats[chat]["deleted_at"] = datetime.now(UTC)
+        else:
+            chat = uuid.uuid4()
+
+        assert await db.pool.fetchrow(R1P_SQL, chat, org, owner) is None
+
+    async def test_fakedb_r1_still_answers_its_six_columns(self, world: World) -> None:
+        """R1's old text keeps today's answer: its six columns, no turn_well_formed, for
+        a turn R1' calls malformed."""
+        db = world.db
+        chat = _shape_chat(db, world.owner, "stopped_no_ids")
+        seqs = [row["seq"] for row in db.messages_of(chat)]
+
+        row = await db.pool.fetchrow(R1_SQL, chat, ORG_ID, world.owner)
+
+        assert row is not None
+        assert [(key, value) for key, value in row.items() if key != "id"] == [
+            ("through_seq", seqs[-1]),
+            ("status", "stopped"),
+            ("user_seq", seqs[0]),
+            ("content", "t"),
+            ("attachment_ids", []),
+        ]
+
+    async def test_fakedb_r1prime_is_the_apps_retry_target_statement(self) -> None:
+        """The statement proven here is the app's: chats._RETRY_TARGET_SQL is R1'
+        (contract C1), whitespace and case aside."""
+        from admino import chats
+
+        assert db_fakes.norm(chats._RETRY_TARGET_SQL) == db_fakes.norm(R1P_SQL)
+
+
+class TestReaderFormsForTheShapeCheck:
+    """The general reader features R1' needs (GH-302), as postgres:16 answers them."""
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            (f"{variant}:{shape}", value)
+            for variant, (_, answers) in _R1P_VARIANTS.items()
+            for shape, value in answers.items()
+        ],
+    )
+    async def test_fakedb_r1prime_variant_evaluates_as_postgres(
+        self, world: World, name: str, expected: bool
+    ) -> None:
+        """A changed R1' gets PostgreSQL's answer for its own text, never C1's: EXISTS
+        without NOT, a status literal dropped, the turn's lower bound dropped."""
+        variant, shape = name.split(":")
+        db = world.db
+        chat = _shape_chat(db, world.owner, shape)
+
+        row = await db.pool.fetchrow(_R1P_VARIANTS[variant][0], chat, ORG_ID, world.owner)
+
+        assert row is not None
+        assert row["turn_well_formed"] is expected
+
+    @pytest.mark.parametrize("variant", list(_R1P_UNSUPPORTED))
+    async def test_fakedb_r1prime_unsupported_variant_fails_the_test(
+        self, world: World, variant: str
+    ) -> None:
+        """A form the reader doesn't evaluate (EXISTS in a WHERE, LIKE or IN (SELECT ...)
+        under NOT) fails loudly with an AssertionError naming it, never an answer."""
+        sql, message = _R1P_UNSUPPORTED[variant]
+        db = world.db
+        chat = _shape_chat(db, world.owner, "tool_turn_error")
+
+        with pytest.raises(AssertionError, match=message):
+            await db.pool.fetchrow(sql, chat, ORG_ID, world.owner)
+
+    @pytest.mark.parametrize("case", list(_NOT_CASES))
+    async def test_fakedb_not_follows_postgres_three_valued_logic(
+        self, world: World, case: str
+    ) -> None:
+        """NOT in a WHERE keeps a row only when the whole predicate is true: NOT over a
+        NULL comparison, IN with a NULL, OR / AND with a NULL side, NOT NOT, and NOT
+        binding looser than ``=``."""
+        predicate, expected = _NOT_CASES[case]
+        db = world.db
+        chat = db.add_chat(world.owner)
+        seqs = [
+            _seq(
+                db, db.add_chat_message(chat, role, "t", tool_call_id=call, tool_use_blocks=blocks)
+            )
+            for role, call, blocks in _LOGIC_ROWS
+        ]
+
+        rows = await db.pool.fetch(_NOT_SQL.replace("<predicate>", predicate), chat, ORG_ID)
+
+        assert [seqs.index(row["seq"]) + 1 for row in rows] == expected
+
+    async def test_fakedb_jsonb_array_length_counts_the_stored_array(self, world: World) -> None:
+        """jsonb_array_length: NULL stays NULL, ``[]`` is 0, two blocks 2; coalesce(..., 0)
+        counts NULL and ``[]`` as none."""
+        db = world.db
+        chat = db.add_chat(world.owner)
+        for role, call, blocks in _LOGIC_ROWS:
+            db.add_chat_message(chat, role, "t", tool_call_id=call, tool_use_blocks=blocks)
+
+        rows = await db.pool.fetch(
+            "SELECT jsonb_array_length(tool_use_blocks) AS raw,"
+            " coalesce(jsonb_array_length(tool_use_blocks), 0) AS counted"
+            " FROM chat_messages WHERE chat_id = $1 AND org_id = $2 ORDER BY seq",
+            chat,
+            ORG_ID,
+        )
+
+        assert [(row["raw"], row["counted"]) for row in rows] == [
+            (None, 0),
+            (2, 2),
+            (None, 0),
+            (None, 0),
+            (0, 0),
+        ]
+
+    @pytest.mark.parametrize(
+        ("document", "message"),
+        [("3", "cannot get array length of a scalar"), ('{"a": 1}', "of a non-array")],
+        ids=["scalar", "object"],
+    )
+    async def test_fakedb_jsonb_array_length_of_a_non_array_is_refused(
+        self, world: World, document: str, message: str
+    ) -> None:
+        """A scalar or an object is postgres:16's InvalidParameterValueError."""
+        db = world.db
+        chat = db.add_chat(world.owner)
+
+        with pytest.raises(asyncpg.exceptions.InvalidParameterValueError, match=message):
+            await db.pool.fetchrow(
+                "SELECT jsonb_array_length($3::jsonb) AS n FROM chats"
+                " WHERE id = $1 AND org_id = $2",
+                chat,
+                ORG_ID,
+                document,
+            )

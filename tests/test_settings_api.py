@@ -3220,7 +3220,12 @@ class TestTaskDonePings:
     def test_settings_api_me_patch_null_task_done_gives_nothing_to_change(
         self, db: FakeDb, app: FastAPI, body: dict[str, Any]
     ) -> None:
-        """A patch whose only task_done is null is the "nothing given" 422 on the body."""
+        """A patch whose only task_done is null is the "nothing given" 422 on the body.
+
+        GH-302 (Decision 4): the validator's own text ("Give at least one setting to
+        change.") is no longer in the 422; its ``value_error`` type on ``["body"]``, with
+        the fixed message "Invalid value", says which check failed.
+        """
         _, token = _login(db, "editor")
         before = _state(db)
 
@@ -3230,7 +3235,9 @@ class TestTaskDonePings:
         errors = response.json()["detail"]
         assert all(error["type"] != "extra_forbidden" for error in errors), errors
         assert [error["loc"] for error in errors] == [["body"]]
-        assert "Give at least one setting to change." in errors[0]["msg"]
+        assert [(error["type"], error["msg"]) for error in errors] == [
+            ("value_error", "Invalid value")
+        ]
         assert _state(db) == before
 
 

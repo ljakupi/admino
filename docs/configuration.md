@@ -709,12 +709,12 @@ Viewer's chats from before a role change stay stored, unused.
 | --- | --- |
 | `POST /api/chats` | Starts a chat. The body is `{}` or `{"title": "..."}`. Answers `201` with the chat: `id`, `title`, `title_source`, `created_at` and `last_activity_at`. Without a title, `title` is `""` and `title_source` is `"auto"` until the first exchange titles it (see below); with one, `"user"`. |
 | `GET /api/chats?cursor=&limit=` | Lists your chats, the most recently active first: `{"chats": [...], "next_cursor": ...}`. `limit` is 1–100, 50 by default. Chats in the trash aren't listed. |
-| `GET /api/chats/{id}?cursor=&limit=` | One chat with a page of its messages, oldest first: the latest 100 by default (`limit` 1–100). `next_cursor` gets the earlier ones. Each message carries its `attachment_ids`. It also carries `pending_confirmation` and `confirmation_status` (see below), `context_usage` (see [Context budget](#context-budget)), and `retryable`: `true` exactly when the chat's latest message ended as `error` or `stopped`, so that a [retry](#retrying-a-failed-reply) would run, whatever page you read. |
+| `GET /api/chats/{id}?cursor=&limit=` | One chat with a page of its messages, oldest first: the latest 100 by default (`limit` 1–100). `next_cursor` gets the earlier ones. Each message carries its `attachment_ids`. It also carries `pending_confirmation` and `confirmation_status` (see below), `context_usage` (see [Context budget](#context-budget)), and `retryable`: `true` exactly when a [retry](#retrying-a-failed-reply) would run: the chat's latest message ended as `error` or `stopped`, and the failed turn is one a retry can replace. It's the retry's own check, whatever page you read. |
 | `PATCH /api/chats/{id}` | Renames the chat: `{"title": "..."}`. `title_source` becomes `"user"`. Sending the same title again changes nothing. |
 | `DELETE /api/chats/{id}` | Moves the chat to the [trash](#trash), with its [attachments](#attachments), and answers `204`; you can restore it from there until it expires. When your organization's trash retention is 0, the chat is deleted for good in the same request: its messages and files are gone when the `204` comes. If that step fails, the `204` still comes and the chat waits in the trash for the next hourly purge (see [Trash](#trash)). A pending confirmation of the chat is dropped. It's recorded in the audit log as `chat.delete` (and `chat.purge` when it's deleted for good), with the chat's ID only. |
 | `POST /api/chats/{id}/messages` | Sends a message: `{"message": "..."}`, optionally with the files you uploaded into the chat, `"attachment_ids": [...]` (see [Attachments](#attachments)). Answers like `POST /api/message`: the reply, its tool calls, the `status`, a `pending_confirmation` when an action waits for your approval, the `error_code`, the `context_usage` and `context_notice` (see [Context budget](#context-budget)), and the `chat_id`. With `Accept: text/event-stream`, the reply streams instead (see [Streaming replies](#streaming-replies)). |
 | `POST /api/chats/{id}/stop` | Stops the chat's streamed message. It needs no body and answers `{"stopped": true}`, or `{"stopped": false}` when the chat has no streamed message running (see [Stopping a reply](#stopping-a-reply)). |
-| `POST /api/chats/{id}/retry` | Runs the chat's latest message again when its last answer ended as `error` or `stopped`, and replaces the failed turn with the new one. It needs no body. Answers like `POST /api/chats/{id}/messages`: JSON, or streamed with `Accept: text/event-stream`. When the last answer didn't fail, it answers `409` `not_retryable` (see [Retrying a failed reply](#retrying-a-failed-reply)). |
+| `POST /api/chats/{id}/retry` | Runs the chat's latest message again when its last answer ended as `error` or `stopped`, and replaces the failed turn with the new one. It needs no body. Answers like `POST /api/chats/{id}/messages`: JSON, or streamed with `Accept: text/event-stream`. When the last answer didn't fail, or its failed turn can't be replaced, it answers `409` `not_retryable` (see [Retrying a failed reply](#retrying-a-failed-reply)). |
 
 - **Titles** have 1 to 200 characters, spaces at either end removed. Control and
   formatting characters are refused with `422`. Creating, renaming and sending messages
@@ -754,7 +754,9 @@ Viewer's chats from before a role change stay stored, unused.
   except in a turn that ended as `error`: there every earlier assistant message stored
   without tool-call blocks is `error` too. In practice that's the text a streamed reply
   showed before it timed out (see [Streaming replies](#streaming-replies)), and a tool
-  call the provider sent without call ids.
+  call the provider sent without call ids. A turn with such a tool call that was stopped,
+  or that waited for your approval, can't be retried: `retryable` is `false`, and a
+  [retry](#retrying-a-failed-reply) answers `409` `not_retryable` before anything runs.
   Invisible characters (control and formatting characters such as zero-width
   spaces, soft hyphens, word joiners and direction marks; tabs and line breaks stay) and
   credential-like text are stripped from the content, like in a live reply and in
@@ -839,12 +841,20 @@ Viewer's chats from before a role change stay stored, unused.
   chat that doesn't exist, is in the trash, or belongs to another user or another
   organization answers the same `404` `{"detail": "Chat not found", "reason":
   "chat_not_found"}`, so nobody learns that someone else's chat exists. A chat ID that
-  isn't a UUID answers `422`. A blank message (empty, or nothing but spaces, tabs, line
-  breaks and other whitespace) that sends no files answers `422` `{"detail": "Message
-  is empty", "reason": "message_empty"}` on both message routes, before any chat is read,
-  so every chat ID gets the same answer; it still counts against your rate limit. A
-  blank message with files (`attachment_ids`) is accepted and stored as sent; the model
-  gets the files without a text. The files a message sends, and those the chat already
+  isn't a UUID answers `422` with the validation list, which every route answers when a
+  field is missing, unknown, of the wrong type or out of range:
+  `{"detail": [{"loc": [...], "msg": "...", "type": "..."}]}`, one entry per problem.
+  `loc` says where (`["path", "chat_id"]`, `["body", "message"]`), `type` names the check
+  that failed (such as `uuid_parsing`, `missing` or `less_than_equal`), and `msg` is a
+  fixed text per `type` (such as `Input should be a valid UUID`) that never quotes a
+  value you sent, not even one character of it. `loc` names the field, so for an
+  unknown field (extra fields are refused, `extra_forbidden`) or a key of a map it is
+  the name you sent. A blank message (empty, or nothing but
+  spaces, tabs, line breaks and other whitespace) that sends no files answers `422`
+  `{"detail": "Message is empty", "reason": "message_empty"}` on both message routes,
+  before any chat is read, so every chat ID gets the same answer; it still counts
+  against your rate limit. A blank message with files (`attachment_ids`) is accepted and
+  stored as sent; the model gets the files without a text. The files a message sends, and those the chat already
   holds, have their own refusals (`attachment_not_found`, `attachment_already_sent`,
   `attachment_not_ready`, `context_overflow`, `attachment_bytes_exceeded`,
   `storage_unavailable`, `image_input_unsupported`), listed under
@@ -1082,15 +1092,19 @@ within a reply.
   reply failed (with an `error_code` or without one), you [stopped](#stopping-a-reply) it,
   or its stream was closed before it ended (a disconnect stops it the same way). A stop
   before the reply had any output leaves no reply: your message itself has
-  `status: "stopped"`, and it can be retried too. `GET /api/chats/{id}` tells you in
-  `retryable`, `true` exactly then, whatever page you read; each message's `status` tells
-  an error from a stop. Nothing else can be retried, and the route answers `409`
-  `not_retryable` (see Errors below): a chat whose latest message is `complete`, waits
-  for your approval or holds an expired confirmation (`awaiting_confirmation`), or reached
-  its tool-call limit (`limit_reached`), an empty chat, and a failed reply that a later
-  message follows, such as the note of a
-  [promoted permission](permissions.md#promoting-a-critical-permission) (like a message,
-  a retry first adds the notes that just took effect).
+  `status: "stopped"`, and it can be retried too. The exception is a failed turn that a
+  retry can't replace: a stopped turn, or one that waited for your approval, whose tool
+  call the provider sent without call ids (see the message `status` under
+  [Chats](#chats)). `GET /api/chats/{id}` tells you in `retryable`, `true` exactly when
+  a retry would run, whatever page you read; each message's `status` tells an error from
+  a stop. Nothing else can be retried, and the route answers `409` `not_retryable` (see
+  Errors below): a chat whose latest message is `complete`, waits for your approval or
+  holds an expired confirmation (`awaiting_confirmation`), or reached its tool-call limit
+  (`limit_reached`), an empty chat, a failed reply that a later message follows, such as
+  the note of a [promoted permission](permissions.md#promoting-a-critical-permission)
+  (like a message, a retry first adds the notes that just took effect), and a failed turn
+  that can't be replaced. The `409` comes before anything runs: no model call, no action,
+  and the turn, its files and a pending approval stay as they were.
 - **What's replaced.** The failed turn: your latest message and everything stored after
   it, the reply with its actions and their results (and what an approval added to it,
   or the text a reply showed before it timed out).
@@ -1144,14 +1158,16 @@ within a reply.
     shortly.", "reason": "rate_limit"}` and `503` with `"reason": "chats_busy"` as for a
     message (see Errors under [Chats](#chats));
   - `409` `{"detail": "The last answer can't be retried.", "reason": "not_retryable"}`
-    when the chat's latest message didn't end as `error` or `stopped` (see above);
+    when the chat's latest message didn't end as `error` or `stopped`, or its failed turn
+    can't be replaced (see above);
   - the chat's files, as for a send (see [Attachments](#attachments)): `422`
     `context_overflow` or `attachment_bytes_exceeded`, `503` `storage_unavailable`, `422`
     `image_input_unsupported`. [Exclude](#excluding-a-file) the file at fault, then retry.
 
-  A chat ID that isn't a UUID answers `422` with the usual validation list. When the run
-  itself fails, the answer is `200` with `status: "error"` and the reply's `error_code`
-  (see [LLM errors and retries](#llm-errors-and-retries)), and that reply can be retried
+  A chat ID that isn't a UUID answers `422` with the usual validation list (see
+  **Errors** under [Chats](#chats)). When the run itself fails, the answer is `200` with
+  `status: "error"` and the reply's `error_code` (see
+  [LLM errors and retries](#llm-errors-and-retries)), and that reply can be retried
   again. `401` without a session, `403` for a cross-site request or a role without chat
   access, and `500` keep the bodies they have on every route.
 
@@ -1487,7 +1503,9 @@ and images. They're what the model gets once the file is sent (see
 `PATCH /api/attachments/{id}` with `{"active": false}` excludes one of your files from the
 chat's later messages, and `{"active": true}` includes it again. The body is exactly that:
 `active` must be `true` or `false` (not a string, a number or `null`), and a missing
-`active` or any other field answers `422`, without echoing what you sent. The answer is
+`active` or any other field answers `422`, without echoing any value you sent (the
+`loc` of any other field is its name as you sent it, see **Errors** under
+[Chats](#chats)). The answer is
 `200` with the attachment, like `GET /api/attachments/{id}`, its `active` the new value.
 
 - **Any status.** It works on your own live attachment whatever its status (`uploaded`,
