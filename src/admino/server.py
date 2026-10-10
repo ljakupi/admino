@@ -8039,7 +8039,8 @@ def _safe_validation_errors(errors: Sequence[ErrorDetails]) -> list[dict[str, ob
     - the ``FixedMessageError``'s text, when the error is a ``value_error``
       whose ``ctx["error"]`` is one with a non-empty message: admino's own
       request validators, whose texts are fixed strings in admino's code (a
-      test scans every construction), never built from the value;
+      test scans every ``FixedMessageError(...)`` call), never built from the
+      value;
     - otherwise the fixed text of the error's ``type`` in
       ``_VALIDATION_MESSAGES``, or ``_VALIDATION_FALLBACK_MESSAGE`` for a type
       outside it. That covers pydantic's built-in errors, a plain

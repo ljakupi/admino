@@ -671,8 +671,11 @@ call, an OAuth connection, a crash) and scans everything the log handler wrote.
   entry per problem: `loc` names the field (for an unknown field or a map key, the name
   as sent), `type` the check, and `msg` is a fixed text. That is the text of the check's
   type, or, for admino's own checks, their message, which is written in admino's code
-  and never built from the request (`tests/test_fixed_message_guard.py` fails on any
-  other). No value you sent is quoted, and the errors aren't logged.
+  and never built from the request. `tests/test_fixed_message_guard.py` scans every
+  `FixedMessageError(...)` call in `src/admino/` and fails on a message built from a
+  value (an f-string, `%`, `.format`, `+`, a parameter, a rebound name), on an import or
+  assignment of the class under another name and on a `class` statement that subclasses
+  it. No value you sent is quoted, and the errors aren't logged.
 - **Chat timings.** Each request to a route that sends a chat message or a confirmation
   logs one `chat timings` line: the request ID, a fixed route label, the status,
   statement counts and durations. It holds no other ID, no text, no title, tool or model

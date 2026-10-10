@@ -299,9 +299,14 @@ class FixedMessageError(ValueError):
     Security: the message reaches the client verbatim, so it must be written
     in admino's code, never built from what was sent. Construct it only with
     a string literal or a name bound once to one (a module constant or a
-    single local assignment); ``tests/test_fixed_message_guard.py`` scans
-    ``src/admino/`` and fails on any other argument (an f-string, ``%``,
-    ``.format``, ``+``, a parameter) and on a subclass.
+    single local assignment). ``tests/test_fixed_message_guard.py`` scans
+    every ``FixedMessageError(...)`` call in ``src/admino/`` and fails on any
+    other argument (an f-string, ``%``, ``.format``, ``+``, a parameter, a
+    rebound name), on an import or assignment of the class under another
+    name and on a ``class`` statement that subclasses it. The scan sees only
+    these calls, while the handlers answer ``str()`` of any instance (a
+    subclass's too): never set a message any other way (``__new__``,
+    assigning ``args``, a ``type()`` subclass, ``getattr``).
 
     Args:
         message: The fixed text; ``str(exc)`` is exactly this.
