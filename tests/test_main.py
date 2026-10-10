@@ -82,6 +82,11 @@ covering:
   (``llm.max_response_tokens``), ``context_margin_percent`` and
   ``max_tool_result_tokens`` (``config.context``), and ``max_context_messages`` 0 (no
   cap). ``_make_mock_config`` sets those config values, so main() gets numbers.
+- GH-302 (Decision 3, contract C4): when ``database.pending_migration_versions``
+  raises ``DuplicateMigrationVersionError`` (two shipped migration files share a
+  version), ``_async_startup`` closes the startup pool and that same error propagates,
+  before any statement, seed or read (as for pending migrations); main() exits 1 with
+  its type-only "Database startup failed" line and never starts uvicorn.
 
 Security notes:
 - All external dependencies are mocked — no real LLM, no real config files,
@@ -1923,6 +1928,114 @@ class TestAsyncStartup:
         )
 
         assert name not in used
+
+
+# ---------------------------------------------------------------------------
+# GH-302: two migration files of one version stop the startup check
+# ---------------------------------------------------------------------------
+
+_DUPLICATE_MIGRATION_MESSAGE = (
+    "Migration version 0031 is used by more than one file: 0031_a.sql, 0031_b.sql."
+)
+
+
+def _duplicate_migration_error() -> RuntimeError:
+    """A real ``database.DuplicateMigrationVersionError``, built when a test runs (a
+    module-level reference would stop this file from collecting before GH-302)."""
+    from admino import database
+
+    error: RuntimeError = database.DuplicateMigrationVersionError(_DUPLICATE_MIGRATION_MESSAGE)
+    return error
+
+
+def _refuse_duplicate_migrations(startup: _Startup, error: BaseException) -> None:
+    """Make the patched pending-migrations check record its step, then raise ``error``."""
+
+    def _raise(*_args: Any, **_kwargs: Any) -> Any:
+        startup.events.append(("pending_migration_versions", len(startup.db.calls)))
+        raise error
+
+    startup.pending_migration_versions.side_effect = _raise
+
+
+class TestAsyncStartupDuplicateMigrationVersion:
+    """GH-302 (Decision 3, contract C4): ``database.pending_migration_versions`` raises
+    ``DuplicateMigrationVersionError`` when two shipped migration files share a version.
+    _async_startup then closes the startup pool and lets that same error propagate, as
+    for pending migrations: no statement, seed or read follows. main() maps it (a
+    RuntimeError) to its type-only "Database startup failed" line and exit 1."""
+
+    @pytest.mark.asyncio
+    async def test_async_startup_duplicate_migration_version_propagates_the_same_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The error object pending_migration_versions raised is the one that leaves
+        _async_startup (not wrapped, not replaced by the pending-migrations error)."""
+        startup = _patch_startup_db(monkeypatch)
+        error = _duplicate_migration_error()
+        _refuse_duplicate_migrations(startup, error)
+
+        with pytest.raises(type(error)) as exc_info:
+            await _async_startup(_startup_config())
+
+        assert exc_info.value is error
+
+    @pytest.mark.asyncio
+    async def test_async_startup_duplicate_migration_version_closes_the_pool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The startup pool is closed once, right after the refused check."""
+        startup = _patch_startup_db(monkeypatch)
+        _refuse_duplicate_migrations(startup, _duplicate_migration_error())
+
+        with pytest.raises(RuntimeError):
+            await _async_startup(_startup_config())
+
+        startup.close_pool.assert_awaited_once()
+        assert [name for name, _ in startup.events] == [
+            "init_pool",
+            "check_health",
+            "pending_migration_versions",
+            "close_pool",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_async_startup_duplicate_migration_version_runs_no_later_step(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No statement at all, no platform row, no per-org seed, no migrations run."""
+        startup = _patch_startup_db(monkeypatch)
+        error = _duplicate_migration_error()
+        _refuse_duplicate_migrations(startup, error)
+
+        with pytest.raises(type(error)):
+            await _async_startup(_startup_config())
+
+        assert startup.db.calls == []
+        assert startup.db.platform_row() is None
+        startup.seed_missing_orgs.assert_not_called()
+        startup.run_migrations.assert_not_called()
+
+    def test_main_duplicate_migration_version_exits_1_without_starting_the_server(
+        self,
+        mock_deps: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """main() exits 1 with one "Database startup failed" ERROR line naming
+        DuplicateMigrationVersionError; uvicorn never runs."""
+        monkeypatch.setattr("admino.main._configure_logging", MagicMock())
+        _fail_db_startup(mock_deps, _duplicate_migration_error())
+
+        with caplog.at_level(logging.DEBUG), pytest.raises(SystemExit) as exc_info:
+            main(config_path=Path("c.yaml"))
+
+        failures = _db_startup_failure_records(caplog)
+        assert exc_info.value.code == 1
+        assert len(failures) == 1
+        assert failures[0].levelno == logging.ERROR
+        assert "DuplicateMigrationVersionError" in failures[0].getMessage()
+        mock_deps["uvicorn_run"].assert_not_called()
 
 
 # ---------------------------------------------------------------------------

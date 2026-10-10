@@ -1,35 +1,52 @@
-"""HTTP spec of GH-245's client signal: ``GET /api/chats/{chat_id}``'s ``retryable``.
+"""HTTP spec of ``GET /api/chats/{chat_id}``'s ``retryable`` (GH-245, GH-302).
 
 Issue #245, criterion "A client can tell from the chat API whether the last answer
 ended as error or interrupted, so it knows when to offer Retry", Decisions 1, 4 and
-6; contract C3 (``ChatDetailResponse.retryable``) and C4's GET line
-(``retryable = detail.latest_status in chats.RETRYABLE_STATUSES``, no new statement).
+6; contract C3 (``ChatDetailResponse.retryable``). Issue #302, criterion
+"``GET /api/chats/{id}`` computes ``retryable`` with the same predicate as the retry's
+check: the latest status, a user message before it, and the turn shape", Decision 2;
+contract C2 (``retryable = detail.latest_status in chats.RETRYABLE_STATUSES and await
+chats.read_retry_target(pool, tenant, chat_id) is not None``) over C1's R1' (the
+retry-target read with the turn-shape item ``turn_well_formed``).
 
 The app from ``create_app()`` runs against the FakeDb world of tests/tenancy_world.py
 (org A's Editor reads their own chats). The agent is a stub bound to the real
 ``Agent.run`` signature that echoes the history it got plus the user message and a
-final reply (only the agreement test runs it, through the retry route).
+final reply (only the agreement tests run it, through the retry route).
 
 What is pinned:
-- ``retryable`` is ``true`` exactly when the chat's latest message (highest seq, any
-  role) ended as ``error`` or ``stopped``: on the assistant reply, on a ``tool`` row
-  and on the user row itself (a stop before any output). Each message keeps its
-  ``status``, which tells an error from a stop.
+- ``retryable`` is ``true`` when the chat's latest message (highest seq, any role)
+  ended as ``error`` or ``stopped`` in a well-formed turn: on the assistant reply, on
+  a ``tool`` row and on the user row itself (a stop before any output). Each message
+  keeps its ``status``, which tells an error from a stop.
 - ``retryable`` is ``false`` for a latest ``complete``, ``awaiting_confirmation`` (a
   live pending confirmation, and an expired one), ``limit_reached`` message, for an
   empty chat, for a failed answer followed by an org notice (a ``user`` message), and
   for an earlier failed turn followed by a complete one.
+- GH-302: ``retryable`` is ``false`` for every latest status when no user message
+  comes before the latest row (the retry has nothing to re-send).
+- GH-302: for each of contract C1's 22 turn shapes (the shapes validated on
+  postgres:16 against ``delete_failed_turn``), ``retryable`` is the C1 result, and
+  the retry agrees: a chat reported retryable is re-run (200), every other answers
+  the 409 ``not_retryable``. A stopped turn and an approval turn whose tool-call
+  assistant row has no tool_use blocks (NULL or ``[]``) are not retryable; their
+  well-formed twins are.
 - It follows the latest message whatever page is read: a ``cursor`` page that doesn't
   hold the latest message reports the latest one's state, not its own messages'.
-- Reading it adds no statement: the GET still runs exactly the owner check (S2), the
-  page (S9'), the latest status (S15), the turn setup (T1) and the turn read (T2''),
-  for a retryable chat and for one that isn't.
-- It agrees with the retry route's status check: every chat it calls retryable is
-  re-run by ``POST /api/chats/{chat_id}/retry`` (200), every other answers the 409
-  ``not_retryable``.
+- GH-302 (Decision 2; this replaces GH-245's "no new statement"): a chat whose latest
+  status is ``error`` or ``stopped`` runs the owner check (S2), the page (S9', S11' on
+  a cursor page), the latest status (S15), the retry-target read (R1', bound to the
+  chat, the caller's org and the caller), the turn setup (T1) and the turn read (T2'')
+  in that order; every other chat runs exactly today's S2, S9', S15, T1, T2''.
+- Reading changes nothing (no chat, message, file or audit row).
+- Another org's, a colleague's, a trashed and an unknown chat whose latest answer
+  failed: the 404 ``chat_not_found`` after the owner check alone. A chat trashed
+  between the latest-status read and R1' is the 404 from R1', nothing after it.
+- It agrees with the retry route's status check (GH-245): every chat it calls
+  retryable is re-run by ``POST /api/chats/{chat_id}/retry`` (200), every other
+  answers the 409 ``not_retryable``.
 
-``admino.chats.RETRYABLE_STATUSES`` and the retry route don't exist before GH-245;
-nothing new is imported at module level, so the file collects either way.
+Nothing new is imported at module level, so the file collects either way.
 
 Security notes: every id and text here is a fixed fake value. No network, no real
 PostgreSQL, no LLM.
@@ -37,15 +54,18 @@ PostgreSQL, no LLM.
 
 from __future__ import annotations
 
+import copy
 import inspect
 import re
+import uuid
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 
 from admino.agent import Agent
 from admino.models import AgentResult, LLMMessage
-from tests.db_fakes import FakeDb
+from tests.db_fakes import FakeDb, norm
 from tests.tenancy_world import (
     build_world,
     make_app,
@@ -58,7 +78,6 @@ from tests.tenancy_world import (
 )
 
 if TYPE_CHECKING:
-    import uuid
     from collections.abc import Callable
     from unittest.mock import MagicMock
 
@@ -79,6 +98,8 @@ _TOOL_BLOCK: Final[dict[str, Any]] = {
     "input": {"query": "Offerte 245"},
 }
 _NOT_RETRYABLE: Final = {"detail": "The last answer can't be retried.", "reason": "not_retryable"}
+_CHAT_NOT_FOUND: Final = {"detail": "Chat not found", "reason": "chat_not_found"}
+_T0: Final = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
 
 # Statements that aren't the route's work: the session lookup and a settings read.
 _NOT_WORK_SQL: Final = re.compile(r"\b(?:sessions|platform_settings)\b")
@@ -86,8 +107,18 @@ _OWNER_LOOKUP: Final = re.compile(
     r"select .+ from chats where id = \$1 and org_id = \$2 and owner_user_id = \$3"
     r" and deleted_at is null"
 )
-# What GET /api/chats/{chat_id} runs before GH-245 (tests/test_chat_detail_context_api.py).
+# What GET /api/chats/{chat_id} runs for a chat whose latest status isn't error or
+# stopped (unchanged since GH-266; tests/test_chat_detail_context_api.py).
 _TODAYS_DETAIL_WORK: Final = ["owner-lookup", "page", "status", "turn-setup", "turn"]
+# GH-302 (Decision 2, contract C2): a failed latest status adds R1' right after S15.
+_FAILED_DETAIL_WORK: Final = [
+    "owner-lookup",
+    "page",
+    "status",
+    "retry-target",
+    "turn-setup",
+    "turn",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +222,111 @@ _LATEST: Final[dict[str, tuple[str, str]]] = {
     "stopped-on-the-user-row": ("user", "stopped"),
 }
 
+# ---------------------------------------------------------------------------
+# GH-302: contract C1's turn shapes, row by row
+# ---------------------------------------------------------------------------
+
+# One stored row: (role, status, tool_use_blocks); None blocks are SQL NULL.
+_Row = tuple[str, str, list[dict[str, Any]] | None]
+
+_BLOCKS: Final[list[dict[str, Any]]] = [_TOOL_BLOCK]
+_ASK: Final[_Row] = ("user", "complete", None)
+
+
+def _reply(status: str, blocks: list[dict[str, Any]] | None = None) -> _Row:
+    """An assistant row stored ``status`` (a tool call when ``blocks`` is given)."""
+    return ("assistant", status, blocks)
+
+
+def _result(status: str) -> _Row:
+    """A tool row (the result of ``_CALL_ID``) stored ``status``."""
+    return ("tool", status, None)
+
+
+# shape -> (its rows in seq order, retryable): contract C1's 22 shapes
+# (RUN_DIR/pg-probe-r1prime.py SHAPES; PostgreSQL's delete_failed_turn accepts the
+# turn exactly when the shape is retryable).
+_SHAPES: Final[dict[str, tuple[list[_Row], bool]]] = {
+    # Well-formed failed turns: retryable.
+    "error-reply": ([_ASK, _reply("error")], True),
+    "tool-turn-ending-error": (
+        [_ASK, _reply("complete", _BLOCKS), _result("complete"), _reply("error")],
+        True,
+    ),
+    "tool-turn-ending-stopped": (
+        [_ASK, _reply("complete", _BLOCKS), _result("complete"), _reply("stopped")],
+        True,
+    ),
+    "stop-on-the-user-row": ([("user", "stopped", None)], True),
+    "error-on-the-user-row": ([("user", "error", None)], True),
+    "error-on-a-tool-row": ([_ASK, _reply("complete", _BLOCKS), _result("error")], True),
+    "d9-partial": ([_ASK, _reply("error"), _reply("error")], True),
+    "awaiting-with-blocks-then-error": (
+        [_ASK, _reply("awaiting_confirmation", _BLOCKS), _result("complete"), _reply("error")],
+        True,
+    ),
+    "earlier-malformed-turn-then-a-well-formed-failure": (
+        [_ASK, _reply("complete"), _reply("stopped"), _ASK, _reply("error")],
+        True,
+    ),
+    # Failed turns the store can't replace: not retryable.
+    "stopped-turn-tool-call-without-blocks": (
+        [_ASK, _reply("complete"), _result("complete"), _reply("stopped")],
+        False,
+    ),
+    "stopped-turn-tool-call-with-empty-blocks": (
+        [_ASK, _reply("complete", []), _result("complete"), _reply("stopped")],
+        False,
+    ),
+    "approval-turn-without-blocks-ending-error": (
+        [_ASK, _reply("awaiting_confirmation"), _result("complete"), _reply("error")],
+        False,
+    ),
+    "approval-turn-without-blocks-ending-stopped": (
+        [_ASK, _reply("awaiting_confirmation"), _reply("stopped")],
+        False,
+    ),
+    "complete-no-block-reply-before-an-error": (
+        [_ASK, _reply("complete"), _reply("error")],
+        False,
+    ),
+    "limit-reached-mid-turn": ([_ASK, _reply("limit_reached"), _reply("error")], False),
+    "tool-row-error-mid-turn": (
+        [_ASK, _reply("complete", _BLOCKS), _result("error"), _reply("stopped")],
+        False,
+    ),
+    "tool-row-stopped-mid-turn": (
+        [_ASK, _reply("complete", _BLOCKS), _result("stopped"), _reply("stopped")],
+        False,
+    ),
+    # Not retryable for another reason (the shape is fine).
+    "complete-latest": ([_ASK, _reply("complete")], False),
+    "error-then-an-org-notice": ([_ASK, _reply("error"), _ASK], False),
+    "earlier-failure-then-complete": ([_ASK, _reply("error"), _ASK, _reply("complete")], False),
+    "no-user-row": ([_reply("error")], False),
+    "empty-chat": ([], False),
+}
+
+# Statement cases (Decision 2): rows, retryable, the GET's work.
+_STATEMENT_CASES: Final[dict[str, tuple[list[_Row], bool, list[str]]]] = {
+    "error": (_SHAPES["error-reply"][0], True, _FAILED_DETAIL_WORK),
+    "stopped": (_SHAPES["tool-turn-ending-stopped"][0], True, _FAILED_DETAIL_WORK),
+    "stopped-turn-tool-call-without-blocks": (
+        _SHAPES["stopped-turn-tool-call-without-blocks"][0],
+        False,
+        _FAILED_DETAIL_WORK,
+    ),
+    "error-without-a-user-row": (_SHAPES["no-user-row"][0], False, _FAILED_DETAIL_WORK),
+    "complete": (_SHAPES["complete-latest"][0], False, _TODAYS_DETAIL_WORK),
+    "awaiting-confirmation": (
+        [_ASK, _reply("awaiting_confirmation", _BLOCKS)],
+        False,
+        _TODAYS_DETAIL_WORK,
+    ),
+    "limit-reached": ([_ASK, _reply("limit_reached")], False, _TODAYS_DETAIL_WORK),
+    "empty-chat": ([], False, _TODAYS_DETAIL_WORK),
+}
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -239,6 +375,12 @@ def client(world: World, agent: MagicMock) -> TestClient:
     return make_client(make_app(agent))
 
 
+@pytest.fixture()
+def tolerant_client(world: World, agent: MagicMock) -> TestClient:
+    """The same app, answering a server error as its 500 instead of raising it."""
+    return make_client(make_app(agent), raise_server_exceptions=False)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -252,6 +394,31 @@ def _chat_in(world: World, owner: Account, state: str) -> uuid.UUID:
     seeds[state](world.db, chat_id)
     if state == "awaiting-confirmation-pending":
         seed_pending_confirmation(owner, chat_id, "conf-245")
+    return chat_id
+
+
+def _shaped_chat(
+    db: FakeDb, owner: Account, rows: list[_Row], *, deleted_at: datetime | None = None
+) -> uuid.UUID:
+    """A titled chat of ``owner`` holding ``rows`` in seq order; its id."""
+    chat_id = db.add_chat(
+        owner.user_id, title="Retry 302", title_source="user", deleted_at=deleted_at
+    )
+    for role, status, blocks in rows:
+        if role == "user":
+            db.add_chat_message(chat_id, "user", "Offerte 302 bitte", status=status)
+        elif role == "tool":
+            db.add_chat_message(
+                chat_id, "tool", "Two emails found.", tool_call_id=_CALL_ID, status=status
+            )
+        else:
+            db.add_chat_message(
+                chat_id,
+                "assistant",
+                "Ich suche die Offerte 302.",
+                tool_use_blocks=blocks,
+                status=status,
+            )
     return chat_id
 
 
@@ -269,9 +436,13 @@ def _body(response: httpx.Response) -> dict[str, Any]:
 
 def _kind(sql: str) -> str:
     """A detail request's statement: owner-lookup (S2), page (S9' / S11'), status (S15),
-    turn-setup (T1), turn (T2''), else the SQL itself."""
+    retry-target (R1', the read with the turn-shape item), turn-setup (T1), turn
+    (T2''), else the SQL itself."""
     if _OWNER_LOOKUP.fullmatch(sql):
         return "owner-lookup"
+    if "as through_seq" in sql:
+        # R1' (contract C1); GH-245's R1 without the shape item is not it.
+        return "retry-target" if "as turn_well_formed" in sql else sql
     if "from chat_messages m" in sql and "as attachment_ids" in sql:
         return "page"
     if sql.startswith("select status from chat_messages"):
@@ -290,6 +461,24 @@ def _work(db: FakeDb, since: int) -> list[str]:
         for call in db.calls[since:]
         if not _NOT_WORK_SQL.search(call.normalized)
     ]
+
+
+def _retry_target_args(db: FakeDb, since: int) -> list[tuple[Any, ...]]:
+    """The bound parameters of each R1' after call ``since``."""
+    return [call.args for call in db.calls[since:] if _kind(call.normalized) == "retry-target"]
+
+
+def _tables(db: FakeDb) -> dict[str, Any]:
+    """A deep copy of the rows a read must not change."""
+    return copy.deepcopy(
+        {
+            "chats": db.chats,
+            "chat_messages": db.chat_messages,
+            "attachments": db.attachments,
+            "audit": db.audit,
+            "chat_seq": db.chat_seq,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +520,36 @@ class TestChatDetailRetryable:
         body = _body(_detail(client, editor, chat_id))
 
         assert body.get("retryable", "missing") is False
+
+    @pytest.mark.parametrize(
+        ("status", "blocks"),
+        [
+            pytest.param("error", None, id="error"),
+            pytest.param("stopped", None, id="stopped"),
+            pytest.param("complete", None, id="complete"),
+            pytest.param("awaiting_confirmation", _BLOCKS, id="awaiting-confirmation"),
+            pytest.param("limit_reached", None, id="limit-reached"),
+        ],
+    )
+    def test_chat_detail_retryable_is_false_without_a_user_message_before_the_latest_row(
+        self,
+        world: World,
+        client: TestClient,
+        status: str,
+        blocks: list[dict[str, Any]] | None,
+    ) -> None:
+        """GH-302 (the retry's predicate): a chat whose only message is the assistant's,
+        stored with any status, has no user message to re-send, so ``retryable`` is
+        false (a JSON bool), also for a failed one."""
+        editor = world.a["editor"]
+        chat_id = _shaped_chat(world.db, editor, [_reply(status, blocks)])
+
+        body = _body(_detail(client, editor, chat_id))
+
+        assert (body["messages"][-1]["status"], body.get("retryable", "missing")) == (
+            status,
+            False,
+        )
 
     @pytest.mark.parametrize(
         ("latest_status", "earlier_status", "page_size", "retryable"),
@@ -376,41 +595,151 @@ class TestChatDetailRetryable:
 
 
 # ---------------------------------------------------------------------------
-# 2. No new statement (contract C4: the S15 status read already exists)
+# 2. Statements (GH-302 Decision 2: R1' only for a failed latest status)
 # ---------------------------------------------------------------------------
 
 
 class TestChatDetailRetryableStatements:
-    """``retryable`` comes from the latest status the GET already reads."""
+    """A failed latest status adds the retry-target read; nothing else changes."""
 
-    def test_chat_detail_retryable_adds_no_statement(
-        self, world: World, client: TestClient
+    @pytest.mark.parametrize("case", list(_STATEMENT_CASES))
+    def test_chat_detail_retryable_reads_the_retry_target_only_for_a_failed_latest_status(
+        self, world: World, client: TestClient, case: str
     ) -> None:
-        """A retryable chat's GET and a complete chat's GET each run exactly today's
-        S2, S9', S15, T1 and T2'' (no retry-target read, nothing else), and report
-        ``retryable`` true and false."""
+        """GH-302 (replaces GH-245's ``test_chat_detail_retryable_adds_no_statement``):
+        a chat whose latest status is ``error`` or ``stopped`` (well-formed, malformed
+        or without a user row) runs S2, S9', S15, R1' (bound to the chat, org A and the
+        Editor), T1 and T2'' in that order; a complete, awaiting, limit-reached and an
+        empty chat run exactly today's five (no R1'). ``retryable`` is what R1' found."""
         db = world.db
         editor = world.a["editor"]
-        failed = _chat_in(world, editor, "error-on-the-assistant-reply")
-        complete = _chat_in(world, editor, "complete")
-
+        rows, retryable, work = _STATEMENT_CASES[case]
+        chat_id = _shaped_chat(db, editor, rows)
+        expected_args = [(chat_id, world.org_a, editor.user_id)] if "retry-target" in work else []
         since = len(db.calls)
-        failed_body = _body(_detail(client, editor, failed))
-        failed_work = _work(db, since)
-        since = len(db.calls)
-        complete_body = _body(_detail(client, editor, complete))
-        complete_work = _work(db, since)
 
+        body = _body(_detail(client, editor, chat_id))
+
+        assert (body.get("retryable"), _work(db, since), _retry_target_args(db, since)) == (
+            retryable,
+            work,
+            expected_args,
+        )
+
+    def test_chat_detail_retryable_cursor_page_of_a_failed_chat_reads_the_retry_target(
+        self, world: World, client: TestClient
+    ) -> None:
+        """An earlier page (S11') of a chat whose latest answer failed: S2, S11', S15,
+        R1', T1, T2'', and ``retryable`` true though the page holds no failed message."""
+        db = world.db
+        editor = world.a["editor"]
+        chat_id = _shaped_chat(db, editor, [_ASK, _reply("complete"), _ASK, _reply("error")])
+        latest_page = _body(_detail(client, editor, chat_id, limit=2))
+        since = len(db.calls)
+
+        earlier = _body(
+            _detail(client, editor, chat_id, limit=2, cursor=latest_page["next_cursor"])
+        )
+
+        statuses = [message["status"] for message in earlier["messages"]]
         assert (
-            failed_body.get("retryable"),
-            complete_body.get("retryable"),
-            failed_work,
-            complete_work,
-        ) == (True, False, _TODAYS_DETAIL_WORK, _TODAYS_DETAIL_WORK)
+            statuses,
+            earlier.get("retryable"),
+            _work(db, since),
+            _retry_target_args(db, since),
+        ) == (
+            ["complete", "complete"],
+            True,
+            _FAILED_DETAIL_WORK,
+            [(chat_id, world.org_a, editor.user_id)],
+        )
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            "error-reply",
+            "stopped-turn-tool-call-without-blocks",
+            "approval-turn-without-blocks-ending-error",
+        ],
+    )
+    def test_chat_detail_retryable_read_changes_nothing(
+        self, world: World, client: TestClient, shape: str
+    ) -> None:
+        """Reading a failed chat (well-formed or not) stores, changes and deletes no
+        chat, message, file or audit row (the identity sequence doesn't move)."""
+        db = world.db
+        editor = world.a["editor"]
+        chat_id = _shaped_chat(db, editor, _SHAPES[shape][0])
+        before = _tables(db)
+
+        _body(_detail(client, editor, chat_id))
+
+        assert _tables(db) == before
+
+    @pytest.mark.parametrize("case", ["other-org", "colleague", "trashed", "unknown"])
+    def test_chat_detail_retryable_unreachable_failed_chat_is_the_404_after_the_owner_check(
+        self, world: World, client: TestClient, case: str
+    ) -> None:
+        """Another org's, a colleague's, a trashed and an unknown chat whose latest
+        answer failed: the 404 ``chat_not_found`` after the owner check alone (no R1')."""
+        db = world.db
+        editor = world.a["editor"]
+        if case == "unknown":
+            chat_id = uuid.uuid4()
+        else:
+            owner = {
+                "other-org": world.b["editor"],
+                "colleague": world.a["org_admin"],
+                "trashed": editor,
+            }[case]
+            chat_id = _shaped_chat(
+                db,
+                owner,
+                _SHAPES["error-reply"][0],
+                deleted_at=_T0 if case == "trashed" else None,
+            )
+        since = len(db.calls)
+
+        response = _detail(client, editor, chat_id)
+
+        assert (response.status_code, response.json(), _work(db, since)) == (
+            404,
+            _CHAT_NOT_FOUND,
+            ["owner-lookup"],
+        )
+
+    def test_chat_detail_retryable_chat_trashed_before_the_retry_target_read_is_the_404(
+        self, world: World, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The chat is trashed right after the latest-status read (S15): R1' finds no
+        live chat, so the GET answers the 404 ``chat_not_found`` and runs nothing after
+        R1' (contract C2)."""
+        db = world.db
+        editor = world.a["editor"]
+        chat_id = _shaped_chat(db, editor, _SHAPES["error-reply"][0])
+        original = db.handle
+
+        def handle(method: str, sql: str, args: tuple[Any, ...], via: str, tx: int | None) -> Any:
+            result = original(method, sql, args, via, tx)
+            if norm(sql).startswith("select status from chat_messages"):
+                db.chats[chat_id]["deleted_at"] = _T0
+                db.chats[chat_id]["trash_group_id"] = chat_id
+            return result
+
+        monkeypatch.setattr(db, "handle", handle)
+        since = len(db.calls)
+
+        response = _detail(client, editor, chat_id)
+
+        assert (response.status_code, response.json(), _work(db, since)) == (
+            404,
+            _CHAT_NOT_FOUND,
+            ["owner-lookup", "page", "status", "retry-target"],
+        )
 
 
 # ---------------------------------------------------------------------------
-# 3. The signal agrees with the retry route (Decision 6: the 409's rule)
+# 3. The signal agrees with the retry route (GH-245 Decision 6, GH-302 Decision 2)
 # ---------------------------------------------------------------------------
 
 
@@ -435,3 +764,22 @@ class TestChatDetailRetryableAgreesWithRetry:
             **dict.fromkeys(_RETRYABLE, (True, 200, None)),
             **dict.fromkeys(_NOT_RETRYABLE_STATES, (False, 409, _NOT_RETRYABLE)),
         }
+
+    @pytest.mark.parametrize("shape", list(_SHAPES))
+    def test_chat_detail_retryable_agrees_with_the_retry_for_each_turn_shape(
+        self, world: World, tolerant_client: TestClient, shape: str
+    ) -> None:
+        """GH-302 (contract C1's 22 shapes): ``retryable`` is the shape's C1 result, and
+        the retry agrees with it: a chat reported retryable is re-run (200), every other
+        answers the 409 ``not_retryable`` (a malformed failed turn too, instead of
+        running the model and failing at store time)."""
+        rows, retryable = _SHAPES[shape]
+        editor = world.a["editor"]
+        chat_id = _shaped_chat(world.db, editor, rows)
+
+        reported = _body(_detail(tolerant_client, editor, chat_id)).get("retryable", "missing")
+        retried = tolerant_client.post(f"/api/chats/{chat_id}/retry", headers=editor.cookie)
+
+        answer = (retried.status_code, retried.json() if retried.status_code == 409 else None)
+        expected = (200, None) if retryable else (409, _NOT_RETRYABLE)
+        assert (reported, answer) == (retryable, expected)

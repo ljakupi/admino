@@ -10,6 +10,19 @@ runtime DSN (user ``admino_app`` = ``RUNTIME_ROLE``, password PG_APP_PASSWORD) a
 ignores the owner's PG_USER/PG_PASSWORD entirely; ``pending_migration_versions()``
 is the app's read-only "is the schema up to date?" check (the app never migrates).
 
+GH-302 (Decision 3, contract C4): two shipped migration files with one version number
+are refused. ``_migration_files()`` raises ``DuplicateMigrationVersionError`` (a
+RuntimeError subclass) for the LOWEST shared version with exactly
+``Migration version 0031 is used by more than one file: 0031_a.sql, 0031_b.sql.``
+(every file of that version, names sorted, joined by ", "), reads no file content and
+still ignores names that aren't ``NNNN_<name>.sql``; a clean sequence comes back as
+today. ``run_migrations()`` lists the files before its first statement, so a duplicate
+acquires no connection and runs nothing (no CREATE TABLE _migrations, no SELECT, nothing
+applied or recorded), on a fresh database (today: fails midway) and on an upgraded one
+(today: the second file is silently skipped); the clean path runs exactly today's
+statements. ``pending_migration_versions()`` raises it before its SELECT. The shipped
+directory uses each version once.
+
 All asyncpg calls are mocked. No real PostgreSQL connections are made.
 
 Security notes:
@@ -23,9 +36,10 @@ Security notes:
 from __future__ import annotations
 
 import re
+from collections import Counter
 from pathlib import Path
-from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import TYPE_CHECKING, Any
+from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 from urllib.parse import quote, quote_plus, unquote, urlsplit
 
 import asyncpg
@@ -768,6 +782,333 @@ class TestPendingMigrationVersions:
         _answer_applied(mock_pool, versions=_shipped_versions())
 
         assert await db_mod.pending_migration_versions(mock_pool) == []
+
+
+# ---------------------------------------------------------------------------
+# Duplicate migration versions (GH-302, Decision 3, contract C4)
+# ---------------------------------------------------------------------------
+
+_DUPLICATE_0031_MESSAGE = (
+    "Migration version 0031 is used by more than one file: 0031_a.sql, 0031_b.sql."
+)
+# The SQL of every file in the duplicate tests: a statement and a secret-looking
+# literal that the refusal must never read or repeat (it names version and files only).
+_SQL_CANARY = "CREATE TABLE canary_7f3e91 (secret TEXT DEFAULT 'pg-secret-5521');"
+_SQL_CANARY_MARKERS: tuple[str, ...] = ("canary_7f3e91", "pg-secret-5521", "CREATE TABLE")
+# Today's tracking-table statement, normalized (``_normalized``).
+_CREATE_MIGRATIONS_TABLE = (
+    "create table if not exists _migrations ( version integer primary key, "
+    "name text not null, applied_at timestamptz not null default now() )"
+)
+_INSERT_MIGRATION = "insert into _migrations (version, name) values ($1, $2)"
+
+
+def _duplicate_error_type() -> type[RuntimeError]:
+    """``database.DuplicateMigrationVersionError``, looked up when a test runs.
+
+    A module-level reference would turn this whole file into one collection error
+    before GH-302 exists.
+    """
+    error_type: type[RuntimeError] = db_mod.DuplicateMigrationVersionError
+    return error_type
+
+
+def _write_sql(directory: Path, names: list[str], sql: str = _SQL_CANARY) -> None:
+    """Create one file per name in ``directory``, each holding ``sql``."""
+    for name in names:
+        (directory / name).write_text(sql, encoding="utf-8")
+
+
+def _record_statements(pool: MagicMock, *, applied: list[int]) -> list[tuple[Any, ...]]:
+    """Record every statement on ``pool`` and its connection, in order.
+
+    Entries are ``(method, normalized SQL, *bound args)``, plus ``("begin",)`` and
+    ``("end",)`` around each transaction. ``SELECT version FROM _migrations`` (through the
+    pool or the connection) answers the ``applied`` versions.
+    """
+    statements: list[tuple[Any, ...]] = []
+    rows = [{"version": version} for version in applied]
+
+    def _recorder(method: str) -> Any:
+        def _record(sql: object = "", *args: object, **_kwargs: object) -> Any:
+            statements.append((method, _normalized(str(sql)), *args))
+            return DEFAULT
+
+        return _record
+
+    for target in (pool, pool._mock_conn):
+        for method in _POOL_QUERY_METHODS:
+            getattr(target, method).side_effect = _recorder(method)
+        target.fetch.return_value = rows
+
+    def _marker(name: str) -> Any:
+        def _mark(*_args: object, **_kwargs: object) -> Any:
+            statements.append((name,))
+            return DEFAULT
+
+        return _mark
+
+    transaction = pool._mock_conn.transaction.return_value
+    transaction.__aenter__.side_effect = _marker("begin")
+    transaction.__aexit__.side_effect = _marker("end")
+    return statements
+
+
+class TestDuplicateMigrationVersions:
+    """Two migration files with one version number are refused (GH-302, Decision 3).
+
+    Today ``_migration_files()`` returns both: a fresh database fails midway with a
+    UniqueViolationError on the second ``INSERT INTO _migrations``, an upgraded one
+    silently skips the second file. The refusal happens before anything touches the
+    database and names the version and the file names, never their contents.
+    """
+
+    def test_database_duplicate_migration_version_error_is_a_runtime_error_subclass(
+        self,
+    ) -> None:
+        """DuplicateMigrationVersionError is its own RuntimeError subclass (main()'s and
+        the migrate step's RuntimeError handling covers it)."""
+        error_type = _duplicate_error_type()
+
+        assert issubclass(error_type, RuntimeError)
+        assert error_type is not RuntimeError
+
+    def test_database_migration_files_two_files_of_one_version_raise_naming_both(
+        self, tmp_path: Path
+    ) -> None:
+        """0031_b.sql and 0031_a.sql among clean neighbours → the exact message, names
+        sorted, the version zero-padded, file names only (no directory)."""
+        _write_sql(tmp_path, ["0030_x.sql", "0031_b.sql", "0031_a.sql", "0032_y.sql"])
+        error_type = _duplicate_error_type()
+
+        with (
+            pytest.raises(error_type) as exc_info,
+            patch.object(db_mod, "_MIGRATIONS_DIR", tmp_path),
+        ):
+            db_mod._migration_files()
+
+        assert type(exc_info.value) is error_type
+        assert str(exc_info.value) == _DUPLICATE_0031_MESSAGE
+
+    def test_database_migration_files_three_files_of_one_version_name_all_three(
+        self, tmp_path: Path
+    ) -> None:
+        """Three files of version 7 → all three named, sorted (not just the first two)."""
+        _write_sql(tmp_path, ["0007_c.sql", "0007_a.sql", "0008_d.sql", "0007_b.sql"])
+
+        with (
+            pytest.raises(_duplicate_error_type()) as exc_info,
+            patch.object(db_mod, "_MIGRATIONS_DIR", tmp_path),
+        ):
+            db_mod._migration_files()
+
+        assert str(exc_info.value) == (
+            "Migration version 0007 is used by more than one file: "
+            "0007_a.sql, 0007_b.sql, 0007_c.sql."
+        )
+
+    def test_database_migration_files_two_duplicated_versions_report_the_lowest(
+        self, tmp_path: Path
+    ) -> None:
+        """Versions 12 (two files) and 40 (three files) both shared → only 0012 is reported,
+        with its own files."""
+        _write_sql(
+            tmp_path,
+            ["0040_c.sql", "0012_n.sql", "0040_a.sql", "0012_m.sql", "0040_b.sql", "0001_a.sql"],
+        )
+
+        with (
+            pytest.raises(_duplicate_error_type()) as exc_info,
+            patch.object(db_mod, "_MIGRATIONS_DIR", tmp_path),
+        ):
+            db_mod._migration_files()
+
+        assert str(exc_info.value) == (
+            "Migration version 0012 is used by more than one file: 0012_m.sql, 0012_n.sql."
+        )
+
+    def test_database_migration_files_duplicate_reads_and_repeats_no_file_content(
+        self, tmp_path: Path
+    ) -> None:
+        """The refusal reads no file (no read_text/read_bytes/open) and its message, repr
+        and args carry nothing of the files' SQL."""
+        _write_sql(tmp_path, ["0031_a.sql", "0031_b.sql"])
+        error_type = _duplicate_error_type()
+        reads = MagicMock(side_effect=AssertionError("a migration file was read"))
+
+        with pytest.raises(error_type) as exc_info:  # noqa: SIM117 - exits after the patches
+            with (
+                patch.object(db_mod, "_MIGRATIONS_DIR", tmp_path),
+                patch.object(Path, "read_text", reads),
+                patch.object(Path, "read_bytes", reads),
+                patch.object(Path, "open", reads),
+                patch("builtins.open", reads),
+            ):
+                db_mod._migration_files()
+
+        reads.assert_not_called()
+        rendered = " ".join((str(exc_info.value), repr(exc_info.value), repr(exc_info.value.args)))
+        assert str(exc_info.value) == _DUPLICATE_0031_MESSAGE
+        for marker in _SQL_CANARY_MARKERS:
+            assert marker not in rendered
+
+    def test_database_migration_files_non_matching_names_are_not_named_in_the_refusal(
+        self, tmp_path: Path
+    ) -> None:
+        """Names that aren't NNNN_<name>.sql but look like version 31 don't join the
+        duplicate: only 0031_a.sql and 0031_b.sql are named."""
+        _write_sql(
+            tmp_path,
+            [
+                "0031_a.sql",
+                "0031_b.sql",
+                "31_x.sql",
+                "0031_x.txt",
+                "0031_x.sql.bak",
+                "0031.sql",
+                "0031_.sql",
+                "00031_x.sql",
+                "README",
+            ],
+        )
+
+        with (
+            pytest.raises(_duplicate_error_type()) as exc_info,
+            patch.object(db_mod, "_MIGRATIONS_DIR", tmp_path),
+        ):
+            db_mod._migration_files()
+
+        assert str(exc_info.value) == _DUPLICATE_0031_MESSAGE
+
+    def test_database_migration_files_non_matching_names_never_count_as_duplicates(
+        self, tmp_path: Path
+    ) -> None:
+        """Guard: one 0031_a.sql next to 31_x.sql, 0031_x.txt, README and the like → no
+        refusal, only 0031_a.sql listed (non-matching names are ignored as today)."""
+        _write_sql(
+            tmp_path,
+            [
+                "0031_a.sql",
+                "31_x.sql",
+                "0031_x.txt",
+                "0031_x.sql.bak",
+                "0031.sql",
+                "0031_.sql",
+                "00031_x.sql",
+                "README",
+            ],
+        )
+
+        with patch.object(db_mod, "_MIGRATIONS_DIR", tmp_path):
+            files = db_mod._migration_files()
+
+        assert files == [(31, tmp_path / "0031_a.sql")]
+
+    def test_database_migration_files_clean_sequence_returns_sorted_versions_and_paths(
+        self, tmp_path: Path
+    ) -> None:
+        """Guard: a clean sequence → (version, path) pairs sorted by version, as today."""
+        _write_sql(tmp_path, ["0010_d.sql", "0002_b.sql", "0001_a.sql", "0003_c.sql"])
+
+        with patch.object(db_mod, "_MIGRATIONS_DIR", tmp_path):
+            files = db_mod._migration_files()
+
+        assert files == [
+            (1, tmp_path / "0001_a.sql"),
+            (2, tmp_path / "0002_b.sql"),
+            (3, tmp_path / "0003_c.sql"),
+            (10, tmp_path / "0010_d.sql"),
+        ]
+
+    def test_database_shipped_migrations_use_each_version_once(self) -> None:
+        """Guard: the shipped migrations directory has no duplicate version (counted here
+        independently), so _migration_files() lists every shipped version once."""
+        counts = Counter(
+            int(match.group(1))
+            for path in db_mod._MIGRATIONS_DIR.iterdir()
+            if (match := _SHIPPED_FILE_RE.match(path.name))
+        )
+
+        assert counts
+        assert [version for version, count in counts.items() if count > 1] == []
+        assert [version for version, _ in db_mod._migration_files()] == sorted(counts)
+
+    @pytest.mark.parametrize(
+        "applied",
+        [
+            pytest.param([], id="fresh-database"),
+            pytest.param([1, 31], id="upgraded-database"),
+        ],
+    )
+    async def test_database_run_migrations_duplicate_version_raises_before_any_statement(
+        self, mock_pool: MagicMock, tmp_path: Path, applied: list[int]
+    ) -> None:
+        """Two 0031 files → the refusal (exact message) before anything: no connection
+        acquired, no CREATE TABLE _migrations, no SELECT, nothing applied or recorded.
+
+        Fresh database: today 0001 and 0031_a are applied, then the second 0031's INSERT
+        fails midway. Upgraded (1 and 31 recorded): today 0031_b is silently skipped.
+        """
+        _write_sql(tmp_path, ["0001_a.sql", "0031_a.sql", "0031_b.sql", "0032_c.sql"])
+        statements = _record_statements(mock_pool, applied=applied)
+
+        with (
+            pytest.raises(_duplicate_error_type()) as exc_info,
+            patch.object(db_mod, "_MIGRATIONS_DIR", tmp_path),
+        ):
+            await db_mod.run_migrations(mock_pool)
+
+        assert str(exc_info.value) == _DUPLICATE_0031_MESSAGE
+        assert statements == []
+        mock_pool.acquire.assert_not_called()
+        mock_pool._mock_conn.transaction.assert_not_called()
+
+    async def test_database_run_migrations_clean_sequence_runs_todays_statements(
+        self, mock_pool: MagicMock, tmp_path: Path
+    ) -> None:
+        """Guard: without a duplicate, exactly today's statements in today's order.
+
+        CREATE TABLE IF NOT EXISTS _migrations, the SELECT of the applied versions, then
+        per pending file (0002 and 0010; 0001 is applied) one transaction holding its SQL
+        and its INSERT into _migrations.
+        """
+        (tmp_path / "0001_a.sql").write_text("CREATE TABLE a (id INT);", encoding="utf-8")
+        (tmp_path / "0002_b.sql").write_text("CREATE TABLE b (id INT);", encoding="utf-8")
+        (tmp_path / "0010_c.sql").write_text("CREATE TABLE c (id INT);", encoding="utf-8")
+        statements = _record_statements(mock_pool, applied=[1])
+
+        with patch.object(db_mod, "_MIGRATIONS_DIR", tmp_path):
+            await db_mod.run_migrations(mock_pool)
+
+        assert statements == [
+            ("execute", _CREATE_MIGRATIONS_TABLE),
+            ("fetch", "select version from _migrations"),
+            ("begin",),
+            ("execute", "create table b (id int)"),
+            ("execute", _INSERT_MIGRATION, 2, "0002_b.sql"),
+            ("end",),
+            ("begin",),
+            ("execute", "create table c (id int)"),
+            ("execute", _INSERT_MIGRATION, 10, "0010_c.sql"),
+            ("end",),
+        ]
+
+    async def test_database_pending_migration_versions_duplicate_version_raises_before_its_select(
+        self, mock_pool: MagicMock, tmp_path: Path
+    ) -> None:
+        """The app's startup check refuses the same way: the exact message, and no query
+        at all (the SELECT never runs)."""
+        _write_sql(tmp_path, ["0001_a.sql", "0031_a.sql", "0031_b.sql"])
+        _answer_applied(mock_pool, versions=[1])
+
+        with (
+            pytest.raises(_duplicate_error_type()) as exc_info,
+            patch.object(db_mod, "_MIGRATIONS_DIR", tmp_path),
+        ):
+            await db_mod.pending_migration_versions(mock_pool)
+
+        assert str(exc_info.value) == _DUPLICATE_0031_MESSAGE
+        assert _query_calls(mock_pool) == []
 
 
 # ---------------------------------------------------------------------------

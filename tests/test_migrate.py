@@ -29,6 +29,15 @@ What is pinned (contract section 2):
   formatters (text by default, JSON with LOG_FORMAT=json, LOG_LEVEL honoured).
 - Source: the ``python -m`` entry point; no eval/exec/compile/importlib/subprocess/shell;
   no SQL built in Python (f-string, %-format, ``.format()``, concatenation).
+- GH-302 (Decision 3, contract C4): two migration files with one version number. The
+  real ``migrate()`` and ``database.run_migrations()`` run over a migrations directory
+  holding ``0031_a.sql`` and ``0031_b.sql`` (only the pool is mocked): ``main()`` returns
+  1, logs exactly ``Migration version 0031 is used by more than one file: 0031_a.sql,
+  0031_b.sql.`` once, at ERROR, without a traceback, and not the generic connection
+  hint (``_MIGRATE_FAILED``); no statement reaches the pool (nothing applied, no runtime
+  password set), the pool is closed, and no log record carries a password, the DSN, a
+  verifier or the files' SQL. These tests patch ``_configure_logging`` out so pytest's
+  caplog handler stays on the root logger.
 
 All asyncpg access is mocked; no real PostgreSQL is needed. An autouse guard replaces
 ``asyncpg.create_pool`` and ``asyncpg.connect`` so an accidental real connection fails
@@ -52,6 +61,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import logging
 import re
 import runpy
 import warnings
@@ -1121,6 +1131,167 @@ class TestMainRunsMigrate:
         assert deps.events == ["init_pool", "run_migrations", "fetchval", "execute", "close_pool"]
         assert _bound(_INIT_POOL_SIGNATURE, deps.init_pool.await_args)[0] == (_expected_owner_dsn())
         _assert_no_secrets(captured.out + captured.err, _OWNER_PASSWORD, _APP_PASSWORD)
+
+
+# ---------------------------------------------------------------------------
+# main() with two migration files of one version (GH-302, Decision 3)
+# ---------------------------------------------------------------------------
+
+_DUPLICATE_MESSAGE: Final = (
+    "Migration version 0031 is used by more than one file: 0031_a.sql, 0031_b.sql."
+)
+# Every migration file's SQL in these tests: none of it may reach a log record.
+_MIGRATION_SQL: Final = "CREATE TABLE canary_mig_3c8d (pw TEXT DEFAULT 'sql-secret-6610');"
+_MIGRATION_SQL_MARKERS: Final[tuple[str, ...]] = (
+    "canary_mig_3c8d",
+    "sql-secret-6610",
+    "CREATE TABLE",
+)
+# The LogRecord attributes logging sets itself; anything else came in through extra=.
+_STANDARD_RECORD_ATTRS: Final = frozenset(
+    vars(logging.LogRecord("", logging.INFO, "", 0, "", (), None))
+) | {"message", "asctime"}
+
+
+@dataclass
+class _DuplicateRun:
+    """What one main() run over a duplicate migration version returned and logged."""
+
+    code: int
+    records: list[logging.LogRecord]
+    pool: MagicMock
+    init_pool: AsyncMock
+    close_pool: AsyncMock
+
+
+@pytest.fixture()
+def run_main_with_duplicate(
+    main_env: pytest.MonkeyPatch,
+    mock_pool: MagicMock,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    connection_guards: dict[str, AsyncMock],
+) -> Callable[[], _DuplicateRun]:
+    """Run ``migrate_mod.main()`` for real over ``0001_a.sql``, ``0031_a.sql``, ``0031_b.sql``.
+
+    The real migrate() and database.run_migrations() run; only the pool is mocked
+    (``init_pool`` returns ``mock_pool``, ``close_pool`` is recorded) and
+    ``_MIGRATIONS_DIR`` points at ``tmp_path``. ``_configure_logging`` is patched out so
+    caplog's handler stays on the root logger; every record at DEBUG is returned.
+    """
+    for name in ("0001_a.sql", "0031_a.sql", "0031_b.sql"):
+        (tmp_path / name).write_text(_MIGRATION_SQL, encoding="utf-8")
+
+    def _run() -> _DuplicateRun:
+        init_pool = AsyncMock(return_value=mock_pool)
+        close_pool = AsyncMock()
+        caplog.clear()
+        with (
+            restored_logging(),
+            caplog.at_level(logging.DEBUG),
+            patch.object(migrate_mod, "_configure_logging", MagicMock()),
+            patch.object(db_mod, "_MIGRATIONS_DIR", tmp_path),
+            patch.object(db_mod, "init_pool", init_pool),
+            patch.object(db_mod, "close_pool", close_pool),
+        ):
+            code = migrate_mod.main()
+        assert connection_guards["create_pool"].await_count == 0
+        assert connection_guards["connect"].await_count == 0
+        return _DuplicateRun(
+            code=code,
+            records=list(caplog.records),
+            pool=mock_pool,
+            init_pool=init_pool,
+            close_pool=close_pool,
+        )
+
+    return _run
+
+
+def _record_texts(record: logging.LogRecord) -> list[str]:
+    """Every text a record carries: message, format string, args, exception and stack
+    text, and each attribute added through ``extra=``."""
+    texts = [record.getMessage(), str(record.msg), repr(record.args)]
+    texts.extend(str(value) for value in (record.exc_text, record.stack_info) if value)
+    texts.extend(
+        repr(value) for key, value in vars(record).items() if key not in _STANDARD_RECORD_ATTRS
+    )
+    return texts
+
+
+class TestMainDuplicateMigrationVersion:
+    """main() over two migration files with one version number (GH-302, Decision 3).
+
+    The migrate step stops before anything is applied and says which version and files
+    collide: its own fixed message (version and file names only), not the generic
+    "check PG_USER, PG_PASSWORD, ..." hint, which would send an operator looking at the
+    connection settings. Today the mocked run "succeeds" (exit 0): both files run.
+    """
+
+    def test_migrate_main_duplicate_migration_version_returns_1(
+        self, run_main_with_duplicate: Callable[[], _DuplicateRun]
+    ) -> None:
+        """Exit code 1."""
+        run = run_main_with_duplicate()
+
+        assert run.code == 1
+
+    def test_migrate_main_duplicate_migration_version_logs_its_message_once_at_error(
+        self, run_main_with_duplicate: Callable[[], _DuplicateRun]
+    ) -> None:
+        """Exactly one ERROR-or-worse record: admino.migrate's, whose text is the error's
+        message, with no traceback or stack; the message appears in no other record."""
+        run = run_main_with_duplicate()
+
+        errors = [record for record in run.records if record.levelno >= logging.ERROR]
+        assert [(r.name, r.levelno, r.getMessage()) for r in errors] == [
+            ("admino.migrate", logging.ERROR, _DUPLICATE_MESSAGE)
+        ]
+        assert errors[0].exc_info is None
+        assert errors[0].stack_info is None
+        assert sum(_DUPLICATE_MESSAGE in r.getMessage() for r in run.records) == 1
+
+    def test_migrate_main_duplicate_migration_version_logs_no_connection_hint(
+        self, run_main_with_duplicate: Callable[[], _DuplicateRun]
+    ) -> None:
+        """The run fails (exit 1) and no record is the generic ``_MIGRATE_FAILED`` hint
+        (by format string or by its text)."""
+        run = run_main_with_duplicate()
+
+        assert run.code == 1
+        assert [r for r in run.records if r.msg == migrate_mod._MIGRATE_FAILED] == []
+        assert [r for r in run.records if "Migration failed" in r.getMessage()] == []
+        assert [r for r in run.records if "PostgreSQL is reachable" in r.getMessage()] == []
+
+    def test_migrate_main_duplicate_migration_version_applies_nothing_and_sets_no_password(
+        self, run_main_with_duplicate: Callable[[], _DuplicateRun]
+    ) -> None:
+        """No connection is acquired and no statement reaches the pool (no migration, no
+        _migrations row, no ALTER ROLE); the pool is still closed once."""
+        run = run_main_with_duplicate()
+
+        assert run.code == 1
+        run.pool.acquire.assert_not_called()
+        for target in (run.pool, run.pool._mock_conn):
+            for method in ("execute", "fetch", "fetchrow", "fetchval"):
+                getattr(target, method).assert_not_awaited()
+        run.close_pool.assert_awaited_once()
+
+    def test_migrate_main_duplicate_migration_version_logs_no_secret_dsn_or_sql(
+        self, run_main_with_duplicate: Callable[[], _DuplicateRun]
+    ) -> None:
+        """At DEBUG, no record (message, args, exception or stack text, extra fields)
+        carries either password (raw or percent-encoded), a DSN, a verifier, a traceback
+        or the migration files' SQL; no record has exc_info."""
+        run = run_main_with_duplicate()
+
+        assert run.code == 1
+        assert run.records
+        assert [r for r in run.records if r.exc_info is not None] == []
+        text = "\n".join(text for record in run.records for text in _record_texts(record))
+        _assert_no_secrets(text, _OWNER_PASSWORD, _APP_PASSWORD)
+        for marker in _MIGRATION_SQL_MARKERS:
+            assert marker not in text
 
 
 # ---------------------------------------------------------------------------

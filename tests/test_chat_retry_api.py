@@ -50,6 +50,17 @@ What is pinned:
   with sends, both ways; another user's bucket is untouched.
 - Logs: one ``Retrying the last message of chat <id>`` line; no message text,
   tool result, reply or file name in any app record.
+- GH-302 (Decision 1, contract C1 and C3): a failed turn the store can't replace
+  (a stopped turn, or an approval turn ending ``error``, whose tool-call message was
+  stored without tool_use blocks because the provider sent no call ids) answers
+  exactly the 409 ``not_retryable`` before the run: no agent run (so no LLM or tool
+  call), the chat row, every message (ids included) and the files' rows with their
+  message links as they were, the chat's pending confirmation kept, no audit row. The
+  refusal is R1''s (``chats.read_retry_target``) under the chat's hold: the owner
+  check (T1) is the last statement before ``hold()``, R1' the only one after it (no
+  history read, no file, no store). No app record carries the turn's texts or file
+  name. Their well-formed twins (the same turns with tool_use blocks) are still
+  retried: 200, the failed turn replaced.
 
 New names (the route) are reached through HTTP only, so the file collects
 before GH-245 is implemented.
@@ -100,6 +111,8 @@ from tests.tenancy_world import (
     use_fast_passwords,
     use_roomy_rate_limits,
 )
+from tests.test_chats_retry import R1 as R1_PRIME
+from tests.test_chats_retry import _canon
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -1485,3 +1498,210 @@ def test_chat_retry_logs_the_chat_id_and_no_content(
     assert len(retrying) == 1
     text = "\n".join(_record_text(record) for record in records)
     assert set(re.findall(r"retry-canary-245-[a-z.-]+", text)) == set()
+
+
+# ---------------------------------------------------------------------------
+# 10. A failed turn the store can't replace: the 409 before the run (GH-302 Decision 1)
+# ---------------------------------------------------------------------------
+
+_NO_ID_RESULT: Final = LLMMessage(role="tool", content=_TOOL_RESULT)
+_PARTIAL_REPLY: Final = "Here is the beginn"
+
+# Each failed turn's rows with their stored status. Without call ids the tool-call
+# message is stored with no tool_use blocks (and its result without a call id):
+# migration 0031's shape check refuses such a stopped or approval turn.
+_NO_IDS_TURNS: Final[dict[str, tuple[tuple[LLMMessage, str], ...]]] = {
+    "stopped_without_call_ids": (
+        (_user(_MESSAGE), "complete"),
+        (_assistant(""), "complete"),
+        (_NO_ID_RESULT, "complete"),
+        (_assistant(_PARTIAL_REPLY), "stopped"),
+    ),
+    "approval_without_call_ids": (
+        (_user(_MESSAGE), "complete"),
+        (_assistant(""), "awaiting_confirmation"),
+        (_NO_ID_RESULT, "complete"),
+        (_assistant(_FAILED_REPLY), "error"),
+    ),
+}
+# Their well-formed twins: the same turns with the call ids (tool_use blocks stored).
+_WITH_IDS_TURNS: Final[dict[str, tuple[tuple[LLMMessage, str], ...]]] = {
+    "stopped_with_call_ids": (
+        (_user(_MESSAGE), "complete"),
+        (_tool_use(_RECALL), "complete"),
+        (_tool(_TOOL_RESULT, _RECALL), "complete"),
+        (_assistant(_PARTIAL_REPLY), "stopped"),
+    ),
+    "approval_with_call_ids": (
+        (_user(_MESSAGE), "complete"),
+        (_tool_use(_PENDING_CALL), "awaiting_confirmation"),
+        (_tool(_TOOL_RESULT, _PENDING_CALL), "complete"),
+        (_assistant(_FAILED_REPLY), "error"),
+    ),
+}
+
+# The statements that locate the refusal: the owner check (turn_setup's T1) and R1'.
+_R1_PRIME_FORM: Final = _canon(R1_PRIME)
+
+
+def _form(sql: str) -> str:
+    """A statement's form: T1, R1' (contract C1's exact text), else its own SQL."""
+    normalized = _canon(sql)
+    if normalized == _R1_PRIME_FORM:
+        return "R1'"
+    if "from organizations o" in normalized and "left join chats c" in normalized:
+        return "T1"
+    return sql
+
+
+def _turn_chat(
+    world: World, turn: tuple[tuple[LLMMessage, str], ...], *, file_name: str = "turn-302.pdf"
+) -> _Failed:
+    """The Editor's chat (last active long ago): ``_EARLIER``, then ``turn`` row by row
+    with its statuses, and an excluded file sent with the turn's user message."""
+    db = world.db
+    chat_id = db.add_chat(world.a["editor"].user_id, last_activity_at=_LONG_AGO)
+    earlier_ids = _seed(db, chat_id, *_EARLIER)
+    failed_ids = [
+        plain(
+            db.add_chat_message(
+                chat_id,
+                message.role,
+                message.content,
+                tool_use_blocks=message.tool_use_blocks,
+                tool_call_id=message.tool_call_id,
+                status=status,
+            )
+        )
+        for message, status in turn
+    ]
+    db.add_attachment(
+        chat_id,
+        filename=file_name,
+        kind="pdf",
+        status="ready",
+        page_count=1,
+        token_estimate=10,
+        derived_bytes=10,
+        message_id=failed_ids[0],
+        active=False,
+    )
+    return _Failed(chat_id, earlier_ids, failed_ids)
+
+
+def _marked_runtime(monkeypatch: pytest.MonkeyPatch, db: FakeDb) -> list[int]:
+    """Swap in a real ``ChatRuntime`` that records how many statements ran when each
+    ``hold()`` is taken; return that list."""
+    from admino.chat_runtime import ChatRuntime
+
+    marks: list[int] = []
+
+    class _Marked(ChatRuntime):
+        def __init__(self) -> None:
+            super().__init__(max_entries=64, idle_s=900.0)
+
+        def hold(self, chat_id: uuid.UUID, owner_user_id: uuid.UUID, **kwargs: Any) -> Any:
+            marks.append(len(db.calls))
+            return super().hold(chat_id, owner_user_id, **kwargs)
+
+    monkeypatch.setattr(server, "_chat_runtime", _Marked())
+    return marks
+
+
+@pytest.mark.parametrize("shape", list(_NO_IDS_TURNS))
+def test_chat_retry_failed_turn_the_store_cannot_replace_gets_409_before_the_run(
+    world: World, client: TestClient, agent: MagicMock, shape: str
+) -> None:
+    """The exact 409 ``not_retryable``; no run (no LLM call, no tool call); the chat row,
+    every message (ids included), the file row and its link to the user message as they
+    were; the chat's pending confirmation kept; no audit row."""
+    editor = world.a["editor"]
+    db = world.db
+    failed = _turn_chat(world, _NO_IDS_TURNS[shape])
+    seed_pending_confirmation(editor, failed.chat_id, _SEEDED_CONFIRMATION)
+    before = _snapshot(db, failed.chat_id)
+    pending = _pending(db)
+    audit = db.audit_rows()
+
+    response = _retry(client, editor, failed.chat_id)
+
+    assert (response.status_code, response.json()) == (409, _NOT_RETRYABLE)
+    assert agent.run.await_count == 0
+    assert _snapshot(db, failed.chat_id) == before
+    assert _pending(db) == pending
+    assert pending[str(failed.chat_id)] is not None
+    assert db.audit_rows() == audit
+
+
+@pytest.mark.parametrize("shape", list(_NO_IDS_TURNS))
+def test_chat_retry_failed_turn_the_store_cannot_replace_is_refused_by_r1_prime_under_the_hold(
+    world: World, client: TestClient, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """Contract C3: the 409 is ``read_retry_target``'s None under the chat's hold. The
+    owner check (T1) is the last statement before ``hold()``; after it the request runs
+    R1' (contract C1's exact text) and nothing else: no history read, no file, no store."""
+    editor = world.a["editor"]
+    db = world.db
+    failed = _turn_chat(world, _NO_IDS_TURNS[shape])
+    marks = _marked_runtime(monkeypatch, db)
+    since = len(db.calls)
+
+    response = _retry(client, editor, failed.chat_id)
+
+    assert response.status_code == 409, response.text
+    (held_at,) = marks
+    before_hold = [_form(call.sql) for call in db.calls[since:held_at]]
+    under_hold = [_form(call.sql) for call in db.calls[held_at:]]
+    assert (before_hold[-1:], under_hold) == (["T1"], ["R1'"])
+
+
+def test_chat_retry_failed_turn_the_store_cannot_replace_logs_no_content(
+    world: World, client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A log line about the refusal, if any, carries no message text, tool result,
+    reply or file name of the chat (any app record, DEBUG)."""
+    caplog.set_level(logging.DEBUG)
+    turn = (
+        (_user("retry-canary-302-message"), "complete"),
+        (_assistant("retry-canary-302-call"), "complete"),
+        (LLMMessage(role="tool", content="retry-canary-302-result"), "complete"),
+        (_assistant("retry-canary-302-partial"), "stopped"),
+    )
+    failed = _turn_chat(world, turn, file_name="retry-canary-302-file.pdf")
+
+    response = _retry(client, world.a["editor"], failed.chat_id)
+
+    assert (response.status_code, response.json()) == (409, _NOT_RETRYABLE)
+    records = [
+        record
+        for record in caplog.records
+        if not record.name.startswith(("httpx", "httpcore", "asyncio"))
+    ]
+    text = "\n".join(_record_text(record) for record in records)
+    assert set(re.findall(r"retry-canary-302-[a-z.-]+", text)) == set()
+
+
+@pytest.mark.parametrize("shape", list(_WITH_IDS_TURNS))
+def test_chat_retry_well_formed_twin_with_tool_use_blocks_is_still_retried(
+    world: World, client: TestClient, script: _Script, shape: str
+) -> None:
+    """The shape check refuses only what the store refuses: the same turn with its
+    tool_use blocks runs (the failed turn's user message, the history before it) and is
+    replaced: the earlier rows (same ids), the user message again, the run's reply."""
+    editor = world.a["editor"]
+    db = world.db
+    failed = _turn_chat(world, _WITH_IDS_TURNS[shape])
+
+    response = _retry(client, editor, failed.chat_id)
+
+    assert response.status_code == 200, response.text
+    (run,) = script.runs
+    assert (run.user_message, _dump(run.history)) == (_MESSAGE, _dump(_EARLIER))
+    assert _stored(db, failed.chat_id) == [
+        *map(_row, _EARLIER),
+        _row(_user(_MESSAGE)),
+        _row(_assistant(_STUB_REPLY)),
+    ]
+    ids = _ids(db, failed.chat_id)
+    assert ids[:2] == failed.earlier_ids
+    assert set(ids).isdisjoint(failed.failed_ids)

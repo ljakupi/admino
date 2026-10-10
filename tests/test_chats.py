@@ -69,9 +69,13 @@ What these tests pin down (contract §2; GH-266 contract §2):
   nothing changes; trashing twice is ``ChatNotFoundError``; a trashed chat is
   invisible to get, list and the message reads.
 - ``append_messages``: one transaction, the chat UPDATE first then one INSERT
-  per message in order (seq order = list order); only the last message gets
-  ``final_status`` and the dumped tool calls (empty or None: NULL), the others
-  ``complete`` / NULL; ``tool_use_blocks`` and ``tool_call_id`` round-trip;
+  per message in order (seq order = list order); the last message gets
+  ``final_status`` and the dumped tool calls (empty or None: NULL); with
+  ``final_status`` ``error`` (GH-245 C1'b) every earlier assistant message
+  without tool_use blocks is stored ``error`` too (pinned in
+  tests/test_chats_retry.py); every other message is ``complete`` and every
+  message but the last has NULL tool calls; ``tool_use_blocks`` and
+  ``tool_call_id`` round-trip;
   ``last_activity_at`` bumped; ``external_content`` set (sticky) only by a
   ``tool`` message holding ``untrusted.wrap(...)`` output, never by a user or
   assistant message with a marker-looking text; U+0000 removed from content and
