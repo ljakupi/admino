@@ -25,9 +25,16 @@ What is pinned:
   versions 1 to 33; run_migrations applies and records it after 0033 (GH-307's
   account preferences), and not again once applied. It opens with a header comment
   naming the retired Viewer role, the two
-  system-actor events (``user.deactivate``, ``invitation.revoke``) and
-  ``users_role_check``.
-- Its statements, in this order (Decision 1):
+  system-actor events (``user.deactivate``, ``invitation.revoke``),
+  ``users_role_check`` and the EXCLUSIVE lock it takes first (Decision 12).
+- Its statements, in this order (Decisions 1 and 12):
+  0. ``LOCK TABLE users, invitations, sessions IN EXCLUSIVE MODE``, before every other
+     statement (Decision 12): the old agent keeps serving while the one-shot migrate
+     step runs, and an invitation accepted, a login or a session written between two of
+     the statements below would leave a wrong audit row or a live Viewer session. The
+     three tables in that order, that mode exactly (reads go on, writes wait for the
+     commit; not the default ACCESS EXCLUSIVE, no weaker mode), no NOWAIT (the step
+     waits for the lock rather than failing the upgrade);
   1. ``INSERT INTO audit_events (org_id, actor_kind, action, target_type, target_ids,
      metadata) SELECT u.org_id, 'system', 'invitation.revoke', 'invitation',
      jsonb_build_array(i.id), jsonb_build_object('user_id', u.id, 'reason',
@@ -62,7 +69,9 @@ What is pinned:
 - The new CHECK's IN-list equals ``typing.get_args(admino.access.MemberRole)``.
 - Nothing else: no other statement, no DO block, function, trigger, role, GRANT,
   REVOKE, CREATE, DROP TABLE / INDEX / COLUMN, TRUNCATE, COPY, MERGE, SET, NOT VALID,
-  owner change or email (Decision 4), also not nested in a body or an EXECUTE literal;
+  owner change or email (Decision 4), and no locking but the one LOCK TABLE (no other
+  LOCK, row lock, NOWAIT, SKIP LOCKED or advisory lock), also not nested in a body or
+  an EXECUTE literal;
   every table and function privilege after 0034 is what it was after 0033;
   ``audit_events_action_check`` is not touched (the catalog in force is still
   0032's: 0033 doesn't touch it either).
@@ -210,6 +219,19 @@ _QUERY_CLAUSES: Final = (
     "from|where|group by|having|order by|limit|offset|union|intersect|except|window"
     "|fetch|for|returning|on conflict"
 )
+# LOCK [TABLE] name [, ...] [IN <mode> MODE] [NOWAIT] (without IN, PostgreSQL takes its
+# default mode, ACCESS EXCLUSIVE).
+_LOCK_RE: Final = re.compile(
+    r"lock (?:table )?(?P<targets>.+?)(?: in (?P<mode>[a-z ]+?) mode)?(?P<nowait> nowait)?"
+)
+_LOCK_TABLE_RE: Final = re.compile(r'(?:"?public"?\.)?"?(?P<table>\w+)"?')
+_DEFAULT_LOCK_MODE: Final = "access exclusive"
+# Locking a fragment does: a LOCK statement, a row lock (FOR [NO KEY] UPDATE, FOR [KEY]
+# SHARE, NOWAIT, SKIP LOCKED) or an advisory-lock function.
+_LOCKING_RE: Final = re.compile(
+    r"^lock\b|\bfor (?:no key )?update\b|\bfor (?:key )?share\b|\bnowait\b|\bskip locked\b"
+    r"|\bpg_(?:try_)?advisory_\w*"
+)
 
 # Fragments 0034 must not start with (top level, DO / function bodies, literals).
 _FORBIDDEN: Final[dict[str, str]] = {
@@ -271,6 +293,15 @@ class _Update(NamedTuple):
     unexpected: tuple[str, ...]
 
 
+class _Lock(NamedTuple):
+    """A LOCK statement read: its tables in written order, its mode, NOWAIT."""
+
+    tables: tuple[str, ...]
+    mode: str
+    nowait: bool
+    unexpected: tuple[str, ...]
+
+
 class _Step(NamedTuple):
     label: str
     form: Any
@@ -290,6 +321,15 @@ _PENDING_INVITATION: Final = frozenset(
 )
 _USERS_AND_INVITATIONS: Final = frozenset({("users", "inner"), ("invitations", "inner")})
 
+# Decision 12: the first statement, before the steps of Decision 1.
+_LOCK_STEP: Final = "lock"
+_TABLE_LOCK: Final = _Lock(
+    tables=("users", "invitations", "sessions"),
+    mode="exclusive",
+    nowait=False,
+    unexpected=(),
+)
+# Decision 1's steps, after the lock.
 _CONTRACT_ORDER: Final = (
     "audit invitation.revoke",
     "delete users",
@@ -627,6 +667,26 @@ def _update(statement: str) -> _Update:
     )
 
 
+def _lock(statement: str) -> _Lock:
+    """``LOCK [TABLE] name [, ...] [IN mode MODE] [NOWAIT]`` read: the tables in written
+    order (a ``public.`` schema and quotes dropped; ONLY or ``*`` stay part of the name,
+    so they don't read as the bare table), the mode (PostgreSQL's default ACCESS
+    EXCLUSIVE without IN) and whether NOWAIT is set."""
+    match = _LOCK_RE.fullmatch(_masked(statement))
+    if match is None:
+        return _Lock((), "", False, (f"unreadable {statement}",))
+    tables: list[str] = []
+    for item in _split(statement[match.start("targets") : match.end("targets")], ","):
+        name = _LOCK_TABLE_RE.fullmatch(item)
+        tables.append(item if name is None else name.group("table"))
+    return _Lock(
+        tables=tuple(tables),
+        mode=match.group("mode") or _DEFAULT_LOCK_MODE,
+        nowait=match.group("nowait") is not None,
+        unexpected=(),
+    )
+
+
 def _literal(value: Any) -> str | None:
     """The text of a '...' literal value, else None."""
     if isinstance(value, str) and re.fullmatch(r"'(?:[^']|'')*'", value):
@@ -654,12 +714,14 @@ def _alter_steps(statement: str) -> list[_Step] | None:
 
 
 def _steps() -> list[_Step]:
-    """What 0034 does, in order: each write read into its form, each ALTER TABLE
-    action one by one; anything else as ``other: ...``."""
+    """What 0034 does, in order: each LOCK and each write read into its form, each
+    ALTER TABLE action one by one; anything else as ``other: ...``."""
     steps: list[_Step] = []
     for statement in _statements():
         masked = _masked(statement)
-        if re.match(r"insert into\b", masked):
+        if re.match(r"lock\b", masked):
+            steps.append(_Step(_LOCK_STEP, _lock(statement)))
+        elif re.match(r"insert into\b", masked):
             form = _insert(statement)
             action = _literal(form.values.get("action"))
             is_audit = form.table == "audit_events" and action is not None
@@ -791,7 +853,8 @@ class TestMigration0034File:
 
     def test_migration_0034_opens_with_a_header_comment_naming_what_it_changes(self) -> None:
         """What and why, before any statement: the retired Viewer role, the two events
-        written with the system actor, and the narrowed users_role_check."""
+        written with the system actor, the narrowed users_role_check, and the EXCLUSIVE
+        lock the migration takes first (Decision 12)."""
         lines = _header_lines()
         header = " ".join(lines)
 
@@ -802,6 +865,8 @@ class TestMigration0034File:
             "names invitation.revoke": "invitation.revoke" in header,
             "names the system actor": re.search(r"\bsystem\b", header) is not None,
             "names the constraint": _ROLE_CHECK in header,
+            "names the lock": re.search(r"\block(?:s|ed)?\b", header, re.IGNORECASE) is not None,
+            "names the lock mode": re.search(r"\bexclusive\b", header, re.IGNORECASE) is not None,
         } == dict.fromkeys(
             (
                 "names the viewer role",
@@ -809,6 +874,8 @@ class TestMigration0034File:
                 "names invitation.revoke",
                 "names the system actor",
                 "names the constraint",
+                "names the lock",
+                "names the lock mode",
             ),
             True,
         )
@@ -820,15 +887,29 @@ class TestMigration0034File:
 
 
 class TestMigration0034Statements:
-    """The six steps of Decision 1, each selecting the Viewer rows it is about."""
+    """Decision 12's lock first, then the six steps of Decision 1, each selecting the
+    Viewer rows it is about."""
 
     def test_migration_0034_runs_the_decided_steps_in_order(self) -> None:
         """Every statement (top level and DO blocks), ALTER TABLE actions one by one:
-        the invitation.revoke rows before the invited accounts are deleted, then the
+        the LOCK first, before any other statement (Decision 12), then the
+        invitation.revoke rows before the invited accounts are deleted, then the
         user.deactivate rows (sessions counted) before the sessions are deleted, then the
         role and status change, then the CHECK dropped and added again. Nothing else,
         nothing twice."""
-        assert [step.label for step in _steps()] == list(_CONTRACT_ORDER)
+        assert [step.label for step in _steps()] == [_LOCK_STEP, *_CONTRACT_ORDER]
+
+    def test_migration_0034_locks_users_invitations_and_sessions_in_exclusive_mode(
+        self,
+    ) -> None:
+        """Decision 12: LOCK TABLE users, invitations, sessions IN EXCLUSIVE MODE (the
+        order test pins it first). The three tables the steps read and write, in that
+        order and none other; EXCLUSIVE exactly, so the old agent's reads go on and its
+        writes (an invitation accepted, a login, a session) wait for the commit: not the
+        default ACCESS EXCLUSIVE (no IN clause), not a weaker mode such as SHARE or ROW
+        EXCLUSIVE; no NOWAIT, so the migrate step waits for the lock instead of failing
+        the upgrade."""
+        assert _forms(_LOCK_STEP) == [_TABLE_LOCK]
 
     def test_migration_0034_records_invitation_revoke_for_each_pending_viewer_invitation(
         self,
@@ -976,13 +1057,17 @@ class TestMigration0034AuditRows:
 
 
 class TestMigration0034Scope:
-    """Only the writes and the CHECK: no code, no privilege, no catalog, no email."""
+    """Only the lock, the writes and the CHECK: no code, no privilege, no catalog, no
+    email, no other lock."""
 
     def test_migration_0034_runs_no_code_privilege_or_schema_change(self) -> None:
         """No DO block, function, trigger, role, GRANT, REVOKE, CREATE, top-level DROP,
         TRUNCATE, COPY, MERGE, SET, CALL, SECURITY DEFINER, owner change, trigger switch,
         replication role, NOT VALID, DROP COLUMN or email_outbox, also not nested in a
-        body or an EXECUTE literal."""
+        body or an EXECUTE literal. The one locking statement is Decision 12's LOCK TABLE
+        users, invitations, sessions IN EXCLUSIVE MODE: no other LOCK (another table or
+        mode, a second one), no row lock (FOR UPDATE / SHARE, NOWAIT, SKIP LOCKED) and no
+        advisory lock, nested ones included."""
         fragments = _fragments(_normalize(_raw_sql()))
         offenders = [
             (kind, fragment)
@@ -995,9 +1080,15 @@ class TestMigration0034Scope:
             for kind, pattern in _FORBIDDEN_ANYWHERE.items()
             if re.search(pattern, _masked(fragment))
         ]
+        locking = [
+            _lock(fragment) if re.match(r"lock\b", _masked(fragment)) else fragment
+            for fragment in fragments
+            if _LOCKING_RE.search(_masked(fragment))
+        ]
 
         assert fragments, f"{_MIGRATION_NAME} runs nothing"
         assert offenders == []
+        assert locking == [_TABLE_LOCK]
 
     def test_migration_0034_changes_no_table_or_function_privilege(self) -> None:
         """Every (table, grantee) and every function's EXECUTE holds after 0034 what it
