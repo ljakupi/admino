@@ -1925,7 +1925,8 @@ log, without names or email addresses.
 - `POST /api/platform/orgs/{id}/users/{user_id}/deactivate` ends every session of the user
   at once (an approval of theirs still waiting in a chat is refused too) and emails them;
   their chats, connections, notes and settings are kept.
-  `.../reactivate` needs a free seat and emails the user a link to log in; it's refused
+  `.../reactivate` restores the account with the role it has stored, as the Org Admin's
+  reactivation does, needs a free seat and emails the user a link to log in; it's refused
   while the organization's deletion is pending. An organization always keeps at least one
   active Org Admin, for the Super Admin too: deactivating the last one answers `409` with
   the reason `last_admin`.

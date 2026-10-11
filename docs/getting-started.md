@@ -343,7 +343,9 @@ roles: Super Admin, Org Admin and Editor. **The upgrade starts from an empty pla
   deactivated, which ends their sessions, and stored as Editors; their pending invitations
   are revoked. Each change is recorded in the organization's audit log with the `system`
   actor: `user.deactivate` with the `reason` `viewer_retired`, and `invitation.revoke`. No
-  email is sent. An Org Admin who reactivates such an account grants it the Editor role.
+  email is sent. Such an account keeps its connections and data, as with any deactivation.
+  Reactivation restores the stored role, so an Org Admin or the Super Admin who
+  reactivates it grants it the Editor role.
 
 ## Quality gates (for contributors)
 
