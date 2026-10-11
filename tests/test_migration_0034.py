@@ -26,14 +26,20 @@ What is pinned:
   account preferences), and not again once applied. It opens with a header comment
   naming the retired Viewer role, the two
   system-actor events (``user.deactivate``, ``invitation.revoke``),
-  ``users_role_check`` and the EXCLUSIVE lock it takes first (Decision 12).
+  ``users_role_check`` and the locks it takes first: the ACCESS EXCLUSIVE one and why
+  (the deadlock a later upgrade would cause) (Decision 12).
 - Its statements, in this order (Decisions 1 and 12):
-  0. ``LOCK TABLE users, invitations, sessions IN EXCLUSIVE MODE``, before every other
-     statement (Decision 12): the old agent keeps serving while the one-shot migrate
-     step runs, and an invitation accepted, a login or a session written between two of
-     the statements below would leave a wrong audit row or a live Viewer session. The
-     three tables in that order, that mode exactly (reads go on, writes wait for the
-     commit; not the default ACCESS EXCLUSIVE, no weaker mode), no NOWAIT (the step
+  0. ``LOCK TABLE users IN ACCESS EXCLUSIVE MODE``, then ``LOCK TABLE invitations,
+     sessions IN EXCLUSIVE MODE``, these two before every other statement (Decision
+     12): the old agent keeps serving while the one-shot migrate step runs, and an
+     invitation accepted, a login or a session written between two of the statements
+     below would leave a wrong audit row or a live Viewer session. ``users`` alone and
+     first, in ACCESS EXCLUSIVE mode exactly: the closing ``ALTER TABLE users`` needs
+     that mode, and holding a weaker one until then upgrades the lock there, which
+     deadlocks with an old-agent request that has read ``users`` and then writes (the
+     security re-audit reproduced it on postgres:16). Then ``invitations``, ``sessions``
+     in that order, in EXCLUSIVE mode exactly (their reads go on, their writes wait for
+     the commit; not ACCESS EXCLUSIVE, no weaker mode). No NOWAIT on either (the step
      waits for the lock rather than failing the upgrade);
   1. ``INSERT INTO audit_events (org_id, actor_kind, action, target_type, target_ids,
      metadata) SELECT u.org_id, 'system', 'invitation.revoke', 'invitation',
@@ -69,9 +75,9 @@ What is pinned:
 - The new CHECK's IN-list equals ``typing.get_args(admino.access.MemberRole)``.
 - Nothing else: no other statement, no DO block, function, trigger, role, GRANT,
   REVOKE, CREATE, DROP TABLE / INDEX / COLUMN, TRUNCATE, COPY, MERGE, SET, NOT VALID,
-  owner change or email (Decision 4), and no locking but the one LOCK TABLE (no other
-  LOCK, row lock, NOWAIT, SKIP LOCKED or advisory lock), also not nested in a body or
-  an EXECUTE literal;
+  owner change or email (Decision 4), and no locking but the two LOCK TABLE statements
+  (no other LOCK, row lock, NOWAIT, SKIP LOCKED or advisory lock), also not nested in a
+  body or an EXECUTE literal;
   every table and function privilege after 0034 is what it was after 0033;
   ``audit_events_action_check`` is not touched (the catalog in force is still
   0032's: 0033 doesn't touch it either).
@@ -321,15 +327,15 @@ _PENDING_INVITATION: Final = frozenset(
 )
 _USERS_AND_INVITATIONS: Final = frozenset({("users", "inner"), ("invitations", "inner")})
 
-# Decision 12: the first statement, before the steps of Decision 1.
+# Decision 12: the first two statements, in this order, before the steps of Decision 1.
+# users in the mode its closing ALTER TABLE needs (no lock upgrade, no deadlock), then
+# the two other tables the steps write in EXCLUSIVE mode.
 _LOCK_STEP: Final = "lock"
-_TABLE_LOCK: Final = _Lock(
-    tables=("users", "invitations", "sessions"),
-    mode="exclusive",
-    nowait=False,
-    unexpected=(),
+_TABLE_LOCKS: Final = (
+    _Lock(tables=("users",), mode="access exclusive", nowait=False, unexpected=()),
+    _Lock(tables=("invitations", "sessions"), mode="exclusive", nowait=False, unexpected=()),
 )
-# Decision 1's steps, after the lock.
+# Decision 1's steps, after the locks.
 _CONTRACT_ORDER: Final = (
     "audit invitation.revoke",
     "delete users",
@@ -687,6 +693,12 @@ def _lock(statement: str) -> _Lock:
     )
 
 
+def _lock_label(lock: _Lock) -> str:
+    """A LOCK step's label: ``lock`` and its tables in written order, so the order of
+    the steps tells the two locks apart (their modes are the form test's)."""
+    return " ".join((_LOCK_STEP, ", ".join(lock.tables))).strip()
+
+
 def _literal(value: Any) -> str | None:
     """The text of a '...' literal value, else None."""
     if isinstance(value, str) and re.fullmatch(r"'(?:[^']|'')*'", value):
@@ -720,7 +732,8 @@ def _steps() -> list[_Step]:
     for statement in _statements():
         masked = _masked(statement)
         if re.match(r"lock\b", masked):
-            steps.append(_Step(_LOCK_STEP, _lock(statement)))
+            lock = _lock(statement)
+            steps.append(_Step(_lock_label(lock), lock))
         elif re.match(r"insert into\b", masked):
             form = _insert(statement)
             action = _literal(form.values.get("action"))
@@ -744,6 +757,13 @@ def _forms(label: str) -> list[Any]:
     steps = _steps()
     assert steps, f"{_MIGRATION_NAME} runs nothing"
     return [step.form for step in steps if step.label == label]
+
+
+def _lock_forms() -> list[_Lock]:
+    """The read forms of every LOCK step, in written order."""
+    steps = _steps()
+    assert steps, f"{_MIGRATION_NAME} runs nothing"
+    return [step.form for step in steps if isinstance(step.form, _Lock)]
 
 
 def _acl(up_to: int) -> dict[tuple[str, str], frozenset[str]]:
@@ -853,8 +873,10 @@ class TestMigration0034File:
 
     def test_migration_0034_opens_with_a_header_comment_naming_what_it_changes(self) -> None:
         """What and why, before any statement: the retired Viewer role, the two events
-        written with the system actor, the narrowed users_role_check, and the EXCLUSIVE
-        lock the migration takes first (Decision 12)."""
+        written with the system actor, the narrowed users_role_check, and the locks the
+        migration takes first (Decision 12): users in ACCESS EXCLUSIVE mode, and why (a
+        weaker lock upgraded at the closing ALTER TABLE deadlocks with the old agent's
+        requests)."""
         lines = _header_lines()
         header = " ".join(lines)
 
@@ -867,6 +889,9 @@ class TestMigration0034File:
             "names the constraint": _ROLE_CHECK in header,
             "names the lock": re.search(r"\block(?:s|ed)?\b", header, re.IGNORECASE) is not None,
             "names the lock mode": re.search(r"\bexclusive\b", header, re.IGNORECASE) is not None,
+            "names access exclusive": re.search(r"\baccess exclusive\b", header, re.IGNORECASE)
+            is not None,
+            "says why (the deadlock)": re.search(r"\bdeadlock", header, re.IGNORECASE) is not None,
         } == dict.fromkeys(
             (
                 "names the viewer role",
@@ -876,6 +901,8 @@ class TestMigration0034File:
                 "names the constraint",
                 "names the lock",
                 "names the lock mode",
+                "names access exclusive",
+                "says why (the deadlock)",
             ),
             True,
         )
@@ -887,29 +914,37 @@ class TestMigration0034File:
 
 
 class TestMigration0034Statements:
-    """Decision 12's lock first, then the six steps of Decision 1, each selecting the
-    Viewer rows it is about."""
+    """Decision 12's two locks first, then the six steps of Decision 1, each selecting
+    the Viewer rows it is about."""
 
     def test_migration_0034_runs_the_decided_steps_in_order(self) -> None:
         """Every statement (top level and DO blocks), ALTER TABLE actions one by one:
-        the LOCK first, before any other statement (Decision 12), then the
-        invitation.revoke rows before the invited accounts are deleted, then the
-        user.deactivate rows (sessions counted) before the sessions are deleted, then the
-        role and status change, then the CHECK dropped and added again. Nothing else,
-        nothing twice."""
-        assert [step.label for step in _steps()] == [_LOCK_STEP, *_CONTRACT_ORDER]
+        the two LOCKs first, before any other statement (Decision 12), the one of users
+        before the one of invitations and sessions; then the invitation.revoke rows
+        before the invited accounts are deleted, then the user.deactivate rows (sessions
+        counted) before the sessions are deleted, then the role and status change, then
+        the CHECK dropped and added again. Nothing else, nothing twice."""
+        assert [step.label for step in _steps()] == [
+            *(_lock_label(lock) for lock in _TABLE_LOCKS),
+            *_CONTRACT_ORDER,
+        ]
 
-    def test_migration_0034_locks_users_invitations_and_sessions_in_exclusive_mode(
+    def test_migration_0034_locks_users_access_exclusive_then_invitations_and_sessions_exclusive(
         self,
     ) -> None:
-        """Decision 12: LOCK TABLE users, invitations, sessions IN EXCLUSIVE MODE (the
-        order test pins it first). The three tables the steps read and write, in that
-        order and none other; EXCLUSIVE exactly, so the old agent's reads go on and its
-        writes (an invitation accepted, a login, a session) wait for the commit: not the
-        default ACCESS EXCLUSIVE (no IN clause), not a weaker mode such as SHARE or ROW
-        EXCLUSIVE; no NOWAIT, so the migrate step waits for the lock instead of failing
-        the upgrade."""
-        assert _forms(_LOCK_STEP) == [_TABLE_LOCK]
+        """Decision 12 (the order test pins both first): LOCK TABLE users IN ACCESS
+        EXCLUSIVE MODE, then LOCK TABLE invitations, sessions IN EXCLUSIVE MODE.
+        - users alone, ACCESS EXCLUSIVE exactly (written or PostgreSQL's default without
+          IN): the closing ALTER TABLE users needs that mode, so the migration never
+          upgrades its lock on users; holding EXCLUSIVE (or weaker) until the ALTER
+          deadlocks with an old-agent request that has read users and then writes.
+        - invitations and sessions, in that order and no other table, EXCLUSIVE exactly:
+          the old agent's reads of them go on and its writes (an invitation accepted, a
+          login's session) wait for the commit; not ACCESS EXCLUSIVE, not a weaker mode
+          such as SHARE or ROW EXCLUSIVE.
+        - No NOWAIT on either, so the migrate step waits for the locks instead of failing
+          the upgrade."""
+        assert _lock_forms() == list(_TABLE_LOCKS)
 
     def test_migration_0034_records_invitation_revoke_for_each_pending_viewer_invitation(
         self,
@@ -1057,17 +1092,18 @@ class TestMigration0034AuditRows:
 
 
 class TestMigration0034Scope:
-    """Only the lock, the writes and the CHECK: no code, no privilege, no catalog, no
-    email, no other lock."""
+    """Only the two locks, the writes and the CHECK: no code, no privilege, no catalog,
+    no email, no other lock."""
 
     def test_migration_0034_runs_no_code_privilege_or_schema_change(self) -> None:
         """No DO block, function, trigger, role, GRANT, REVOKE, CREATE, top-level DROP,
         TRUNCATE, COPY, MERGE, SET, CALL, SECURITY DEFINER, owner change, trigger switch,
         replication role, NOT VALID, DROP COLUMN or email_outbox, also not nested in a
-        body or an EXECUTE literal. The one locking statement is Decision 12's LOCK TABLE
-        users, invitations, sessions IN EXCLUSIVE MODE: no other LOCK (another table or
-        mode, a second one), no row lock (FOR UPDATE / SHARE, NOWAIT, SKIP LOCKED) and no
-        advisory lock, nested ones included."""
+        body or an EXECUTE literal. The only locking statements are Decision 12's two, in
+        this order: LOCK TABLE users IN ACCESS EXCLUSIVE MODE and LOCK TABLE invitations,
+        sessions IN EXCLUSIVE MODE: no other LOCK (another table or mode, a third one),
+        no row lock (FOR UPDATE / SHARE, NOWAIT, SKIP LOCKED) and no advisory lock,
+        nested ones included."""
         fragments = _fragments(_normalize(_raw_sql()))
         offenders = [
             (kind, fragment)
@@ -1088,7 +1124,7 @@ class TestMigration0034Scope:
 
         assert fragments, f"{_MIGRATION_NAME} runs nothing"
         assert offenders == []
-        assert locking == [_TABLE_LOCK]
+        assert locking == list(_TABLE_LOCKS)
 
     def test_migration_0034_changes_no_table_or_function_privilege(self) -> None:
         """Every (table, grantee) and every function's EXECUTE holds after 0034 what it
