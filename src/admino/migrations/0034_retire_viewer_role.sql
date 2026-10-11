@@ -2,7 +2,15 @@
 -- Retire the Viewer role (GH-306).
 --
 -- The platform has three roles: the Super Admin, Org Admins and Editors. No
--- account may keep the Viewer role, and none is promoted. In this order:
+-- account may keep the Viewer role, and none is promoted.
+--
+-- Lock first: the old agent can keep serving while the one-shot migrate step
+-- runs, so users, invitations and sessions are locked in EXCLUSIVE mode for
+-- the transaction. Reads continue; writes (an invitation accepted, a login)
+-- wait for the commit. That keeps every audit row and session count below
+-- true to what the statements after it change.
+--
+-- Then, in this order:
 --
 -- - Every pending Viewer invitation (accepted_at IS NULL, expired or not,
 --   whose account has role viewer and status invited) is revoked as
@@ -13,9 +21,9 @@
 --   write left behind) is deactivated as POST /api/org/users/{id}/deactivate
 --   does: a user.deactivate event, then its sessions are deleted (so they end
 --   on their next request), and the account is stored with role editor and
---   status deactivated. It stays deactivated until an Org Admin reactivates
---   it; reactivation restores the stored role, so it is an explicit grant of
---   Editor.
+--   status deactivated. It stays deactivated until an Org Admin or the Super
+--   Admin reactivates it; reactivation restores the stored role, so it is an
+--   explicit grant of Editor.
 -- - users_role_check (0004's inline CHECK) is replaced under the same name
 --   with org_admin and editor only. An invitation has no role column of its
 --   own (it is its invited account's role), so this one CHECK covers both.
@@ -35,6 +43,8 @@
 -- Viewer rows writes no audit row.
 --
 -- Grants: none change.
+
+LOCK TABLE users, invitations, sessions IN EXCLUSIVE MODE;
 
 INSERT INTO audit_events (org_id, actor_kind, action, target_type, target_ids, metadata)
 SELECT u.org_id, 'system', 'invitation.revoke', 'invitation',
