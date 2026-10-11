@@ -36,6 +36,15 @@ What these tests pin down (the GH-166 contract, section 1.4):
 - No password reaches a log record, an exception, an audit row or any SQL
   argument (only its hash is bound); no name, email, timezone or instructions
   reach a log record; errors carry no IDs.
+- GH-307 (Decision 4): ``MyAccountResponse.password_changed_at`` is the
+  caller's stored ``users.password_changed_at`` (None until the first change),
+  returned by ``get_account`` and ``update_account``. A successful
+  ``change_password`` sets it with the database clock (``now()``) in the same
+  ``UPDATE`` that stores the new hash (contract C4), so it shares the
+  transaction of the session revoke and the audit row. Every refused change
+  (wrong current password, policy, a deleted or deactivated account, a failed
+  audit write) leaves it as it was; another user's value never changes or
+  shows; the audit metadata and the logs gain nothing.
 
 All database calls go to the in-memory tests/db_fakes.FakeDb (``db.pool``).
 ``passwords.verify_password`` and ``passwords.hash_password`` are fast recording
@@ -94,6 +103,8 @@ _ACCOUNT_FIELDS: Final = (
     "response_language",
     "timezone",
     "personal_instructions",
+    # GH-307: the date of the last password change.
+    "password_changed_at",
 )
 _UUID_RE: Final = re.compile(
     r"[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}", re.IGNORECASE
@@ -437,6 +448,7 @@ class TestGetAccount:
             "response_language": "it",
             "timezone": "Europe/Zurich",
             "personal_instructions": _INSTRUCTIONS,
+            "password_changed_at": None,
         }
 
     async def test_my_account_get_unset_preferences_are_none_and_empty(
@@ -605,7 +617,7 @@ class TestUpdateAccount:
 
         result = await ma.update_account(db.pool, principal=principal, patch=_patch(**changes))
 
-        expected = {"email": _EMAIL, **changes}
+        expected = {"email": _EMAIL, **changes, "password_changed_at": None}
         assert _stored(db, principal.user_id) == expected
         assert result.model_dump() == expected
 
@@ -939,7 +951,10 @@ class TestChangePasswordSuccess:
 
         after = dict(db.users[principal.user_id])
         assert after.pop("password_hash") == fake_hash(_NEW)
+        # GH-307: the change date moves with the hash (its value: TestPasswordChangedAt).
+        assert after.pop("password_changed_at") is not None
         before.pop("password_hash")
+        before.pop("password_changed_at")
         assert after == before
 
 
@@ -1261,3 +1276,267 @@ class TestNoSecrets:
         text = _log_text(caplog)
         for marker in (_EMAIL, _NAME, _INSTRUCTIONS, _TIMEZONE):
             assert marker.casefold() not in text
+
+
+# ---------------------------------------------------------------------------
+# 11. password_changed_at (GH-307)
+# ---------------------------------------------------------------------------
+
+# A change stored before the test (with microseconds, so a lossy copy shows).
+_EARLIER_CHANGE: Final = datetime(2026, 3, 4, 5, 6, 7, 890123, tzinfo=UTC)
+_EARLIER: Final = [
+    pytest.param(None, id="never-changed"),
+    pytest.param(_EARLIER_CHANGE, id="changed-before"),
+]
+
+# Contract C4: the new hash and the change date in ONE statement, the date from the
+# database's clock (now()), never a value bound from Python.
+_HASH_UPDATE_RE: Final = re.compile(
+    r"update users set password_hash = \$1 ?, ?password_changed_at = now\(\) "
+    r"where id = \$2 and deleted_at is null and status = 'active' returning id"
+)
+
+# Every way change_password refuses (decision 4: "a refused change leaves it as it was").
+_REFUSED_CHANGES: Final = (
+    "wrong-current-password",
+    "policy",
+    "audit-failure",
+    "deleted-account",
+    "deleted-after-reauth",
+    "deactivated-after-reauth",
+)
+
+
+def _changed_at(db: FakeDb, user_id: uuid.UUID) -> Any:
+    """The stored users.password_changed_at of an account."""
+    return db.users[user_id]["password_changed_at"]
+
+
+def _assert_utc_between(value: Any, before: datetime, after: datetime) -> None:
+    """``value`` is an aware UTC datetime read from the clock between the two bounds."""
+    assert isinstance(value, datetime), value
+    assert value.utcoffset() == timedelta(0), value
+    assert before <= value <= after, (before, value, after)
+
+
+async def _refused_change(
+    ma: ModuleType,
+    db: FakeDb,
+    principal: Principal,
+    cause: str,
+    monkeypatch: pytest.MonkeyPatch,
+    hasher: _Hasher,
+) -> None:
+    """Run one change_password that is refused for ``cause``, and check its error."""
+    row = db.users[principal.user_id]
+    if cause == "wrong-current-password":
+        with pytest.raises(ma.WrongPasswordError):
+            await _change(ma, db, principal, current=_WRONG)
+    elif cause == "policy":
+        with pytest.raises(passwords.PasswordPolicyError):
+            await _change(ma, db, principal, new="Short-307")
+    elif cause == "audit-failure":
+        db.fail_audit = True
+        with pytest.raises(AuditRecordError):
+            await _change(ma, db, principal)
+    elif cause == "deleted-account":
+        row["deleted_at"] = datetime.now(UTC) - timedelta(minutes=5)
+        with pytest.raises(ma.AccountNotFoundError):
+            await _change(ma, db, principal)
+    else:
+
+        def hash_then_lose_the_account(password: str) -> str:
+            # Runs after the re-authentication and before the transaction opens.
+            encoded = hasher(password)
+            if cause == "deleted-after-reauth":
+                row["deleted_at"] = datetime.now(UTC)
+            else:
+                row["status"] = "deactivated"
+            return encoded
+
+        monkeypatch.setattr(passwords, "hash_password", hash_then_lose_the_account)
+        with pytest.raises(ma.AccountNotFoundError):
+            await _change(ma, db, principal)
+
+
+def _undo_refusal(
+    db: FakeDb, principal: Principal, monkeypatch: pytest.MonkeyPatch, hasher: _Hasher
+) -> None:
+    """Remove whatever made ``_refused_change`` refuse, so the next change is accepted."""
+    db.fail_audit = False
+    row = db.users[principal.user_id]
+    row["deleted_at"] = None
+    row["status"] = "active"
+    monkeypatch.setattr(passwords, "hash_password", hasher)
+
+
+class TestPasswordChangedAt:
+    """GH-307: set by a successful change (now(), in the hash UPDATE), returned by
+    get_account and update_account, left alone by everything else."""
+
+    async def test_my_account_get_password_changed_at_is_none_until_the_first_change(
+        self, ma: ModuleType, db: FakeDb
+    ) -> None:
+        principal = _member(db)
+
+        result = await ma.get_account(db.pool, principal=principal)
+
+        assert result.password_changed_at is None
+
+    @pytest.mark.parametrize("who", ["member", "super_admin"])
+    async def test_my_account_get_returns_the_stored_password_changed_at(
+        self, ma: ModuleType, db: FakeDb, who: str
+    ) -> None:
+        make = _member if who == "member" else _super_admin
+        principal = make(db, password_changed_at=_EARLIER_CHANGE)
+
+        result = await ma.get_account(db.pool, principal=principal)
+
+        assert result.password_changed_at == _EARLIER_CHANGE
+
+    async def test_my_account_update_returns_the_stored_password_changed_at(
+        self, ma: ModuleType, db: FakeDb
+    ) -> None:
+        """The PATCH /api/me response carries it too; a profile change doesn't touch it."""
+        principal = _patchable(db, password_changed_at=_EARLIER_CHANGE)
+
+        result = await ma.update_account(
+            db.pool, principal=principal, patch=_patch(name="Marker Renamed Person")
+        )
+
+        assert result.password_changed_at == _EARLIER_CHANGE
+        assert _changed_at(db, principal.user_id) == _EARLIER_CHANGE
+
+    @pytest.mark.parametrize("earlier", _EARLIER)
+    async def test_my_account_change_password_sets_password_changed_at_to_now(
+        self, ma: ModuleType, db: FakeDb, earlier: datetime | None
+    ) -> None:
+        """The first change sets it; a later one replaces the earlier date."""
+        principal = _member(db, password_changed_at=earlier)
+        before = datetime.now(UTC)
+
+        await _change(ma, db, principal)
+
+        _assert_utc_between(_changed_at(db, principal.user_id), before, datetime.now(UTC))
+
+    async def test_my_account_change_password_date_is_returned_by_get_account(
+        self, ma: ModuleType, db: FakeDb
+    ) -> None:
+        principal = _member(db)
+
+        await _change(ma, db, principal)
+        result = await ma.get_account(db.pool, principal=principal)
+
+        assert result.password_changed_at is not None
+        assert result.password_changed_at == _changed_at(db, principal.user_id)
+
+    async def test_my_account_change_password_twice_moves_the_date_forward(
+        self, ma: ModuleType, db: FakeDb
+    ) -> None:
+        principal = _member(db)
+        await _change(ma, db, principal)
+        first = _changed_at(db, principal.user_id)
+        before = datetime.now(UTC)
+
+        await _change(ma, db, principal, current=_NEW, new=_NEW + "-second")
+
+        second = _changed_at(db, principal.user_id)
+        _assert_utc_between(second, before, datetime.now(UTC))
+        assert first < second
+
+    async def test_my_account_change_password_sets_the_date_in_the_hash_update(
+        self, ma: ModuleType, db: FakeDb
+    ) -> None:
+        """Contract C4: the hash UPDATE sets password_changed_at = now() (no clock value is
+        bound), in the transaction of the session revoke and the audit row; no other
+        write names the column."""
+        principal = _member(db)
+        db.open_session(principal.user_id)
+
+        await _change(ma, db, principal)
+
+        (update,) = db.matching(r"^update users set password_hash\b")
+        assert _HASH_UPDATE_RE.fullmatch(update.normalized), update.normalized
+        assert [plain(arg) if isinstance(arg, uuid.UUID) else arg for arg in update.args] == [
+            fake_hash(_NEW),
+            principal.user_id,
+        ]
+        writes = db.matching(r"^(?:update|insert|delete)\b")
+        assert [call for call in writes if "password_changed_at" in call.normalized] == [update]
+        (revoke,) = db.matching(r"^delete from sessions\b")
+        (audit,) = db.matching(r"^insert into audit_events\b")
+        assert update.tx is not None
+        assert {(call.via, call.tx) for call in (update, revoke, audit)} == {
+            (update.via, update.tx)
+        }
+
+    @pytest.mark.parametrize("earlier", _EARLIER)
+    @pytest.mark.parametrize("cause", _REFUSED_CHANGES)
+    async def test_my_account_refused_change_keeps_password_changed_at(
+        self,
+        ma: ModuleType,
+        db: FakeDb,
+        hasher: _Hasher,
+        monkeypatch: pytest.MonkeyPatch,
+        cause: str,
+        earlier: datetime | None,
+    ) -> None:
+        """Null stays null and an earlier date stays that date, whatever the refusal; the
+        same account's next, accepted change then sets it (the positive control)."""
+        principal = _member(db, password_changed_at=earlier)
+
+        await _refused_change(ma, db, principal, cause, monkeypatch, hasher)
+
+        assert _changed_at(db, principal.user_id) == earlier
+        assert db.users[principal.user_id]["password_hash"] == fake_hash(_CURRENT)
+        _undo_refusal(db, principal, monkeypatch, hasher)
+        before = datetime.now(UTC)
+        await _change(ma, db, principal)
+        _assert_utc_between(_changed_at(db, principal.user_id), before, datetime.now(UTC))
+
+    async def test_my_account_change_password_sets_only_the_callers_date(
+        self, ma: ModuleType, db: FakeDb
+    ) -> None:
+        """A colleague (never changed), another org's member (changed before) and a Super
+        Admin keep theirs, and the colleague still reads None."""
+        principal = _member(db)
+        colleague = _member(db, email="colleague.marker@example.test")
+        outsider = _member(
+            db,
+            org_id=OTHER_ORG_ID,
+            email="outsider.marker@example.test",
+            password_changed_at=_EARLIER_CHANGE,
+        )
+        admin = _super_admin(db, email="platform.marker@example.test")
+
+        await _change(ma, db, principal)
+        theirs = await ma.get_account(db.pool, principal=colleague)
+
+        assert _changed_at(db, principal.user_id) is not None
+        assert [_changed_at(db, other.user_id) for other in (colleague, outsider, admin)] == [
+            None,
+            _EARLIER_CHANGE,
+            None,
+        ]
+        assert theirs.password_changed_at is None
+
+    async def test_my_account_change_password_date_is_not_logged_or_audited(
+        self, ma: ModuleType, db: FakeDb, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The password.change metadata stays exactly {"sessions_revoked": n}; no log
+        record names the column or carries the stored date."""
+        caplog.set_level(logging.DEBUG)
+        principal = _member(db)
+        db.open_session(principal.user_id)
+
+        await _change(ma, db, principal)
+        await ma.get_account(db.pool, principal=principal)
+
+        stamp = _changed_at(db, principal.user_id)
+        (row,) = db.audit_rows("password.change")
+        assert row["metadata"] == {"sessions_revoked": 1}
+        assert "password_changed_at" not in json.dumps(db.audit, default=str)
+        text = _log_text(caplog)
+        assert "password_changed_at" not in text
+        for rendered in (stamp.isoformat(), str(stamp)):
+            assert rendered.casefold() not in text

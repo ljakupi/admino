@@ -41,6 +41,14 @@ What these tests pin down:
 - Audit rows: exact actors, targets, IP and metadata; an audit failure
   propagates and rolls everything back (fail closed).
 - No email, token, password or link in any log line, audit row or error.
+- GH-307 (Decision 4, contract C5): the completed reset sets
+  ``users.password_changed_at`` with the database clock, in the same
+  statement as the new hash (``UPDATE users SET password_hash = $1,
+  password_changed_at = now() WHERE id = $2``), inside the transaction of the
+  token consume (so a rollback keeps the old value). A request alone, every
+  unusable link, a refused new password and a failed audit write leave it as
+  it was; only the reset account's value changes; the audit metadata and the
+  logs gain nothing.
 
 All database calls go to the in-memory fake of tests/db_fakes.py (re-exported by
 tests/password_reset_fakes.py).
@@ -68,6 +76,7 @@ import pytest
 
 from admino import passwords, sessions
 from admino.audit_events import AuditRecordError
+from tests.db_fakes import OTHER_ORG_ID
 from tests.password_reset_fakes import (
     FAKE_LIFETIME,
     LINK_PREFIX,
@@ -1195,14 +1204,18 @@ class TestConfirmSuccess:
     async def test_password_reset_confirm_stores_the_new_hash(
         self, pr: ModuleType, db: FakeDb
     ) -> None:
-        """UPDATE users SET password_hash = $1 WHERE id = $2 with the new hash and the id."""
+        """UPDATE users SET password_hash = $1, password_changed_at = now() WHERE id = $2
+        (GH-307, contract C5) with the new hash and the id."""
         user_id = _add_active(db)
         token = await _issue(pr, db)
 
         await _confirm(pr, db, token)
 
         update = _one(
-            db.matching(r"^update users set password_hash = \$1 where (?:\w+\.)?id = \$2")
+            db.matching(
+                r"^update users set password_hash = \$1 ?, ?password_changed_at = now\(\) "
+                r"where (?:\w+\.)?id = \$2"
+            )
         )
         assert update.args[:2] == (fake_hash(_NEW_PASSWORD), user_id)
         assert db.users[user_id]["password_hash"] == fake_hash(_NEW_PASSWORD)
@@ -1536,3 +1549,235 @@ class TestNoContent:
             assert not _carries_email(call)
             assert not _carries(call, token)
             assert not _carries(call, _NEW_PASSWORD)
+
+
+# ---------------------------------------------------------------------------
+# 16. password_changed_at (GH-307)
+# ---------------------------------------------------------------------------
+
+# A change stored before the test (with microseconds, so a lossy copy shows).
+_EARLIER_CHANGE = datetime(2026, 3, 4, 5, 6, 7, 890123, tzinfo=UTC)
+_EARLIER: list[Any] = [
+    pytest.param(None, id="never-changed"),
+    pytest.param(_EARLIER_CHANGE, id="changed-before"),
+]
+
+# Contract C5, the whole statement: the date from the database's clock (now()), never a
+# value bound from Python.
+_C5_UPDATE_RE = re.compile(
+    r"update users set password_hash = \$1 ?, ?password_changed_at = now\(\) "
+    r"where (?:\w+\.)?id = \$2"
+)
+
+# Every confirm that is refused (decision 4: "a refused change leaves it as it was").
+_REFUSED_CONFIRMS = (
+    "malformed-token",
+    "unknown-token",
+    "expired",
+    "superseded",
+    "account-deactivated",
+    "account-deleted",
+    "org-deactivated",
+    "lost-race",
+    "policy",
+    "audit-failure",
+)
+
+
+def _changed_at(db: FakeDb, user_id: uuid.UUID) -> Any:
+    """The stored users.password_changed_at of an account."""
+    return db.users[user_id]["password_changed_at"]
+
+
+def _assert_utc_between(value: Any, before: datetime, after: datetime) -> None:
+    """``value`` is an aware UTC datetime read from the clock between the two bounds."""
+    assert isinstance(value, datetime), value
+    assert value.utcoffset() == timedelta(0), value
+    assert before <= value <= after, (before, value, after)
+
+
+async def _refused_confirm(pr: ModuleType, db: FakeDb, user_id: uuid.UUID, cause: str) -> None:
+    """Run one confirm_reset for the account that is refused for ``cause``, and check its
+    error."""
+    if cause == "malformed-token":
+        with pytest.raises(pr.InvalidResetTokenError):
+            await _confirm(pr, db, "not-a-token")
+        return
+    if cause == "unknown-token":
+        with pytest.raises(pr.InvalidResetTokenError):
+            await _confirm(pr, db, "Q" * 21 + "-" + "z" * 20 + "_")
+        return
+    token = await _issue(pr, db)
+    expected: type[BaseException] = pr.InvalidResetTokenError
+    password = _NEW_PASSWORD
+    if cause == "expired":
+        _expire(db, user_id, "past")
+    elif cause == "superseded":
+        await _issue(pr, db)
+    elif cause == "account-deactivated":
+        db.users[user_id]["status"] = "deactivated"
+    elif cause == "account-deleted":
+        db.users[user_id]["deleted_at"] = _DELETED_AT
+    elif cause == "org-deactivated":
+        db.users[user_id]["org_status"] = "deactivated"
+    elif cause == "lost-race":
+
+        def used_concurrently() -> None:
+            db.tokens.pop(user_id, None)
+
+        db.after_token_lookup = used_concurrently
+    elif cause == "policy":
+        expected, password = passwords.PasswordPolicyError, "Kq7#vX9!pL2"
+    else:
+        db.fail_audit = True
+        expected = AuditRecordError
+    with pytest.raises(expected):
+        await _confirm(pr, db, token, new_password=password)
+
+
+def _undo_refusal(db: FakeDb, user_id: uuid.UUID) -> None:
+    """Remove whatever made ``_refused_confirm`` refuse, so a fresh link works."""
+    db.fail_audit = False
+    db.after_token_lookup = None
+    db.users[user_id].update({"status": "active", "deleted_at": None, "org_status": None})
+
+
+class TestPasswordChangedAt:
+    """GH-307: a completed reset sets users.password_changed_at; nothing else does."""
+
+    @pytest.mark.parametrize("earlier", _EARLIER)
+    @pytest.mark.parametrize("who", list(_ELIGIBLE))
+    async def test_password_reset_confirm_sets_password_changed_at_to_now(
+        self, pr: ModuleType, db: FakeDb, who: str, earlier: datetime | None
+    ) -> None:
+        """The first change sets it; a later one replaces the earlier date."""
+        user_id = _add_active(db, **_ELIGIBLE[who], password_changed_at=earlier)
+        token = await _issue(pr, db)
+        before = datetime.now(UTC)
+
+        await _confirm(pr, db, token)
+
+        _assert_utc_between(_changed_at(db, user_id), before, datetime.now(UTC))
+
+    async def test_password_reset_confirm_sets_the_date_in_the_hash_update(
+        self, pr: ModuleType, db: FakeDb
+    ) -> None:
+        """Contract C5: the hash UPDATE sets password_changed_at = now() (only the hash and
+        the id are bound), inside the committed transaction of the token consume; no other
+        write names the column."""
+        user_id = _add_active(db)
+        token = await _issue(pr, db)
+        db.calls.clear()
+        db.transactions.clear()
+
+        await _confirm(pr, db, token)
+
+        update = _one(db.matching(r"^update users set password_hash\b"))
+        consume = _consume(db)
+        assert _C5_UPDATE_RE.fullmatch(update.normalized), update.normalized
+        assert update.args == (fake_hash(_NEW_PASSWORD), user_id)
+        assert [call for call in _writes(db) if "password_changed_at" in call.normalized] == [
+            update
+        ]
+        assert consume.tx is not None
+        assert (update.via, update.tx) == (consume.via, consume.tx)
+        assert db.transactions == [(consume.tx, "commit")]
+
+    @pytest.mark.parametrize("earlier", _EARLIER)
+    @pytest.mark.parametrize("cause", _REFUSED_CONFIRMS)
+    async def test_password_reset_refused_confirm_keeps_password_changed_at(
+        self, pr: ModuleType, db: FakeDb, cause: str, earlier: datetime | None
+    ) -> None:
+        """Null stays null and an earlier date stays that date, whatever the refusal; a
+        fresh link then completes and sets it (the positive control)."""
+        user_id = _add_active(db, password_changed_at=earlier)
+
+        await _refused_confirm(pr, db, user_id, cause)
+
+        assert _changed_at(db, user_id) == earlier
+        assert db.users[user_id]["password_hash"] == "fake$initial"
+        _undo_refusal(db, user_id)
+        token = await _issue(pr, db)
+        before = datetime.now(UTC)
+        await _confirm(pr, db, token, new_password=_OTHER_PASSWORD)
+        _assert_utc_between(_changed_at(db, user_id), before, datetime.now(UTC))
+
+    async def test_password_reset_used_link_keeps_the_first_password_changed_at(
+        self, pr: ModuleType, db: FakeDb
+    ) -> None:
+        """The second confirm with the same link is refused: the date of the first one
+        stays."""
+        user_id = _add_active(db)
+        token = await _issue(pr, db)
+        await _confirm(pr, db, token)
+        first = _changed_at(db, user_id)
+
+        with pytest.raises(pr.InvalidResetTokenError):
+            await _confirm(pr, db, token, new_password=_OTHER_PASSWORD)
+
+        assert first is not None
+        assert _changed_at(db, user_id) == first
+
+    @pytest.mark.parametrize("earlier", _EARLIER)
+    async def test_password_reset_request_alone_leaves_password_changed_at(
+        self, pr: ModuleType, db: FakeDb, earlier: datetime | None
+    ) -> None:
+        """Asking for a link changes nothing; completing it does."""
+        user_id = _add_active(db, password_changed_at=earlier)
+
+        token = await _issue(pr, db)
+        kept = _changed_at(db, user_id)
+        before = datetime.now(UTC)
+        await _confirm(pr, db, token)
+
+        assert kept == earlier
+        _assert_utc_between(_changed_at(db, user_id), before, datetime.now(UTC))
+
+    async def test_password_reset_confirm_sets_only_the_accounts_password_changed_at(
+        self, pr: ModuleType, db: FakeDb
+    ) -> None:
+        """A colleague with a pending link of their own, another org's member and a Super
+        Admin keep their dates."""
+        colleague = db.add_account(
+            email="colleague@example.test", password_changed_at=_EARLIER_CHANGE
+        )
+        outsider = db.add_account(
+            email="outsider@example.test",
+            org_id=OTHER_ORG_ID,
+            password_changed_at=_EARLIER_CHANGE,
+        )
+        admin = db.add_account(**_super_admin_fields(email="root@example.test"))
+        await _request(pr, db, email="colleague@example.test")
+        user_id = _add_active(db)
+        token = await _issue(pr, db)
+
+        await _confirm(pr, db, token)
+
+        assert _changed_at(db, user_id) is not None
+        assert [_changed_at(db, other) for other in (colleague, outsider, admin)] == [
+            _EARLIER_CHANGE,
+            _EARLIER_CHANGE,
+            None,
+        ]
+
+    async def test_password_reset_password_changed_at_reaches_no_audit_row_or_log(
+        self, pr: ModuleType, db: FakeDb, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Both audit rows keep exactly their metadata; no log record names the column or
+        carries the stored date."""
+        caplog.set_level(logging.DEBUG)
+        user_id = _add_active(db)
+        db.open_session(user_id)
+        token = await _issue(pr, db)
+
+        await _confirm(pr, db, token)
+
+        stamp = _changed_at(db, user_id)
+        assert [(row["action"], row["metadata"]) for row in db.audit_rows()] == [
+            ("password_reset.request", {"email_sent": True}),
+            ("password_reset.complete", {"sessions_revoked": 1}),
+        ]
+        assert "password_changed_at" not in json.dumps(db.audit, default=str)
+        assert "password_changed_at" not in caplog.text
+        for rendered in (stamp.isoformat(), str(stamp)):
+            assert rendered not in caplog.text

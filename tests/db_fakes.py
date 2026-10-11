@@ -58,11 +58,14 @@ The settings scopes (GH-159, migration 0013):
   0 to 90, default 30), and ``updated_at``. ``add_org_settings`` seeds a row
   (every column a keyword argument) and ``org_settings_row(org_id)`` reads a
   copy back.
-- ``user_settings`` (``user_settings``, keyed by user id): ``user_id``
-  (primary key, references users ON DELETE CASCADE), ``theme`` (NOT NULL,
-  default 'light', one of light / dark / system), ``notifications_enabled``
-  (NOT NULL, default true), ``notifications_task_done`` (GH-35, migration
-  0015: NOT NULL, default false) and ``updated_at``.
+- ``user_settings`` (``user_settings``, keyed by user id), as migration 0033
+  (GH-307) leaves it: ``user_id`` (primary key, references users ON DELETE
+  CASCADE), ``theme`` (NOT NULL, default 'light', one of light / dark /
+  system), ``updated_at``, ``density`` (TEXT NOT NULL, default 'comfortable',
+  CHECK one of comfortable / compact), ``notifications_approvals`` and
+  ``notifications_completed`` (BOOLEAN NOT NULL, default true). Migration 0033
+  dropped ``notifications_enabled`` (0013) and ``notifications_task_done``
+  (GH-35, 0015): a statement naming either fails like any unknown column.
 - Every statement naming one of the three tables runs through the SQL
   reader. Written rows must satisfy the migration: a value of the wrong
   Python type (a non-bool for a BOOLEAN, a non-int for an INTEGER, a non-str
@@ -693,7 +696,7 @@ Organizations and invitations (GH-153):
   schema's rules raise the driver's errors: the case-insensitive unique email
   (UniqueViolationError, whose text repeats the email, as the driver's does),
   the users CHECKs of migration 0004 (for the columns a statement writes;
-  ``users_role_check`` as migration 0033 narrowed it, GH-306: a member's role
+  ``users_role_check`` as migration 0034 narrowed it, GH-306: a member's role
   is org_admin or editor, so 'viewer' is refused by every INSERT, UPDATE and
   ``add_account`` seed) and
   its kind/org_id immutability trigger, the invitations CHECKs of migration
@@ -721,6 +724,15 @@ Organizations and invitations (GH-153):
   END`` as a value (one WHEN branch). A ``fetchval`` users lookup by id that
   selects one column (``SELECT email FROM users WHERE id = $1``) returns that
   column.
+- GH-307: ``users`` gains ``password_changed_at`` (migration 0033: TIMESTAMPTZ,
+  nullable, no default; a non-datetime or naive value is a DataError). Rows
+  from ``add_account`` (``password_changed_at=None`` unless given) and from an
+  INSERT (an invitation) start NULL. Every UPDATE of the password hash runs on
+  the reader like any users UPDATE, so ``password_changed_at = now()`` in its
+  SET stores the statement's clock (``now()`` above) and a form without it
+  (the login rehash, invitation acceptance) leaves the stored value as it is.
+  The profile SELECT (it names ``timezone``) and its ``UPDATE ... RETURNING``
+  return the column like any other.
 - ``after_invitation_lookup`` runs once, right after the first SELECT on
   invitations bound to a token hash (a concurrent accept, revoke, rotation or
   expiry between the lookup and the transaction).
@@ -954,9 +966,12 @@ _USER_COLUMNS: Final = frozenset(
         "created_at",
         "last_login_at",
         "deleted_at",
+        # GH-307: migration 0033's last password change (TIMESTAMPTZ, nullable, no
+        # default: NULL until the first change).
+        "password_changed_at",
     }
 )
-# GH-306 (migration 0033): ``users_role_check`` allows the two member roles; a
+# GH-306 (migration 0034): ``users_role_check`` allows the two member roles; a
 # Super Admin's role is NULL. The Viewer role is retired, so 'viewer' is refused.
 _USER_ROLES: Final = frozenset({"org_admin", "editor"})
 _ORG_COLUMNS: Final = frozenset(
@@ -1080,9 +1095,20 @@ _ORG_SETTINGS_COLUMNS: Final = frozenset(
         "updated_at",
     }
 )
+# GH-307: user_settings after migration 0033 (notifications_enabled and
+# notifications_task_done dropped, density and the two notification types added).
 _USER_SETTINGS_COLUMNS: Final = frozenset(
-    {"user_id", "theme", "notifications_enabled", "notifications_task_done", "updated_at"}
+    {
+        "user_id",
+        "theme",
+        "updated_at",
+        "density",
+        "notifications_approvals",
+        "notifications_completed",
+    }
 )
+# GH-307: the density CHECK of migration 0033.
+DENSITIES: Final = frozenset({"comfortable", "compact"})
 # GH-161: the org-scoped permission matrix (the recreated permissions table).
 _PERMISSIONS_COLUMNS: Final = frozenset({"org_id", "tool", "action", "permission", "updated_at"})
 PERMISSION_STATES: Final = frozenset({"allow", "confirm", "deny"})
@@ -1141,12 +1167,14 @@ _SETTINGS_TYPES: Final[dict[str, dict[str, str]]] = {
         **dict.fromkeys(ORG_POLICY_COLUMNS, "int"),
         "updated_at": "timestamptz",
     },
+    # GH-307: in the migrated table's column order (0013's, then 0033's additions).
     "user_settings": {
         "user_id": "uuid",
         "theme": "text",
-        "notifications_enabled": "bool",
-        "notifications_task_done": "bool",
         "updated_at": "timestamptz",
+        "density": "text",
+        "notifications_approvals": "bool",
+        "notifications_completed": "bool",
     },
     "permissions": {
         "org_id": "uuid",
@@ -1187,6 +1215,10 @@ _SETTINGS_NULLABLE: Final[dict[str, frozenset[str]]] = {
 _OLD_SETTINGS_RE: Final = re.compile(
     r"(?<![\w.])(?:from|into|update|join|table|exists|truncate)\s+(?:only\s+)?"
     r"(?:public\.)?\"?settings\"?(?![\w])"
+)
+# GH-307: the user_settings columns migration 0033 dropped, named anywhere in a statement.
+_DROPPED_USER_SETTINGS_RE: Final = re.compile(
+    r"(?<![\w$])notifications_(?:enabled|task_done)(?![\w$])"
 )
 _AGGREGATE_RE: Final = re.compile(r"(?<![\w.])(?:count|bool_and|bool_or|every|min|max|sum) ?\(")
 
@@ -2215,6 +2247,7 @@ class FakeDb:
         timezone: str | None = None,
         personal_instructions: str = "",
         user_id: uuid.UUID | None = None,
+        password_changed_at: datetime | None = None,
     ) -> uuid.UUID:
         """Add an account and return its id (a plain uuid.UUID).
 
@@ -2228,10 +2261,15 @@ class FakeDb:
         account self-service columns (GH-166, migration 0021). ``user_id``
         (GH-176) gives the account a fixed id (e.g. ``auth_helpers.TEST_MEMBER_ID``)
         instead of a random one; it must not exist yet. A member's ``role`` is
-        'org_admin' or 'editor' (GH-306, migration 0033's ``users_role_check``):
+        'org_admin' or 'editor' (GH-306, migration 0034's ``users_role_check``):
         any other value, 'viewer' included, raises CheckViolationError as the
-        INSERT would.
+        INSERT would. ``password_changed_at`` (GH-307, migration 0033) is the
+        last password change: None (NULL) until the first one, else an aware
+        datetime.
         """
+        assert password_changed_at is None or (
+            isinstance(password_changed_at, datetime) and password_changed_at.tzinfo is not None
+        ), "users.password_changed_at is a TIMESTAMPTZ: None or an aware datetime"
         user_id = uuid.uuid4() if user_id is None else uuid.UUID(int=user_id.int)
         assert user_id not in self.users, f"an account with id {user_id} exists already"
         is_member = kind == "member"
@@ -2257,6 +2295,7 @@ class FakeDb:
             "personal_instructions": personal_instructions,
             "created_at": created_at or datetime.now(UTC) - timedelta(days=1),
             "last_login_at": last_login_at,
+            "password_changed_at": password_changed_at,
         }
         return user_id
 
@@ -2494,17 +2533,19 @@ class FakeDb:
         user_id: uuid.UUID,
         *,
         theme: str = "light",
-        notifications_enabled: bool = True,
-        notifications_task_done: bool = False,
+        density: str = "comfortable",
+        notifications_approvals: bool = True,
+        notifications_completed: bool = True,
         updated_at: datetime | None = None,
     ) -> dict[str, Any]:
-        """Store a user's user_settings row (GH-159, GH-35)."""
+        """Store a user's user_settings row (GH-159; GH-307: migration 0033's columns)."""
         row: dict[str, Any] = {
             "user_id": user_id,
             "theme": theme,
-            "notifications_enabled": notifications_enabled,
-            "notifications_task_done": notifications_task_done,
             "updated_at": updated_at or datetime.now(UTC),
+            "density": density,
+            "notifications_approvals": notifications_approvals,
+            "notifications_completed": notifications_completed,
         }
         self.check_settings("user_settings", row, original=None)
         self.user_settings[user_id] = row
@@ -3056,6 +3097,11 @@ class FakeDb:
         if _OLD_SETTINGS_RE.search(_masked_literals(n)):
             # Migration 0013 dropped the key/value settings table (GH-159).
             raise asyncpg.exceptions.UndefinedTableError('relation "settings" does not exist')
+        if dropped := _DROPPED_USER_SETTINGS_RE.search(_masked_literals(n)):
+            # GH-307: migration 0033 dropped both columns. PostgreSQL refuses the
+            # statement when it is planned, with or without a matching row.
+            msg = f'column "{dropped.group(0)}" does not exist'
+            raise asyncpg.exceptions.UndefinedColumnError(msg)
         if self.fail_sql is not None and re.search(self.fail_sql, n):
             raise asyncpg.exceptions.DeadlockDetectedError("deadlock detected")
         if _AUDIT_REWRITE_RE.search(n) or (n.startswith("truncate") and "audit_events" in n):
@@ -3093,8 +3139,6 @@ class FakeDb:
             return self._consume_token(args)
         if method == "fetchrow" and "password_reset_tokens" in n:
             return self._token_row(args)
-        if n.startswith("update users set password_hash"):
-            return self._set_password(args)
         if n.startswith("insert into sessions"):
             return self._insert_session(method, sql, args)
         if n.startswith("delete from sessions"):
@@ -3204,7 +3248,7 @@ class FakeDb:
     # -- the settings tables of migration 0013 (GH-159) ----------------------------
 
     def settings_defaults(self, table: str, given: dict[str, Any], now: datetime) -> dict[str, Any]:
-        """A new settings row: the column defaults (migrations 0013-0015), then the given values."""
+        """A new settings row: the column defaults (migrations 0013-0033), then the given values."""
         row: dict[str, Any] = dict.fromkeys(_COLUMNS[table])
         if table == "platform_settings":
             row["id"] = True
@@ -3216,7 +3260,13 @@ class FakeDb:
             row["instructions"] = ""
             row.update({column: default for column, (default, _, _) in ORG_POLICY_COLUMNS.items()})
         elif table == "user_settings":
-            row.update(theme="light", notifications_enabled=True, notifications_task_done=False)
+            # GH-307: migration 0033's defaults (density, the two notification types).
+            row.update(
+                theme="light",
+                density="comfortable",
+                notifications_approvals=True,
+                notifications_completed=True,
+            )
         elif table == "oauth_tokens":
             row.update(healthy=True, created_at=now, last_refreshed_at=now)
         elif table == "memory":
@@ -3332,6 +3382,8 @@ class FakeDb:
             )
         elif table == "user_settings":
             rules.append(("theme", row["theme"] in THEMES))
+            # GH-307: user_settings_density_check (migration 0033).
+            rules.append(("density", row["density"] in DENSITIES))
         elif table == "permissions":
             rules.append(("permission", row["permission"] in PERMISSION_STATES))
             rules.append(("tool", IDENTIFIER_RE.fullmatch(row["tool"]) is not None))
@@ -3931,6 +3983,15 @@ class FakeDb:
                 if column in changed and row[column] != original[column]:
                     msg = "users.kind and users.org_id can't change"
                     raise check(msg)
+        changed_at = row.get("password_changed_at")
+        if (
+            "password_changed_at" in changed
+            and changed_at is not None
+            and not (isinstance(changed_at, datetime) and changed_at.tzinfo is not None)
+        ):
+            # GH-307 (migration 0033): a TIMESTAMPTZ; asyncpg's encoder refuses a non-datetime.
+            msg = "invalid input for query argument (password_changed_at): timestamptz expected"
+            raise asyncpg.exceptions.DataError(msg)
         for column in ("email", "kind", "status", "ui_language", "personal_instructions"):
             if column in changed and row.get(column) is None:
                 msg = f'null value in column "{column}" of relation "users"'
@@ -4458,14 +4519,6 @@ class FakeDb:
         if self.after_token_lookup is not None:
             self.after_token_lookup()
         return found
-
-    def _set_password(self, args: tuple[Any, ...]) -> str:
-        new_hash = next(arg for arg in args if isinstance(arg, str))
-        user_id = plain(next(arg for arg in args if isinstance(arg, uuid.UUID)))
-        if user_id not in self.users:
-            return "UPDATE 0"
-        self.users[user_id]["password_hash"] = new_hash
-        return "UPDATE 1"
 
     # -- sessions ----------------------------------------------------------------
 

@@ -7,8 +7,11 @@ at call time, so a missing model fails only its own tests.
 
 What these tests pin down:
 - ``MyAccountResponse`` has exactly ``email``, ``name``, ``ui_language``,
-  ``response_language``, ``timezone`` and ``personal_instructions``: no
-  password, hash, token, id, org id, role or account kind. ``name`` may be
+  ``response_language``, ``timezone``, ``personal_instructions`` and (GH-307)
+  ``password_changed_at``: no password, hash, token, id, org id, role or
+  account kind. ``password_changed_at`` is required and ``datetime | None``
+  (null until the first change); a datetime serializes as an ISO 8601 string
+  with its UTC offset, None as null. ``name`` may be
   null (a Super Admin created without one), ``response_language`` null means
   "the org default", ``timezone`` null means "not preset yet" (consumers use
   Europe/Zurich), ``personal_instructions`` ``""`` means none. ``ui_language``
@@ -53,13 +56,23 @@ from __future__ import annotations
 
 import json
 import zoneinfo
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from pydantic import SecretStr, ValidationError
 
 _RESPONSE_FIELDS = frozenset(
-    {"email", "name", "ui_language", "response_language", "timezone", "personal_instructions"}
+    {
+        "email",
+        "name",
+        "ui_language",
+        "response_language",
+        "timezone",
+        "personal_instructions",
+        # GH-307: the date of the last password change (null until the first one).
+        "password_changed_at",
+    }
 )
 _PATCH_FIELDS = frozenset(
     {"name", "ui_language", "response_language", "timezone", "personal_instructions"}
@@ -136,6 +149,7 @@ def _response_data(**overrides: Any) -> dict[str, Any]:
         "response_language": "it",
         "timezone": "Europe/Zurich",
         "personal_instructions": "I lead the finance team.\nSign off with 'Best, Ada'.",
+        "password_changed_at": None,
         **overrides,
     }
 
@@ -241,6 +255,55 @@ class TestMyAccountResponse:
     def test_account_models_response_rejects_language(self, field: str, value: str) -> None:
         """The UI has no Italian; neither list has Spanish."""
         assert not _accepted(lambda: _response(**{field: value}))
+
+
+# ---------------------------------------------------------------------------
+# 1b. MyAccountResponse.password_changed_at (GH-307)
+# ---------------------------------------------------------------------------
+
+# A stored change date with microseconds, so a lossy serialization shows.
+_CHANGED_AT = datetime(2026, 10, 10, 8, 30, 15, 123456, tzinfo=UTC)
+
+
+class TestMyAccountResponsePasswordChangedAt:
+    """The date of the last password change: required, ``datetime | None``."""
+
+    def test_account_models_response_password_changed_at_is_an_optional_datetime(
+        self,
+    ) -> None:
+        field = _model("MyAccountResponse").model_fields["password_changed_at"]
+
+        assert field.annotation == (datetime | None)
+
+    def test_account_models_response_password_changed_at_is_required(self) -> None:
+        """No default: every response states it, null included."""
+        data = _response_data()
+        del data["password_changed_at"]
+
+        assert not _accepted(lambda: _model("MyAccountResponse").model_validate(data))
+
+    def test_account_models_response_password_changed_at_keeps_the_datetime(self) -> None:
+        assert _response(password_changed_at=_CHANGED_AT).password_changed_at == _CHANGED_AT
+
+    def test_account_models_response_password_changed_at_serializes_as_iso_8601(self) -> None:
+        """A JSON string with its UTC offset, that parses back to the same instant."""
+        dumped = json.loads(_response(password_changed_at=_CHANGED_AT).model_dump_json())
+        value = dumped["password_changed_at"]
+
+        assert isinstance(value, str)
+        parsed = datetime.fromisoformat(value)
+        assert parsed.utcoffset() == timedelta(0)
+        assert parsed == _CHANGED_AT
+
+    def test_account_models_response_password_changed_at_may_be_null(self) -> None:
+        """None = the password was never changed (or not since GH-307)."""
+        response = _response(password_changed_at=None)
+
+        assert response.password_changed_at is None
+        assert json.loads(response.model_dump_json())["password_changed_at"] is None
+
+    def test_account_models_response_password_changed_at_refuses_a_non_date(self) -> None:
+        assert not _accepted(lambda: _response(password_changed_at="last tuesday"))
 
 
 # ---------------------------------------------------------------------------

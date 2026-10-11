@@ -10,9 +10,16 @@ a fast fake.
 What these tests pin down:
 - ``GET /api/me`` → 200 ``MyAccountResponse``: exactly ``email``, ``name``,
   ``ui_language``, ``response_language`` (None: the org default),
-  ``timezone`` (None: not preset yet) and ``personal_instructions`` ('':
-  none), read from the caller's own users row, for every role (the Super
-  Admin included). No id, kind, role, org or hash.
+  ``timezone`` (None: not preset yet), ``personal_instructions`` ('':
+  none) and (GH-307) ``password_changed_at`` (null until the first change,
+  then an ISO 8601 UTC timestamp), read from the caller's own users row, for
+  every role (the Super Admin included). No id, kind, role, org or hash.
+- GH-307 (Decision 4): a successful ``POST /api/me/password`` sets
+  ``password_changed_at`` (the database clock); ``GET /api/me`` and the
+  ``PATCH /api/me`` response show it; a refused change (403, 422, 500) leaves
+  it as it was; another user's value never changes or shows; ``GET
+  /api/auth/me`` doesn't carry it; a PATCH can't set it (422); it reaches no
+  log line and no audit row.
 - ``PATCH /api/me`` (``MyAccountPatch``) → 200 with the stored values: each
   field on its own (the name stripped, the instructions as typed);
   ``response_language: null`` stores NULL, an absent field stays as it was.
@@ -57,6 +64,7 @@ import logging
 import re
 import sys
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final, cast
 from unittest.mock import MagicMock
 
@@ -106,8 +114,19 @@ _CSRF_REFUSED: Final = {"detail": "Cross-origin request refused"}
 _RATE_LIMITED: Final = {"detail": "Rate limit exceeded"}
 
 _ACCOUNT_KEYS: Final = frozenset(
-    {"email", "name", "ui_language", "response_language", "timezone", "personal_instructions"}
+    {
+        "email",
+        "name",
+        "ui_language",
+        "response_language",
+        "timezone",
+        "personal_instructions",
+        # GH-307: the date of the last password change.
+        "password_changed_at",
+    }
 )
+# The columns a body is compared with (password_changed_at: a stored None is the JSON
+# null; a stored date is compared through _parsed_changed_at).
 _ACCOUNT_COLUMNS: Final = (
     "email",
     "name",
@@ -115,6 +134,7 @@ _ACCOUNT_COLUMNS: Final = (
     "response_language",
     "timezone",
     "personal_instructions",
+    "password_changed_at",
 )
 # GET /api/auth/me is unchanged by GH-166 (no timezone, no instructions).
 _AUTH_ME_KEYS: Final = frozenset(
@@ -525,6 +545,7 @@ class TestGetAccount:
             "response_language": None,
             "timezone": None,
             "personal_instructions": "",
+            "password_changed_at": None,
         }
 
     def test_my_account_api_get_super_admin(self, db: FakeDb) -> None:
@@ -543,6 +564,7 @@ class TestGetAccount:
             "response_language": None,
             "timezone": None,
             "personal_instructions": "",
+            "password_changed_at": None,
         }
 
     def test_my_account_api_get_returns_the_stored_values(self, db: FakeDb) -> None:
@@ -569,10 +591,11 @@ class TestGetAccount:
             "response_language": "it",
             "timezone": "America/Argentina/Buenos_Aires",
             "personal_instructions": instructions,
+            "password_changed_at": None,
         }
 
     @pytest.mark.parametrize("who", ["editor", "super_admin"])
-    def test_my_account_api_get_has_exactly_the_six_fields(self, db: FakeDb, who: str) -> None:
+    def test_my_account_api_get_has_exactly_the_seven_fields(self, db: FakeDb, who: str) -> None:
         """No user id, kind, org id, role, status or hash in the body."""
         user_id, token = _signed_in(db, who)
 
@@ -741,7 +764,7 @@ class TestPatchAccount:
         response = _patch(_client(_app()), token, body)
 
         assert response.status_code == 200, response.text
-        expected = {"email": _START["email"], **body}
+        expected = {"email": _START["email"], **body, "password_changed_at": None}
         assert _stored(db, user_id) == expected
         assert response.json() == expected
 
@@ -1469,3 +1492,172 @@ class TestEveryRole:
             "Renamed",
             "Europe/Vienna",
         )
+
+
+# ---------------------------------------------------------------------------
+# 8. password_changed_at (GH-307)
+# ---------------------------------------------------------------------------
+
+# A change stored before the test (with microseconds, so a lossy copy shows).
+_EARLIER_CHANGE: Final = datetime(2026, 3, 4, 5, 6, 7, 890123, tzinfo=UTC)
+
+_REFUSED_CHANGES: Final = [
+    pytest.param("wrong-current-password", 403, id="wrong-current-password-403"),
+    pytest.param("policy", 422, id="policy-422"),
+    pytest.param("audit-failure", 500, id="audit-failure-500"),
+]
+
+
+def _parsed_changed_at(body: dict[str, Any]) -> datetime | None:
+    """A body's password_changed_at: null, or an ISO 8601 string with a UTC offset,
+    parsed to the instant it names."""
+    value = body["password_changed_at"]
+    if value is None:
+        return None
+    assert isinstance(value, str), value
+    parsed = datetime.fromisoformat(value)
+    assert parsed.utcoffset() == timedelta(0), value
+    return parsed
+
+
+class TestPasswordChangedAt:
+    """Set by POST /api/me/password, shown by GET and PATCH /api/me, nothing else."""
+
+    def test_my_account_api_password_change_sets_password_changed_at(self, db: FakeDb) -> None:
+        """204; the stored date is an aware UTC datetime from the clock during the request,
+        and the next GET /api/me (a new session: the change ended them all) shows it."""
+        user_id, token = _signed_in(db)
+        before = datetime.now(UTC)
+
+        response = _change(_client(_app()), token)
+
+        after = datetime.now(UTC)
+        stored = db.users[user_id]["password_changed_at"]
+        read = _get(_client(_app()), db.open_session(user_id))
+        assert response.status_code == 204, response.text
+        assert isinstance(stored, datetime), stored
+        assert stored.utcoffset() == timedelta(0)
+        assert before <= stored <= after
+        assert read.status_code == 200, read.text
+        assert _parsed_changed_at(read.json()) == stored
+
+    def test_my_account_api_patch_response_carries_password_changed_at(self, db: FakeDb) -> None:
+        """The PATCH /api/me response and the next GET show the stored date; a profile
+        change leaves it as it is."""
+        user_id, token = _signed_in(db, **_START, password_changed_at=_EARLIER_CHANGE)
+        client = _client(_app())
+
+        patched = _patch(client, token, {"name": "Lina Muster"})
+        read = _get(client, token)
+
+        assert patched.status_code == 200, patched.text
+        assert _parsed_changed_at(patched.json()) == _EARLIER_CHANGE
+        assert _parsed_changed_at(read.json()) == _EARLIER_CHANGE
+        assert db.users[user_id]["password_changed_at"] == _EARLIER_CHANGE
+
+    @pytest.mark.parametrize(("cause", "status"), _REFUSED_CHANGES)
+    def test_my_account_api_refused_password_change_keeps_password_changed_at(
+        self, db: FakeDb, cause: str, status: int
+    ) -> None:
+        """A wrong current password, a refused new one or a failed audit write: the
+        earlier date stays (stored and on GET /api/me); the next accepted change then
+        moves it (the positive control)."""
+        user_id, token = _signed_in(db, password_changed_at=_EARLIER_CHANGE)
+        client = _client(_app(), raise_server_exceptions=False)
+        db.fail_audit = cause == "audit-failure"
+
+        refused = _change(
+            client,
+            token,
+            current=_WRONG_PASSWORD if cause == "wrong-current-password" else _PASSWORD,
+            new=_TOO_SHORT if cause == "policy" else _NEW_PASSWORD,
+        )
+        db.fail_audit = False
+        kept = db.users[user_id]["password_changed_at"]
+        read = _get(client, token)
+        accepted = _change(client, token)
+
+        assert refused.status_code == status, refused.text
+        assert kept == _EARLIER_CHANGE
+        assert _parsed_changed_at(read.json()) == _EARLIER_CHANGE
+        assert accepted.status_code == 204, accepted.text
+        assert db.users[user_id]["password_changed_at"] > _EARLIER_CHANGE
+
+    def test_my_account_api_password_changed_at_is_the_callers_own(self, db: FakeDb) -> None:
+        """Before the change the caller reads null while a colleague has a date; after it,
+        the colleague's and another org's dates are unchanged and the colleague still
+        reads their own."""
+        user_id, token = _signed_in(db)
+        colleague, colleague_token = _signed_in(
+            db, "org_admin", password_changed_at=_EARLIER_CHANGE
+        )
+        outsider = _account(db, "editor", org_id=OTHER_ORG_ID, password_changed_at=_EARLIER_CHANGE)
+        client = _client(_app())
+
+        own_before = _get(client, token)
+        changed = _change(client, token)
+        theirs = _get(_client(_app()), colleague_token)
+
+        assert own_before.status_code == 200, own_before.text
+        assert own_before.json()["password_changed_at"] is None
+        assert changed.status_code == 204, changed.text
+        assert db.users[user_id]["password_changed_at"] is not None
+        assert [db.users[other]["password_changed_at"] for other in (colleague, outsider)] == [
+            _EARLIER_CHANGE,
+            _EARLIER_CHANGE,
+        ]
+        assert _parsed_changed_at(theirs.json()) == _EARLIER_CHANGE
+
+    def test_my_account_api_auth_me_does_not_carry_password_changed_at(self, db: FakeDb) -> None:
+        """GET /api/auth/me keeps its six keys; GET /api/me is where the date shows."""
+        _, token = _signed_in(db, password_changed_at=_EARLIER_CHANGE)
+        client = _client(_app())
+
+        auth_me = client.get(_AUTH_ME, headers=_cookie(token))
+        me = _get(client, token)
+
+        assert auth_me.status_code == 200, auth_me.text
+        assert set(auth_me.json()) == _AUTH_ME_KEYS
+        assert _parsed_changed_at(me.json()) == _EARLIER_CHANGE
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            pytest.param({"password_changed_at": "2020-01-02T03:04:05Z"}, id="a-date"),
+            pytest.param({"name": "Lina Muster", "password_changed_at": None}, id="null-and-name"),
+        ],
+    )
+    def test_my_account_api_patch_cannot_set_password_changed_at(
+        self, db: FakeDb, body: dict[str, Any]
+    ) -> None:
+        """An unknown field of MyAccountPatch: 422, nothing written, the date unchanged."""
+        user_id, token = _signed_in(db, **_START, password_changed_at=_EARLIER_CHANGE)
+        client = _client(_app())
+
+        response = _patch(client, token, body)
+        read = _get(client, token)
+
+        assert response.status_code == 422, response.text
+        assert db.users[user_id]["name"] == _START["name"]
+        assert db.users[user_id]["password_changed_at"] == _EARLIER_CHANGE
+        assert _parsed_changed_at(read.json()) == _EARLIER_CHANGE
+
+    def test_my_account_api_password_changed_at_reaches_no_log_or_audit_row(
+        self, db: FakeDb, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The password.change metadata stays exactly {"sessions_revoked": n}; no app log
+        record names the column or carries the date."""
+        caplog.set_level(logging.DEBUG)
+        user_id, token = _signed_in(db)
+
+        changed = _change(_client(_app()), token)
+        read = _get(_client(_app()), db.open_session(user_id))
+
+        assert changed.status_code == 204, changed.text
+        assert read.status_code == 200, read.text
+        stamp = db.users[user_id]["password_changed_at"]
+        assert [row["metadata"] for row in db.audit_rows()] == [{"sessions_revoked": 1}]
+        logs = _log_text(caplog)
+        assert "password_changed_at" not in logs
+        for rendered in (stamp.isoformat(), str(stamp), read.json()["password_changed_at"]):
+            assert rendered not in logs

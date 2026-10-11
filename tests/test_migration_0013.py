@@ -26,7 +26,9 @@ What these tests pin down:
 - ``user_settings``: ``user_id UUID PRIMARY KEY REFERENCES users (id) ON
   DELETE CASCADE``; ``theme TEXT NOT NULL DEFAULT 'light'`` limited to the
   ``SettingsAppearance.theme`` values; ``notifications_enabled BOOLEAN NOT NULL
-  DEFAULT true``; ``updated_at``.
+  DEFAULT true``; ``updated_at``. (GH-307: migration 0033 drops
+  notifications_enabled; its model field goes with it, and
+  tests/test_migration_0033.py pins the columns that replace it.)
 - Every existing org and user gets a row with the column defaults only
   (``INSERT INTO org_settings (org_id) SELECT id FROM organizations`` and the
   same for users), and the SQL defaults equal the Pydantic defaults.
@@ -64,6 +66,7 @@ from admino.models import (
     SettingsPatchLLM,
     ToolsSettings,
 )
+from tests.test_migration_0015 import _user_settings_changes_after
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -810,11 +813,16 @@ class TestMigration0013UserSettings:
         assert _in_values("user_settings", "theme") == literal
 
     def test_migration_0013_notifications_enabled_is_required_boolean_default_true(self) -> None:
+        """The SQL default is the model's while the column is shipped (GH-307: once a later
+        migration drops it, the model field goes with it)."""
         definition = _column("user_settings", "notifications_enabled")
 
         assert re.match(r"(?:boolean|bool)\b", _masked(definition)), definition
         assert _is_required(definition), definition
-        assert SettingsNotifications().enabled is True
+        if "notifications_enabled" in _user_settings_changes_after(_VERSION)[1]:
+            assert "enabled" not in SettingsNotifications.model_fields
+        else:
+            assert SettingsNotifications().enabled is True
         assert _default(definition) == "true", definition
 
     def test_migration_0013_user_updated_at(self) -> None:

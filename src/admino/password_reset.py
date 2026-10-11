@@ -26,8 +26,10 @@ email is queued through the outbox (#148) with the link
 ``{public_url}/reset-password#token=<token>``, and ``password_reset.request``
 is recorded. A confirm checks the token and the account again, applies the
 password policy, and then, in one transaction, consumes the token, stores
-the new Argon2 hash, ends every session of the user (deletes its rows,
-``sessions.revoke_user_sessions``) and records ``password_reset.complete``.
+the new Argon2 hash with its change time (``users.password_changed_at``,
+GH-307: the transaction clock), ends every session of the user (deletes its
+rows, ``sessions.revoke_user_sessions``) and records
+``password_reset.complete``.
 
 Security notes:
 - No user enumeration: ``request_reset`` returns None and raises nothing for
@@ -117,7 +119,10 @@ _CONSUME_SQL: Final = """
     WHERE token_hash = $1 AND user_id = $2 AND expires_at > now()
     RETURNING user_id
 """
-_UPDATE_HASH_SQL: Final = "UPDATE users SET password_hash = $1 WHERE id = $2"
+# GH-307: the change time is the transaction clock, stored with the hash.
+_UPDATE_HASH_SQL: Final = (
+    "UPDATE users SET password_hash = $1, password_changed_at = now() WHERE id = $2"
+)
 
 
 class InvalidResetTokenError(Exception):
@@ -245,6 +250,9 @@ async def confirm_reset(
     pool: asyncpg.Pool, *, token: str, new_password: str, ip: str | None
 ) -> None:
     """Set a new password with a reset token, and end every session of the account.
+
+    The new hash and its change time (``password_changed_at``) are stored
+    together, in the transaction that consumes the token.
 
     Args:
         pool: The database pool.

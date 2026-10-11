@@ -20,7 +20,7 @@ Routes:
 - DELETE /api/me/sessions/{session_id} — Ends one of the caller's sessions
   (clears the cookie when it is the current one); audited.
 - GET/PATCH /api/me       — The caller's own name, languages, timezone and
-  personal instructions (every role).
+  personal instructions, and when the password last changed (every role).
 - POST /api/me/password   — Changes the caller's own password, ends every
   session of the caller and clears the cookie; audited.
 - POST /api/org/users/{user_id}/logout — An Org Admin ends every session of a
@@ -157,8 +157,8 @@ Routes:
   account is read again first under the hold: deactivated, removed or an org
   deactivated meanwhile is the 401, a role without ``chat.send`` the 403,
   with nothing run or stored and the confirmation left pending (GH-298).
-- GET/PATCH /api/me/settings — The caller's own theme and notifications (every
-  role).
+- GET/PATCH /api/me/settings — The caller's own appearance (theme, density) and
+  notification types (every role).
 - POST /api/me/settings/reset — Revert the caller's own settings to the
   defaults (every role).
 - GET/PATCH /api/org/settings — The Org Admin's own org's profile,
@@ -2582,6 +2582,9 @@ async def post_org_user_logout(
 
 async def get_my_account(principal: _PrincipalDep) -> MyAccountResponse:
     """Handle GET /api/me — the caller's own profile, languages, timezone and instructions.
+
+    The response also carries ``password_changed_at`` (GH-307): when the
+    password last changed, None until the first change.
 
     Args:
         principal: The logged-in principal (401 without a session).
@@ -6863,7 +6866,7 @@ async def _close_llm_client(client: LLMClient) -> None:
 
 
 async def get_my_settings(principal: _PrincipalDep) -> UserSettingsResponse:
-    """Handle GET /api/me/settings — the caller's own theme and notifications.
+    """Handle GET /api/me/settings — the caller's own appearance and notifications.
 
     Args:
         principal: The logged-in principal (401 without a session).
@@ -6886,7 +6889,7 @@ async def get_my_settings(principal: _PrincipalDep) -> UserSettingsResponse:
 async def patch_my_settings(
     principal: _PrincipalDep, body: UserSettingsPatch
 ) -> UserSettingsResponse:
-    """Handle PATCH /api/me/settings — change the caller's own theme and/or notifications.
+    """Handle PATCH /api/me/settings — change the caller's own appearance and/or notifications.
 
     Args:
         principal: The logged-in principal (401 without a session).
@@ -6910,7 +6913,7 @@ async def patch_my_settings(
 async def reset_my_settings(principal: _PrincipalDep) -> UserSettingsResponse:
     """Handle POST /api/me/settings/reset — revert the caller's own settings (GH-35).
 
-    Only the caller's theme and notifications: never the account (names,
+    Only the caller's appearance and notifications: never the account (names,
     languages), the connected accounts or the org and platform settings.
 
     Args:

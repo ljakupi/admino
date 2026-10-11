@@ -87,13 +87,13 @@ GH-160 (platform defaults) adds, over the same routes:
   next org deletion uses the new grace period.
 - A member role's PATCH of any section is 403 with nothing read or written.
 
-GH-35 (settings page controls) adds, on the user scope:
-- ``notifications.task_done`` (the task-done pings toggle, default off,
-  independent of ``notifications.enabled``) on ``GET`` / ``PATCH
-  /api/me/settings``, stored in ``user_settings.notifications_task_done``. A
-  field not given keeps its stored value; a non-JSON-bool ``task_done`` is a 422
-  at that field, a ``task_done``-only null patch the "nothing given" 422, both
-  without echo.
+GH-35 (settings page controls) adds, on the user scope (GH-307 renames its
+notification fields, below; the tests here follow the new names):
+- a second notification toggle beside the first on ``GET`` / ``PATCH
+  /api/me/settings``, stored in its own ``user_settings`` column, neither a
+  master switch for the other. A field not given keeps its stored value; a
+  non-JSON-bool value is a 422 at that field, a patch whose only values are
+  null the "nothing given" 422, both without echo.
 - ``POST /api/me/settings/reset``: behind a session (401), a per-user rate
   limit (key ``/api/me/settings/reset``, (0.2, 3), 429 before any database
   work), then ``account.manage`` (every role; 403 when ``can`` refuses, nothing
@@ -122,6 +122,24 @@ GH-162 (data residency) adds, on the org scope:
 - The PATCH body can't set residency: a ``data_residency`` key, at the top or
   under ``tools``, is a 422 like any unknown key (no echo, nothing written,
   the org keeps its policy).
+
+GH-307 (account preferences for the new UI) reshapes the user scope:
+- ``appearance`` is ``{theme, density}`` (``density``: ``comfortable`` by
+  default, or ``compact``) and ``notifications`` is ``{approvals, completed}``
+  (both on by default), stored in ``user_settings.density`` /
+  ``notifications_approvals`` / ``notifications_completed``. A user without a
+  row (every role, the Super Admin included) reads light / comfortable / true
+  / true, and the reset answers exactly that.
+- ``notifications.enabled`` and ``notifications.task_done`` are unknown fields
+  now: a PATCH naming either is a 422 ``extra_forbidden`` at that key, like an
+  unknown appearance key or an unknown top-level key, and nothing is stored.
+- A PATCH is partial (a field not given keeps its stored value; the response
+  is the full stored state) and idempotent (the same body twice answers the
+  same 200 body and leaves the same row). A bad ``density`` (not one of the two
+  values) or a non-JSON-bool ``approvals`` / ``completed`` is a 422 at that
+  field without echo, nothing stored.
+- Per user: one user's PATCH or reset never changes another user's row (same
+  org or another), and one user's GET never answers another user's values.
 
 GH-169 widens the org settings response (profile, instructions, security,
 retention and plan beside ``tools`` and ``data_residency``; specified in
@@ -182,10 +200,10 @@ _ORG = "/api/org/settings"
 _PLATFORM = "/api/platform/settings"
 _RESET = "/api/me/settings/reset"
 _RESET_KEY = "/api/me/settings/reset"
-# GH-35: the user scope's defaults (task-done pings start off).
+# GH-307: the user scope's defaults (light, comfortable, both notification types on).
 _ME_DEFAULTS: dict[str, Any] = {
-    "appearance": {"theme": "light"},
-    "notifications": {"enabled": True, "task_done": False},
+    "appearance": {"theme": "light", "density": "comfortable"},
+    "notifications": {"approvals": True, "completed": True},
 }
 _UNAUTHORIZED = {"detail": "Unauthorized"}
 _FORBIDDEN = {"detail": "Forbidden"}
@@ -278,25 +296,42 @@ _LLM_RESPONSE_KEYS = frozenset(
     }
 )
 
-# GH-35: values a strict-bool ``task_done`` refuses (id, value).
-_BAD_TASK_DONE_VALUES: list[tuple[str, Any]] = [
-    ("task-done-marker", "ECHOMARK42"),
-    ("task-done-yes", "yes"),
-    ("task-done-1", 1),
-    ("task-done-0", 0),
-    ("task-done-string-true", "true"),
-    ("task-done-list", [1]),
-    ("task-done-object", {}),
+# GH-35, GH-307: values a strict-bool notification field refuses (id, value).
+_BAD_NOTIFICATION_VALUES: list[tuple[str, Any]] = [
+    ("marker", "ECHOMARK42"),
+    ("yes", "yes"),
+    ("1", 1),
+    ("0", 0),
+    ("string-true", "true"),
+    ("list", [1]),
+    ("empty-list", []),
+    ("object", {}),
 ]
-# GH-35: patches whose only task_done is null give nothing to change.
-_NULL_TASK_DONE_BODIES = [
-    pytest.param({"notifications": {"task_done": None}}, id="null-task-done"),
+# GH-307: the two notification fields.
+_NOTIFICATION_FIELDS = ("approvals", "completed")
+# GH-307: values the density field refuses (id, value).
+_BAD_DENSITY_VALUES: list[tuple[str, Any]] = [
+    ("marker", "ECHOMARK42-density"),
+    ("tiny", "tiny"),
+    ("capitals", "COMPACT"),
+    ("empty", ""),
+    ("1", 1),
+    ("true", True),
+    ("list", ["compact"]),
+]
+# GH-35, GH-307: patches whose only values are null give nothing to change.
+_NULL_NOTIFICATION_BODIES = [
+    pytest.param({"notifications": {"completed": None}}, id="null-completed"),
     pytest.param(
-        {"notifications": {"enabled": None, "task_done": None}}, id="null-enabled-and-task-done"
+        {"notifications": {"approvals": None, "completed": None}}, id="null-approvals-and-completed"
     ),
     pytest.param(
-        {"appearance": None, "notifications": {"task_done": None}},
-        id="null-appearance-and-task-done",
+        {"appearance": None, "notifications": {"completed": None}},
+        id="null-appearance-and-completed",
+    ),
+    pytest.param(
+        {"appearance": {"theme": None, "density": None}, "notifications": {"approvals": None}},
+        id="null-theme-density-and-approvals",
     ),
 ]
 _BAD_ME_BODIES = [
@@ -309,14 +344,14 @@ _BAD_ME_BODIES = [
     ),
     pytest.param({"appearance": {"theme": "dark", "font": "ECHOMARK42"}}, id="extra-nested"),
     pytest.param(
-        {"notifications": {"enabled": True, "email": "ECHOMARK42@example.ch"}},
+        {"notifications": {"approvals": True, "email": "ECHOMARK42@example.ch"}},
         id="extra-nested-notifications",
     ),
-    pytest.param({"notifications": {"enabled": "yes"}}, id="enabled-yes"),
-    pytest.param({"notifications": {"enabled": 1}}, id="enabled-1"),
-    pytest.param({"notifications": {"enabled": 0}}, id="enabled-0"),
-    pytest.param({"notifications": {"enabled": "true"}}, id="enabled-string-true"),
-    pytest.param({"notifications": {"enabled": [1, 2]}}, id="enabled-list"),
+    pytest.param({"notifications": {"approvals": "yes"}}, id="approvals-yes"),
+    pytest.param({"notifications": {"approvals": 1}}, id="approvals-1"),
+    pytest.param({"notifications": {"approvals": 0}}, id="approvals-0"),
+    pytest.param({"notifications": {"approvals": "true"}}, id="approvals-string-true"),
+    pytest.param({"notifications": {"approvals": [1, 2]}}, id="approvals-list"),
     pytest.param({"appearance": {"theme": "ECHOMARK42-blue"}}, id="theme-unknown"),
     pytest.param({"appearance": {"theme": "DARK"}}, id="theme-capitals"),
     pytest.param({"appearance": {"theme": ""}}, id="theme-empty"),
@@ -324,19 +359,19 @@ _BAD_ME_BODIES = [
     pytest.param({}, id="empty-object"),
     pytest.param({"appearance": {}}, id="empty-appearance"),
     pytest.param({"appearance": None}, id="null-appearance"),
-    pytest.param({"notifications": {"enabled": None}}, id="null-enabled"),
+    pytest.param({"notifications": {"approvals": None}}, id="null-approvals"),
     pytest.param({"appearance": {}, "notifications": {}}, id="both-empty"),
     pytest.param([], id="list"),
     pytest.param("ECHOMARK42", id="string"),
     *(
-        pytest.param({"notifications": {"task_done": value}}, id=name)
-        for name, value in _BAD_TASK_DONE_VALUES
+        pytest.param({"notifications": {"completed": value}}, id=f"completed-{name}")
+        for name, value in _BAD_NOTIFICATION_VALUES
     ),
     pytest.param(
-        {"appearance": {"theme": "dark"}, "notifications": {"task_done": "ECHOMARK42"}},
-        id="valid-theme-bad-task-done",
+        {"appearance": {"theme": "dark"}, "notifications": {"completed": "ECHOMARK42"}},
+        id="valid-theme-bad-completed",
     ),
-    *_NULL_TASK_DONE_BODIES,
+    *_NULL_NOTIFICATION_BODIES,
 ]
 _BAD_ORG_BODIES = [
     pytest.param({"tools": {"files": False}}, id="removed-files-tool"),
@@ -1199,12 +1234,12 @@ class TestMySettings:
 
         assert patched.status_code == 200, patched.text
         assert patched.json() == {
-            "appearance": {"theme": "dark"},
-            "notifications": {"enabled": True, "task_done": False},
+            "appearance": {"theme": "dark", "density": "comfortable"},
+            "notifications": {"approvals": True, "completed": True},
         }
         assert read.json() == patched.json()
         row = db.user_settings[user_id]
-        assert (row["theme"], row["notifications_enabled"]) == ("dark", True)
+        assert (row["theme"], row["notifications_approvals"]) == ("dark", True)
 
     def test_settings_api_me_patch_notifications_keeps_the_theme(
         self, db: FakeDb, app: FastAPI
@@ -1213,13 +1248,13 @@ class TestMySettings:
         db.add_user_settings(user_id, theme="system")
 
         response = _call(
-            _client(app), "me_patch", token, body={"notifications": {"enabled": False}}
+            _client(app), "me_patch", token, body={"notifications": {"approvals": False}}
         )
 
         assert response.status_code == 200, response.text
         assert response.json() == {
-            "appearance": {"theme": "system"},
-            "notifications": {"enabled": False, "task_done": False},
+            "appearance": {"theme": "system", "density": "comfortable"},
+            "notifications": {"approvals": False, "completed": True},
         }
 
     def test_settings_api_two_users_keep_different_themes(self, db: FakeDb, app: FastAPI) -> None:
@@ -3021,117 +3056,134 @@ class TestPlatformDefaultsContentFree:
 
 
 # ---------------------------------------------------------------------------
-# 18. GH-35: task-done pings on /api/me/settings
+# 18. GH-35 (GH-307 names): the notification toggles on /api/me/settings
 # ---------------------------------------------------------------------------
 
 
-def _me(theme: str = "light", *, enabled: bool = True, task_done: bool = False) -> dict[str, Any]:
-    """A /api/me/settings response body."""
+def _me(
+    theme: str = "light",
+    *,
+    density: str = "comfortable",
+    approvals: bool = True,
+    completed: bool = True,
+) -> dict[str, Any]:
+    """A /api/me/settings response body (GH-307 shape)."""
     return {
-        "appearance": {"theme": theme},
-        "notifications": {"enabled": enabled, "task_done": task_done},
+        "appearance": {"theme": theme, "density": density},
+        "notifications": {"approvals": approvals, "completed": completed},
     }
 
 
-def _stored(db: FakeDb, user_id: uuid.UUID) -> tuple[str, bool, bool]:
-    """(theme, notifications_enabled, notifications_task_done) of a user's stored row."""
+def _stored(db: FakeDb, user_id: uuid.UUID) -> tuple[str, str, bool, bool]:
+    """(theme, density, notifications_approvals, notifications_completed) of a user's
+    stored row."""
     row = db.user_settings[user_id]
-    return (row["theme"], row["notifications_enabled"], row["notifications_task_done"])
+    return (
+        row["theme"],
+        row["density"],
+        row["notifications_approvals"],
+        row["notifications_completed"],
+    )
 
 
-class TestTaskDonePings:
-    """GH-35: ``notifications.task_done`` (default off) is read, patched on its own and kept
-    by every other patch; it is independent of ``notifications.enabled``."""
+class TestNotificationToggles:
+    """GH-35, renamed by GH-307: ``notifications.completed`` (default on) is read, patched
+    on its own and kept by every other patch; it is independent of
+    ``notifications.approvals``."""
 
-    def test_settings_api_me_get_returns_the_stored_task_done(
+    def test_settings_api_me_get_returns_the_stored_completed(
         self, db: FakeDb, app: FastAPI
     ) -> None:
         user_id, token = _login(db, "editor")
-        db.add_user_settings(user_id, theme="dark", notifications_task_done=True)
+        db.add_user_settings(user_id, theme="dark", notifications_completed=False)
 
         response = _call(_client(app), "me_get", token)
 
         assert response.status_code == 200, response.text
-        assert response.json() == _me("dark", task_done=True)
+        assert response.json() == _me("dark", completed=False)
 
     @pytest.mark.parametrize("role", _ROLES)
-    def test_settings_api_me_patch_task_done_on_is_stored_and_returned(
+    def test_settings_api_me_patch_completed_off_is_stored_and_returned(
         self, db: FakeDb, app: FastAPI, role: str
     ) -> None:
-        """Without a row: task_done on, theme and tool-approval pings keep their defaults."""
+        """Without a row: completed off; theme, density and approvals keep their defaults."""
         user_id, token = _login(db, role)
 
         response = _call(
-            _client(app), "me_patch", token, body={"notifications": {"task_done": True}}
+            _client(app), "me_patch", token, body={"notifications": {"completed": False}}
         )
 
         assert response.status_code == 200, response.text
-        assert response.json() == _me(task_done=True)
-        assert _stored(db, user_id) == ("light", True, True)
+        assert response.json() == _me(completed=False)
+        assert _stored(db, user_id) == ("light", "comfortable", True, False)
 
-    def test_settings_api_me_patch_task_done_keeps_theme_and_enabled(
+    def test_settings_api_me_patch_completed_keeps_theme_density_and_approvals(
         self, db: FakeDb, app: FastAPI
     ) -> None:
         user_id, token = _login(db, "editor")
-        db.add_user_settings(user_id, theme="dark", notifications_enabled=False)
+        db.add_user_settings(
+            user_id, theme="dark", density="compact", notifications_approvals=False
+        )
 
         response = _call(
-            _client(app), "me_patch", token, body={"notifications": {"task_done": True}}
+            _client(app), "me_patch", token, body={"notifications": {"completed": False}}
         )
 
         assert response.status_code == 200, response.text
-        assert response.json() == _me("dark", enabled=False, task_done=True)
-        assert _stored(db, user_id) == ("dark", False, True)
+        assert response.json() == _me("dark", density="compact", approvals=False, completed=False)
+        assert _stored(db, user_id) == ("dark", "compact", False, False)
 
-    def test_settings_api_me_patch_task_done_off_is_stored(self, db: FakeDb, app: FastAPI) -> None:
+    def test_settings_api_me_patch_completed_on_is_stored(self, db: FakeDb, app: FastAPI) -> None:
         user_id, token = _login(db, "editor")
-        db.add_user_settings(user_id, theme="system", notifications_task_done=True)
+        db.add_user_settings(user_id, theme="system", notifications_completed=False)
 
         response = _call(
-            _client(app), "me_patch", token, body={"notifications": {"task_done": False}}
+            _client(app), "me_patch", token, body={"notifications": {"completed": True}}
         )
 
         assert response.status_code == 200, response.text
-        assert response.json() == _me("system", task_done=False)
-        assert _stored(db, user_id) == ("system", True, False)
+        assert response.json() == _me("system", completed=True)
+        assert _stored(db, user_id) == ("system", "comfortable", True, True)
 
-    def test_settings_api_me_task_done_persists_across_a_reload(
+    def test_settings_api_me_completed_persists_across_a_reload(
         self, db: FakeDb, app: FastAPI
     ) -> None:
-        """A later GET from a fresh client (a page reload) still reads task_done on."""
+        """A later GET from a fresh client (a page reload) still reads completed off."""
         _, token = _login(db, "editor")
         patched = _call(
-            _client(app), "me_patch", token, body={"notifications": {"task_done": True}}
+            _client(app), "me_patch", token, body={"notifications": {"completed": False}}
         )
         assert patched.status_code == 200, patched.text
 
         reloaded = _call(_client(app), "me_get", token)
 
         assert reloaded.status_code == 200, reloaded.text
-        assert reloaded.json() == _me(task_done=True)
+        assert reloaded.json() == _me(completed=False)
 
-    def test_settings_api_me_patch_theme_keeps_task_done(self, db: FakeDb, app: FastAPI) -> None:
+    def test_settings_api_me_patch_theme_keeps_completed(self, db: FakeDb, app: FastAPI) -> None:
         user_id, token = _login(db, "editor")
-        db.add_user_settings(user_id, notifications_task_done=True)
+        db.add_user_settings(user_id, notifications_completed=False)
 
         response = _call(_client(app), "me_patch", token, body={"appearance": {"theme": "dark"}})
 
         assert response.status_code == 200, response.text
-        assert response.json() == _me("dark", task_done=True)
-        assert _stored(db, user_id) == ("dark", True, True)
+        assert response.json() == _me("dark", completed=False)
+        assert _stored(db, user_id) == ("dark", "comfortable", True, False)
 
-    def test_settings_api_me_patch_enabled_keeps_task_done(self, db: FakeDb, app: FastAPI) -> None:
-        """Tool-approval pings off is not a master switch: task-done pings stay on."""
+    def test_settings_api_me_patch_approvals_keeps_completed(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """Approval notifications off is not a master switch: completed stays on."""
         user_id, token = _login(db, "editor")
-        db.add_user_settings(user_id, notifications_task_done=True)
+        db.add_user_settings(user_id, notifications_completed=True)
 
         response = _call(
-            _client(app), "me_patch", token, body={"notifications": {"enabled": False}}
+            _client(app), "me_patch", token, body={"notifications": {"approvals": False}}
         )
 
         assert response.status_code == 200, response.text
-        assert response.json() == _me(enabled=False, task_done=True)
-        assert _stored(db, user_id) == ("light", False, True)
+        assert response.json() == _me(approvals=False, completed=True)
+        assert _stored(db, user_id) == ("light", "comfortable", False, True)
 
     def test_settings_api_me_patch_every_field_at_once(self, db: FakeDb, app: FastAPI) -> None:
         user_id, token = _login(db, "org_admin")
@@ -3141,16 +3193,16 @@ class TestTaskDonePings:
             "me_patch",
             token,
             body={
-                "appearance": {"theme": "dark"},
-                "notifications": {"enabled": False, "task_done": True},
+                "appearance": {"theme": "dark", "density": "compact"},
+                "notifications": {"approvals": False, "completed": False},
             },
         )
 
         assert response.status_code == 200, response.text
-        assert response.json() == _me("dark", enabled=False, task_done=True)
-        assert _stored(db, user_id) == ("dark", False, True)
+        assert response.json() == _me("dark", density="compact", approvals=False, completed=False)
+        assert _stored(db, user_id) == ("dark", "compact", False, False)
 
-    def test_settings_api_me_patch_task_done_with_a_null_enabled_is_valid(
+    def test_settings_api_me_patch_completed_with_a_null_approvals_is_valid(
         self, db: FakeDb, app: FastAPI
     ) -> None:
         user_id, token = _login(db, "editor")
@@ -3159,68 +3211,67 @@ class TestTaskDonePings:
             _client(app),
             "me_patch",
             token,
-            body={"notifications": {"enabled": None, "task_done": True}},
+            body={"notifications": {"approvals": None, "completed": False}},
         )
 
         assert response.status_code == 200, response.text
-        assert response.json() == _me(task_done=True)
-        assert _stored(db, user_id) == ("light", True, True)
+        assert response.json() == _me(completed=False)
+        assert _stored(db, user_id) == ("light", "comfortable", True, False)
 
-    def test_settings_api_me_task_done_is_per_user(self, db: FakeDb, app: FastAPI) -> None:
-        """One user's task-done pings never switch another user's on."""
+    def test_settings_api_me_completed_is_per_user(self, db: FakeDb, app: FastAPI) -> None:
+        """One user's completed notifications never switch another user's off."""
         user_a, token_a = _login(db, "editor")
         user_b, token_b = _login(db, "editor")
         client = _client(app)
 
-        patched = _call(client, "me_patch", token_a, body={"notifications": {"task_done": True}})
+        patched = _call(client, "me_patch", token_a, body={"notifications": {"completed": False}})
         other = _call(client, "me_get", token_b)
 
         assert patched.status_code == 200, patched.text
         assert other.json() == _ME_DEFAULTS
-        assert db.user_settings[user_a]["notifications_task_done"] is True
+        assert db.user_settings[user_a]["notifications_completed"] is False
         assert user_b not in db.user_settings
 
-    def test_settings_api_me_patch_task_done_writes_no_audit_row(
+    def test_settings_api_me_patch_completed_writes_no_audit_row(
         self, db: FakeDb, app: FastAPI
     ) -> None:
         _, token = _login(db, "org_admin")
 
         response = _call(
-            _client(app), "me_patch", token, body={"notifications": {"task_done": True}}
+            _client(app), "me_patch", token, body={"notifications": {"completed": False}}
         )
 
         assert response.status_code == 200, response.text
         assert db.audit == []
 
     @pytest.mark.parametrize(
-        "value", [pytest.param(value, id=name) for name, value in _BAD_TASK_DONE_VALUES]
+        "value", [pytest.param(value, id=name) for name, value in _BAD_NOTIFICATION_VALUES]
     )
-    def test_settings_api_me_patch_bad_task_done_is_refused_at_the_field(
-        self, db: FakeDb, app: FastAPI, value: Any
+    @pytest.mark.parametrize("field", _NOTIFICATION_FIELDS)
+    def test_settings_api_me_patch_bad_notification_value_is_refused_at_the_field(
+        self, db: FakeDb, app: FastAPI, field: str, value: Any
     ) -> None:
-        """A known field with a non-JSON-bool value: the 422 points at task_done (not an
+        """A known field with a non-JSON-bool value: the 422 points at that field (not an
         unknown key), never echoes the input, and nothing is written."""
         _, token = _login(db, "editor")
         before = _state(db)
 
-        response = _call(
-            _client(app), "me_patch", token, body={"notifications": {"task_done": value}}
-        )
+        response = _call(_client(app), "me_patch", token, body={"notifications": {field: value}})
 
         assert response.status_code == 422, response.text
         errors = response.json()["detail"]
         assert errors
-        assert all(error["loc"] == ["body", "notifications", "task_done"] for error in errors)
+        assert all(error["loc"] == ["body", "notifications", field] for error in errors)
         assert all(error["type"] != "extra_forbidden" for error in errors), errors
         assert all("input" not in error for error in errors)
         assert "ECHOMARK42" not in response.text
         assert _state(db) == before
 
-    @pytest.mark.parametrize("body", _NULL_TASK_DONE_BODIES)
-    def test_settings_api_me_patch_null_task_done_gives_nothing_to_change(
+    @pytest.mark.parametrize("body", _NULL_NOTIFICATION_BODIES)
+    def test_settings_api_me_patch_null_values_give_nothing_to_change(
         self, db: FakeDb, app: FastAPI, body: dict[str, Any]
     ) -> None:
-        """A patch whose only task_done is null is the "nothing given" 422 on the body.
+        """A patch whose only values are null is the "nothing given" 422 on the body.
 
         GH-304 (Decision 5): the validator's own fixed text ("Give at least one setting
         to change.") is the ``msg`` of its ``value_error`` on ``["body"]`` again (GH-302
@@ -3254,7 +3305,11 @@ def _reset(client: TestClient, token: str | None, **headers: str) -> httpx.Respo
 def _customized(db: FakeDb, user_id: uuid.UUID) -> None:
     """A stored row that differs from the defaults in every column."""
     db.add_user_settings(
-        user_id, theme="dark", notifications_enabled=False, notifications_task_done=True
+        user_id,
+        theme="dark",
+        density="compact",
+        notifications_approvals=False,
+        notifications_completed=False,
     )
 
 
@@ -3262,7 +3317,7 @@ def _assert_reset_row(db: FakeDb, user_id: uuid.UUID) -> None:
     """The caller's row is gone, or holds exactly the column defaults."""
     row = db.user_settings.get(user_id)
     if row is not None:
-        assert _stored(db, user_id) == ("light", True, False), row
+        assert _stored(db, user_id) == ("light", "comfortable", True, True), row
 
 
 def _user_settings_calls(db: FakeDb, since: int) -> list[str]:
@@ -3321,7 +3376,7 @@ class TestResetMySettings:
         user_id, token = _login(db, role)
         _customized(db, user_id)
         assert _call(_client(app), "me_get", token).json() == _me(
-            "dark", enabled=False, task_done=True
+            "dark", density="compact", approvals=False, completed=False
         )
 
         reset = _reset(_client(app), token)
@@ -3341,11 +3396,11 @@ class TestResetMySettings:
         db.users[user_id]["response_language"] = "en"
         _customized(db, user_id)
         peer = db.add_account(role="editor")
-        db.add_user_settings(peer, theme="system", notifications_task_done=True)
+        db.add_user_settings(peer, theme="system", notifications_completed=False)
         stranger = db.add_account(role="org_admin", org_id=OTHER_ORG_ID)
-        db.add_user_settings(stranger, theme="dark", notifications_enabled=False)
+        db.add_user_settings(stranger, theme="dark", notifications_approvals=False)
         root = db.add_account(kind="super_admin", role=None)
-        db.add_user_settings(root, notifications_task_done=True)
+        db.add_user_settings(root, density="compact")
         db.add_org_settings(ORG_ID, gmail=False)
         db.add_org_settings(OTHER_ORG_ID, outlook=False)
         expected = _state(db)
@@ -3474,7 +3529,7 @@ class TestResetMySettings:
         assert allowed == [200] * burst
         assert (limited.status_code, limited.json()) == (429, _RATE_LIMITED)
         assert statements == []
-        assert _stored(db, user_a) == ("dark", False, True)
+        assert _stored(db, user_a) == ("dark", "compact", False, False)
         assert other.status_code == 200, other.text
         _assert_reset_row(db, user_b)
         assert (_RESET_KEY, f"user:{user_a}") in server._rate_buckets
@@ -3512,3 +3567,316 @@ class TestResetMySettings:
         assert reset.status_code == 200, reset.text
         assert again.status_code == 200, again.text
         assert "zephyrmarker" not in _log_text(caplog).lower()
+
+
+# ---------------------------------------------------------------------------
+# 20. GH-307: account preferences (density, approvals, completed) on /api/me/settings
+# ---------------------------------------------------------------------------
+
+# Every column of this stored row differs from the defaults, so a patch that writes a
+# default into a field it was not given shows up.
+_CUSTOM_ROW: dict[str, Any] = {
+    "theme": "dark",
+    "density": "compact",
+    "notifications_approvals": False,
+    "notifications_completed": False,
+}
+# (body, the stored (theme, density, approvals, completed) afterwards), from _CUSTOM_ROW.
+_PARTIAL_PATCHES = [
+    pytest.param(
+        {"appearance": {"density": "comfortable"}},
+        ("dark", "comfortable", False, False),
+        id="density-alone",
+    ),
+    pytest.param(
+        {"notifications": {"approvals": True}},
+        ("dark", "compact", True, False),
+        id="approvals-alone",
+    ),
+    pytest.param(
+        {"notifications": {"completed": True}},
+        ("dark", "compact", False, True),
+        id="completed-alone",
+    ),
+    pytest.param(
+        {"appearance": {"density": "comfortable"}, "notifications": {"completed": True}},
+        ("dark", "comfortable", False, True),
+        id="density-and-completed",
+    ),
+    pytest.param(
+        {"appearance": {"theme": "system"}, "notifications": {"approvals": True}},
+        ("system", "compact", True, False),
+        id="theme-and-approvals",
+    ),
+]
+# (body, the stored (theme, density, approvals, completed) after it, without a row before)
+_IDEMPOTENT_PATCHES = [
+    pytest.param(
+        {
+            "appearance": {"theme": "dark", "density": "compact"},
+            "notifications": {"approvals": False, "completed": False},
+        },
+        ("dark", "compact", False, False),
+        id="every-field",
+    ),
+    pytest.param(
+        {"appearance": {"density": "compact"}},
+        ("light", "compact", True, True),
+        id="density-alone",
+    ),
+]
+# (body, the loc of its one extra_forbidden error)
+_UNKNOWN_FIELD_PATCHES = [
+    pytest.param(
+        {"notifications": {"enabled": False}},
+        ["body", "notifications", "enabled"],
+        id="old-enabled",
+    ),
+    pytest.param(
+        {"notifications": {"task_done": True}},
+        ["body", "notifications", "task_done"],
+        id="old-task-done",
+    ),
+    pytest.param(
+        {"notifications": {"approvals": False, "enabled": False}},
+        ["body", "notifications", "enabled"],
+        id="old-enabled-beside-approvals",
+    ),
+    pytest.param(
+        {"notifications": {"completed": False, "task_done": "ECHOMARK42-pings"}},
+        ["body", "notifications", "task_done"],
+        id="old-task-done-beside-completed",
+    ),
+    pytest.param(
+        {"appearance": {"density": "compact", "font_size": "ECHOMARK42-large"}},
+        ["body", "appearance", "font_size"],
+        id="unknown-appearance-key",
+    ),
+    pytest.param(
+        {"appearance": {"density": "compact"}, "sidebar": "ECHOMARK42-wide"},
+        ["body", "sidebar"],
+        id="unknown-top-level-key",
+    ),
+]
+_OTHER_USERS = [
+    pytest.param("editor", ORG_ID, id="same-org"),
+    pytest.param("editor", OTHER_ORG_ID, id="other-org"),
+    pytest.param("super_admin", ORG_ID, id="super-admin"),
+]
+
+
+def _settings_row(db: FakeDb, user_id: uuid.UUID) -> dict[str, Any]:
+    """A copy of a user's stored user_settings row without ``updated_at``."""
+    row = db.user_settings[user_id]
+    return {key: value for key, value in copy.deepcopy(row).items() if key != "updated_at"}
+
+
+def _assert_envelope(response: httpx.Response, body: Any) -> list[dict[str, Any]]:
+    """A 422 in the validation envelope (``loc`` / ``msg`` / ``type`` per error, no
+    input) that repeats no marker of the body; returns its errors."""
+    assert response.status_code == 422, response.text
+    errors = response.json()["detail"]
+    assert errors
+    assert all(set(error) == {"loc", "msg", "type"} for error in errors), errors
+    for marker in _echo_markers(body):
+        assert marker not in response.text, marker
+    return errors
+
+
+class TestAccountPreferences:
+    """GH-307: ``appearance`` is ``{theme, density}``, ``notifications`` is ``{approvals,
+    completed}``; partial and idempotent PATCH; the reset answers the new defaults; the
+    old ``enabled`` / ``task_done`` keys are unknown fields; each user's own row only."""
+
+    @pytest.mark.parametrize("role", _ROLES)
+    def test_settings_api_me_get_defaults_for_every_role(
+        self, db: FakeDb, app: FastAPI, role: str
+    ) -> None:
+        """No row: light, comfortable, approvals on, completed on (the Super Admin too)."""
+        _, token = _login(db, role)
+
+        response = _call(_client(app), "me_get", token)
+
+        assert (response.status_code, response.json()) == (200, _ME_DEFAULTS)
+
+    def test_settings_api_me_get_returns_every_stored_value(self, db: FakeDb, app: FastAPI) -> None:
+        user_id, token = _login(db, "editor")
+        db.add_user_settings(user_id, **_CUSTOM_ROW)
+
+        response = _call(_client(app), "me_get", token)
+
+        assert (response.status_code, response.json()) == (
+            200,
+            _me("dark", density="compact", approvals=False, completed=False),
+        )
+
+    @pytest.mark.parametrize(("body", "expected"), _PARTIAL_PATCHES)
+    def test_settings_api_me_patch_changes_only_the_given_fields(
+        self,
+        db: FakeDb,
+        app: FastAPI,
+        body: dict[str, Any],
+        expected: tuple[str, str, bool, bool],
+    ) -> None:
+        """Every field not given keeps its stored value; the response is the full stored
+        state, and a later GET reads the same."""
+        user_id, token = _login(db, "editor")
+        db.add_user_settings(user_id, **_CUSTOM_ROW)
+        client = _client(app)
+        theme, density, approvals, completed = expected
+
+        patched = _call(client, "me_patch", token, body=body)
+        read = _call(client, "me_get", token)
+
+        assert patched.status_code == 200, patched.text
+        assert patched.json() == _me(
+            theme, density=density, approvals=approvals, completed=completed
+        )
+        assert _stored(db, user_id) == expected
+        assert read.json() == patched.json()
+
+    @pytest.mark.parametrize("role", _ROLES)
+    def test_settings_api_me_patch_density_without_a_row_keeps_the_other_defaults(
+        self, db: FakeDb, app: FastAPI, role: str
+    ) -> None:
+        user_id, token = _login(db, role)
+
+        response = _call(
+            _client(app), "me_patch", token, body={"appearance": {"density": "compact"}}
+        )
+
+        assert (response.status_code, response.json()) == (200, _me(density="compact"))
+        assert _stored(db, user_id) == ("light", "compact", True, True)
+
+    @pytest.mark.parametrize(("body", "expected"), _IDEMPOTENT_PATCHES)
+    def test_settings_api_me_patch_twice_is_idempotent(
+        self,
+        db: FakeDb,
+        app: FastAPI,
+        body: dict[str, Any],
+        expected: tuple[str, str, bool, bool],
+    ) -> None:
+        """The same body twice: the same 200 body (the full stored state) and the same
+        stored row."""
+        user_id, token = _login(db, "editor")
+        client = _client(app)
+        theme, density, approvals, completed = expected
+
+        first = _call(client, "me_patch", token, body=body)
+        stored_first = _settings_row(db, user_id)
+        second = _call(client, "me_patch", token, body=body)
+
+        assert (first.status_code, second.status_code) == (200, 200), second.text
+        assert first.json() == _me(theme, density=density, approvals=approvals, completed=completed)
+        assert second.json() == first.json()
+        assert _stored(db, user_id) == expected
+        assert _settings_row(db, user_id) == stored_first
+
+    def test_settings_api_reset_after_patches_restores_the_new_defaults(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """Every field changed through the API, then the reset: the answer and the next
+        GET are light / comfortable / approvals on / completed on."""
+        user_id, token = _login(db, "editor")
+        client = _client(app)
+        changed = _call(
+            client,
+            "me_patch",
+            token,
+            body={
+                "appearance": {"theme": "system", "density": "compact"},
+                "notifications": {"approvals": False, "completed": False},
+            },
+        )
+        assert changed.json() == _me(
+            "system", density="compact", approvals=False, completed=False
+        ), changed.text
+
+        reset = _reset(client, token)
+        reloaded = _call(client, "me_get", token)
+
+        assert (reset.status_code, reset.json()) == (200, _ME_DEFAULTS)
+        assert (reloaded.status_code, reloaded.json()) == (200, _ME_DEFAULTS)
+        _assert_reset_row(db, user_id)
+
+    @pytest.mark.parametrize(("body", "loc"), _UNKNOWN_FIELD_PATCHES)
+    def test_settings_api_me_patch_unknown_field_is_422_at_that_key(
+        self, db: FakeDb, app: FastAPI, body: dict[str, Any], loc: list[str]
+    ) -> None:
+        """The removed ``enabled`` / ``task_done`` keys are unknown fields like any other:
+        one ``extra_forbidden`` error at that key, no echo, the stored row unchanged."""
+        user_id, token = _login(db, "editor")
+        db.add_user_settings(user_id, theme="system")
+        before = _state(db)
+
+        response = _call(_client(app), "me_patch", token, body=body)
+
+        errors = _assert_envelope(response, body)
+        assert [(error["loc"], error["type"]) for error in errors] == [(loc, "extra_forbidden")]
+        assert _state(db) == before
+
+    @pytest.mark.parametrize(
+        "value", [pytest.param(value, id=name) for name, value in _BAD_DENSITY_VALUES]
+    )
+    def test_settings_api_me_patch_bad_density_is_refused_at_the_field(
+        self, db: FakeDb, app: FastAPI, value: Any
+    ) -> None:
+        """Not one of comfortable / compact: the 422 points at density (not an unknown
+        key), never echoes the input, and nothing is stored."""
+        user_id, token = _login(db, "editor")
+        db.add_user_settings(user_id, theme="system")
+        before = _state(db)
+        body = {"appearance": {"density": value}}
+
+        response = _call(_client(app), "me_patch", token, body=body)
+
+        errors = _assert_envelope(response, body)
+        assert all(error["loc"] == ["body", "appearance", "density"] for error in errors), errors
+        assert all(error["type"] != "extra_forbidden" for error in errors), errors
+        assert _state(db) == before
+
+    @pytest.mark.parametrize(("role", "org_id"), _OTHER_USERS)
+    def test_settings_api_me_settings_are_per_user(
+        self, db: FakeDb, app: FastAPI, role: str, org_id: uuid.UUID
+    ) -> None:
+        """User B (same org, another org or the Super Admin) has a custom row and reads it
+        first. User A's GET answers A's defaults, A's PATCH answers A's own state, A's
+        reset and the next GET answer the defaults; B's row and B's GET are unchanged
+        throughout."""
+        user_b, token_b = _login(db, role, org_id)
+        db.add_user_settings(
+            user_b,
+            theme="system",
+            density="compact",
+            notifications_approvals=False,
+            notifications_completed=False,
+        )
+        b_row = _settings_row(db, user_b)
+        b_values = _me("system", density="compact", approvals=False, completed=False)
+        _, token_a = _login(db, "editor")
+        client = _client(app)
+
+        b_first = _call(client, "me_get", token_b)
+        a_read = _call(client, "me_get", token_a)
+        a_patch = _call(
+            client,
+            "me_patch",
+            token_a,
+            body={"appearance": {"density": "compact"}, "notifications": {"approvals": False}},
+        )
+        b_after_patch = _settings_row(db, user_b)
+        a_reset = _reset(client, token_a)
+        a_after_reset = _call(client, "me_get", token_a)
+        b_last = _call(client, "me_get", token_b)
+
+        assert (b_first.status_code, b_first.json()) == (200, b_values)
+        assert (a_read.status_code, a_read.json()) == (200, _ME_DEFAULTS)
+        assert (a_patch.status_code, a_patch.json()) == (
+            200,
+            _me(density="compact", approvals=False),
+        )
+        assert (a_reset.status_code, a_reset.json()) == (200, _ME_DEFAULTS)
+        assert a_after_reset.json() == _ME_DEFAULTS
+        assert b_after_patch == b_row
+        assert _settings_row(db, user_b) == b_row
+        assert b_last.json() == b_values

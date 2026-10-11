@@ -27,6 +27,10 @@ What these tests pin down:
   before any database call, and validate their bodies (422) without echoing
   input.
 - No email, token, password or link in any log line, audit row or response.
+- GH-307: a completed confirm sets the account's ``password_changed_at``
+  (``GET /api/me`` then shows it as an ISO 8601 UTC timestamp); an unusable
+  link (400), a refused new password (422) and a failed audit write (500)
+  leave it as it was.
 
 All database calls are faked. No network, no real PostgreSQL, no SMTP.
 
@@ -1153,3 +1157,87 @@ class TestNoContentLeak:
         assert token.casefold() not in rendered
         assert _NEW_PASSWORD.casefold() not in rendered
         assert re.search(r"reset-password", rendered) is None
+
+
+# ---------------------------------------------------------------------------
+# 9. password_changed_at (GH-307)
+# ---------------------------------------------------------------------------
+
+# A change stored before the test (with microseconds, so a lossy copy shows).
+_EARLIER_CHANGE = datetime(2026, 3, 4, 5, 6, 7, 890123, tzinfo=UTC)
+
+_REFUSED_CONFIRMS: list[Any] = [
+    pytest.param("unknown-token", 400, id="unknown-token-400"),
+    pytest.param("expired", 400, id="expired-400"),
+    pytest.param("superseded", 400, id="superseded-400"),
+    pytest.param("account-deactivated", 400, id="account-deactivated-400"),
+    pytest.param("policy", 422, id="policy-422"),
+    pytest.param("audit-failure", 500, id="audit-failure-500"),
+]
+
+
+def _me_changed_at(app: FastAPI, db: FakeDb, user_id: uuid.UUID) -> datetime | None:
+    """GET /api/me with a fresh session of the account (a reset ends them all): its
+    password_changed_at, null or an ISO 8601 string with a UTC offset, parsed."""
+    response = _client(app).get("/api/me", headers=_cookie(db.open_session(user_id)))
+    assert response.status_code == 200, response.text
+    value = response.json()["password_changed_at"]
+    if value is None:
+        return None
+    assert isinstance(value, str), value
+    parsed = datetime.fromisoformat(value)
+    assert parsed.utcoffset() == timedelta(0), value
+    return parsed
+
+
+class TestPasswordChangedAt:
+    """A completed reset sets password_changed_at; a refused one leaves it."""
+
+    def test_password_reset_api_confirm_sets_password_changed_at(self, db: FakeDb) -> None:
+        """204; the stored date is an aware UTC datetime from the clock during the confirm,
+        and GET /api/me shows it."""
+        user_id = db.add_account(email=_EMAIL)
+        app = _app()
+        token = _issue(db, app)
+        before = datetime.now(UTC)
+
+        response = _confirm(_client(app), token)
+
+        after = datetime.now(UTC)
+        stored = db.users[user_id]["password_changed_at"]
+        assert response.status_code == 204, response.text
+        assert isinstance(stored, datetime), stored
+        assert stored.utcoffset() == timedelta(0)
+        assert before <= stored <= after
+        assert _me_changed_at(app, db, user_id) == stored
+
+    @pytest.mark.parametrize(("cause", "status"), _REFUSED_CONFIRMS)
+    def test_password_reset_api_refused_confirm_keeps_password_changed_at(
+        self, db: FakeDb, cause: str, status: int
+    ) -> None:
+        """The earlier date stays (stored and on GET /api/me); a fresh link then completes
+        and moves it (the positive control)."""
+        user_id = db.add_account(email=_EMAIL, password_changed_at=_EARLIER_CHANGE)
+        app = _app()
+        client = _client(app, raise_server_exceptions=False)
+        token = _WELL_FORMED_UNKNOWN if cause == "unknown-token" else _issue(db, app)
+        if cause == "expired":
+            db.tokens[user_id]["expires_at"] = datetime.now(UTC) - timedelta(seconds=1)
+        elif cause == "superseded":
+            _issue(db, app)
+        elif cause == "account-deactivated":
+            db.users[user_id]["status"] = "deactivated"
+        db.fail_audit = cause == "audit-failure"
+
+        refused = _confirm(client, token, "Kq7#vX9!pL2" if cause == "policy" else _NEW_PASSWORD)
+
+        db.fail_audit = False
+        db.users[user_id]["status"] = "active"
+        kept = db.users[user_id]["password_changed_at"]
+        shown = _me_changed_at(app, db, user_id)
+        accepted = _confirm(client, _issue(db, app), _OTHER_PASSWORD)
+        assert refused.status_code == status, refused.text
+        assert kept == _EARLIER_CHANGE
+        assert shown == _EARLIER_CHANGE
+        assert accepted.status_code == 204, accepted.text
+        assert db.users[user_id]["password_changed_at"] > _EARLIER_CHANGE

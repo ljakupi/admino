@@ -269,17 +269,20 @@ Settings have three scopes. Each has an owner and its own route; any other role 
 
 | Scope | Who changes it | Route | What it holds |
 | --- | --- | --- | --- |
-| **Mine** | every account | `GET` / `PATCH /api/me/settings`, `POST /api/me/settings/reset` | Theme, tool-approval pings and task-done pings. The **Settings** page shows these next to **My account**. |
+| **Mine** | every account | `GET` / `PATCH /api/me/settings`, `POST /api/me/settings/reset` | The appearance: theme (`appearance.theme`: `light`, `dark` or `system`) and density (`appearance.density`: `comfortable` or `compact`). What the notification center shows: actions waiting for your decision (`notifications.approvals`) and finished tasks and routine runs (`notifications.completed`), each on or off. The **Settings** page shows these next to **My account**. |
 | **Organization** | Org Admin | `GET` / `PATCH /api/org/settings` | The organization's profile (name, default response language), instructions, session policy, trash retention, and which tool services the agent may use: Gmail, Google Calendar, Google Drive, Outlook, Outlook Calendar, OneDrive and memory. Org Admins edit them under **Organization → Settings** (see [Organization settings](#organization-settings)). The response also carries the organization's data residency policy (`data_residency`) and plan (`plan.seats`, `plan.storage_quota`), both read-only here. |
 | **Platform** | Super Admin | `GET` / `PATCH /api/platform/settings` | The LLM provider, a model per provider, the active model's capabilities and the LLM retry limit, the platform limits, and the [platform defaults](#platform-defaults): file limits, retention, and security. The Super Admin edits them under **Platform → Defaults**. The response also carries the number of organizations with data residency on (`llm.residency_orgs`, read-only). |
 
 - The UI and response languages, the timezone and the personal instructions belong to your
   account, not to these settings (see **My account** under
   [Accounts and sessions](#accounts-and-sessions)).
+- `PATCH /api/me/settings` changes only the fields you give, and needs at least one. Any
+  other key, a value of the wrong type (such as `"true"` for `true`) and the old
+  `notifications.enabled` and `notifications.task_done` keys answer `422`.
 - `POST /api/me/settings/reset` resets only your own settings to the defaults: light theme,
-  tool-approval pings on, task-done pings off. Your connected accounts, your account (name,
-  languages, timezone, personal instructions), and the organization and platform settings,
-  stay as they are.
+  comfortable density, approvals on, completed on. Your connected accounts, your account
+  (name, languages, timezone, personal instructions), and the organization and platform
+  settings, stay as they are.
 - Organization and platform changes are recorded in the audit log: which fields changed,
   a tool's old and new on/off state, and a number's old and new value. An `llm`
   change records only which fields changed: the provider, model names, capabilities and
@@ -292,9 +295,14 @@ Settings have three scopes. Each has an owner and its own route; any other role 
   Their stored switches are kept for when residency is off.
 - The tool permission matrix and critical promotions are per organization too. See
   [Permissions → Per organization](permissions.md#per-organization).
-- Upgrading from a version with the single `settings` table drops it: everyone starts from
-  the defaults (light theme, tool-approval pings on, task-done pings off, every tool
-  service on), and the platform settings start from `config.yaml`.
+- Upgrading from a version with the single `settings` table drops it: everyone starts with
+  a light theme, comfortable density, approvals on, completed off and every tool service
+  on, and the platform settings start from `config.yaml`.
+- Upgrading from a version with the tool-approval and task-done pings keeps each user's
+  theme, and each saved task-done choice becomes their completed setting, on or off as it
+  was (without saved settings, the new defaults apply). Approvals start on for everyone,
+  whatever their tool-approval pings were, and density starts comfortable. Every
+  account's `password_changed_at` (see **My account** below) starts empty (`null`).
 
 ### Organization settings
 
@@ -584,6 +592,11 @@ any of its fields; both only ever reach your own account.
   recorded in the audit log as `password.change`, with the number of sessions that ended.
   A wrong current password answers `403` and counts toward the brute-force protection
   above like a failed login; while the account is locked, even the right one is refused.
+- **Password changed** (`password_changed_at`, read-only): when your password last
+  changed, an ISO 8601 timestamp in UTC, in `GET /api/me` and the `PATCH /api/me`
+  response. It's `null` until the first change. Changing your password with
+  `POST /api/me/password`, or completing a password reset, sets it; accepting an
+  invitation doesn't, and a refused change leaves it as it was.
 - **Sessions**: the page lists your sessions (browser or agent, IP address, last used)
   and lets you end any of them, as described under **Your sessions** above.
 

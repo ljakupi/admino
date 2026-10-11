@@ -40,6 +40,8 @@ What these tests pin down:
   (``/api/auth/invitations/get``, ``/accept``); one caller never throttles
   another. Cross-origin writes are refused (403) before any database call.
 - No email, name, password, token or link in any log line or audit row.
+- GH-307: accepting sets the first password but not ``password_changed_at``,
+  which stays null (``GET /api/me`` shows null with the new cookie).
 
 All database calls are faked. No network, no real PostgreSQL, no SMTP.
 
@@ -1410,6 +1412,33 @@ class TestAcceptRoute:
             "org_admin",
         )
         assert body["ui_language"] == "fr"
+
+    def test_invitations_api_accept_leaves_password_changed_at_null(self, db: FakeDb) -> None:
+        """GH-307 (decision 4): accepting sets the first password, which is not a change:
+        the stored password_changed_at stays null and GET /api/me with the new cookie
+        shows null; the member's later POST /api/me/password sets it (the positive
+        control)."""
+        _, session = _admin(db)
+        client = _client(_app())
+        _, token = _invite(db, client, session)
+        cookie, _ = _session_set_cookie(_accept(client, token))
+        client.cookies.clear()
+
+        me = client.get("/api/me", headers=_cookie(cookie))
+        row = db.user_by_email(_EMAIL)
+        stored = None if row is None else row["password_changed_at"]
+        changed = client.post(
+            "/api/me/password",
+            json={"current_password": _PASSWORD, "new_password": _OTHER_PASSWORD},
+            headers=_cookie(cookie),
+        )
+
+        assert me.status_code == 200, me.text
+        assert row is not None
+        assert stored is None
+        assert me.json()["password_changed_at"] is None
+        assert changed.status_code == 204, changed.text
+        assert db.users[_invited_id(db)]["password_changed_at"] is not None
 
     def test_invitations_api_accept_uses_the_org_session_policy(self, db: FakeDb) -> None:
         """GH-169: the invited org's stored policy (its org_settings row: 20 minutes / 2

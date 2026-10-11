@@ -1,4 +1,4 @@
--- 0033_retire_viewer_role.sql
+-- 0034_retire_viewer_role.sql
 -- Retire the Viewer role (GH-306).
 --
 -- The platform has three roles: the Super Admin, Org Admins and Editors. No

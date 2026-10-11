@@ -15,6 +15,10 @@ What these tests pin down:
   (``False``: #28 asks the browser for permission when the toggle is switched
   on, so it can't start on), and the FakeDb (``tests/db_fakes.py``) mirrors the
   column: name, ``bool`` type, NOT NULL and the ``False`` default of a new row.
+  GH-307: the model and the FakeDb follow the latest schema, and migration 0033
+  drops the column (its values move to ``notifications_completed``), so these
+  mirror checks read the later shipped migrations: a dropped column has no model
+  field and no FakeDb column (tests/test_migration_0033.py pins what replaces it).
 - Nothing else: only ``user_settings`` is altered and only by adding that one
   column; no DROP, no UPDATE / DELETE / TRUNCATE / MERGE, no INSERT / COPY, no
   table, index, function, trigger, view, type or DO block, no GRANT / REVOKE,
@@ -55,6 +59,8 @@ _COLUMNS_0013 = frozenset({"user_id", "theme", "notifications_enabled", "updated
 _SQL_BOOLS: dict[str, bool] = {"true": True, "false": False}
 _BOOLEAN = r"(?:boolean|bool)\b"
 _ALTER_RE = re.compile(r"alter\s+table\s+(?:if\s+exists\s+)?(?:only\s+)?(\w+)\s+(.*)", re.DOTALL)
+# GH-307: a DROP [COLUMN] [IF EXISTS] action of a later migration (not a constraint).
+_DROP_COLUMN_RE = re.compile(r'drop\s+(?:column\s+)?(?!constraint\b)(?:if\s+exists\s+)?"?(\w+)"?')
 
 
 # ---------------------------------------------------------------------------
@@ -67,12 +73,16 @@ def _migration_path() -> Path:
 
 
 def _migration_sql() -> str:
-    """The shipped migration, normalized outside literals only.
+    """The shipped migration, normalized outside literals only."""
+    return _normalized(_migration_path().read_text(encoding="utf-8"))
+
+
+def _normalized(raw: str) -> str:
+    """A migration's SQL, normalized outside literals only.
 
     ``--`` comments are blanked, whitespace is collapsed and keywords are
     lowercased; the contents of '...' and "..." are kept byte for byte.
     """
-    raw = _migration_path().read_text(encoding="utf-8")
     out: list[str] = []
     quote = ""
     index = 0
@@ -136,14 +146,15 @@ def _split(text: str, separator: str) -> list[str]:
     return [item for item in items if item]
 
 
-def _statements() -> list[str]:
-    return _split(_migration_sql(), ";")
+def _statements(sql: str | None = None) -> list[str]:
+    """The statements of a normalized SQL text (this migration's by default)."""
+    return _split(_migration_sql() if sql is None else sql, ";")
 
 
-def _actions() -> list[tuple[str, str]]:
-    """(table, action) for every ALTER TABLE action, in order."""
+def _actions(sql: str | None = None) -> list[tuple[str, str]]:
+    """(table, action) for every ALTER TABLE action, in order (this migration's by default)."""
     actions: list[tuple[str, str]] = []
-    for statement in _statements():
+    for statement in _statements(sql):
         match = _ALTER_RE.fullmatch(_masked(statement))
         if match is None:
             continue
@@ -175,6 +186,37 @@ def _added_columns() -> list[tuple[str, str]]:
         for added in [_added_column(action)]
         if added is not None
     ]
+
+
+def _user_settings_changes_after(version: int) -> tuple[frozenset[str], frozenset[str]]:
+    """(added, dropped): the user_settings columns the shipped migrations after a version
+    leave added or dropped, applied in version order.
+
+    GH-307: migration 0033 drops this column (its values move to notifications_completed)
+    and 0013's notifications_enabled. The models and tests/db_fakes.py follow the latest
+    schema, so the mirror checks below read what the later migrations did.
+    """
+    added: set[str] = set()
+    dropped: set[str] = set()
+    for path in sorted(db_mod._MIGRATIONS_DIR.iterdir()):
+        match = db_mod._MIGRATION_FILE_RE.match(path.name)
+        if match is None or int(match.group(1)) <= version:
+            continue
+        for table, action in _actions(_normalized(path.read_text(encoding="utf-8"))):
+            if table != _TABLE:
+                continue
+            if (column := _added_column(action)) is not None:
+                added.add(column[0])
+                dropped.discard(column[0])
+            elif (drop := _DROP_COLUMN_RE.match(_masked(action))) is not None:
+                dropped.add(drop.group(1))
+                added.discard(drop.group(1))
+    return frozenset(added), frozenset(dropped)
+
+
+def _dropped_later() -> frozenset[str]:
+    """The user_settings columns a migration after this one drops."""
+    return _user_settings_changes_after(_VERSION)[1]
 
 
 def _definition() -> str:
@@ -341,45 +383,73 @@ class TestMigration0015Column:
 
 
 class TestMigration0015MatchesPython:
-    """The SQL default equals the Pydantic default and the FakeDb mirrors the column."""
+    """The SQL default equals the Pydantic default and the FakeDb mirrors the column.
+
+    GH-307: both mirror the latest schema. Once a later migration drops the column
+    (0033), the model field and the FakeDb column are gone with it; the columns that
+    replace it are pinned against the models and the FakeDb in
+    tests/test_migration_0033.py.
+    """
 
     def test_migration_0015_default_equals_the_pydantic_default(self) -> None:
+        """While the column is shipped; dropped later, the model field goes too."""
         sql_default = _SQL_BOOLS.get(_default(_definition()) or "")
-        pydantic_default = models_module.SettingsNotifications().task_done
 
         assert sql_default is False
-        assert pydantic_default is False
-        assert sql_default is pydantic_default
+        if _COLUMN in _dropped_later():
+            assert _API_FIELD not in models_module.SettingsNotifications.model_fields
+        else:
+            pydantic_default = models_module.SettingsNotifications().task_done
+            assert pydantic_default is False
+            assert sql_default is pydantic_default
 
     def test_migration_0015_column_maps_to_the_api_field(self) -> None:
-        """notifications_task_done <-> notifications.task_done (a plain bool)."""
+        """notifications_task_done <-> notifications.task_done (a plain bool), while the
+        column is shipped; dropped later, the field goes with it."""
         fields = models_module.SettingsNotifications.model_fields
 
         assert f"notifications_{_API_FIELD}" in dict(_added_columns())
-        assert _API_FIELD in fields
-        assert fields[_API_FIELD].annotation is bool
+        if _COLUMN in _dropped_later():
+            assert _API_FIELD not in fields
+        else:
+            assert _API_FIELD in fields
+            assert fields[_API_FIELD].annotation is bool
 
-    def test_migration_0015_the_fake_database_has_the_column(self) -> None:
-        """tests/db_fakes.py's user_settings is migration 0013 plus this migration."""
+    def test_migration_0015_the_fake_database_mirrors_the_column(self) -> None:
+        """tests/db_fakes.py's user_settings is migration 0013 plus this migration, as the
+        later shipped migrations leave it (GH-307: 0033 drops this column)."""
         added = {name for name, _ in _added_columns()}
+        later_added, later_dropped = _user_settings_changes_after(_VERSION)
 
-        assert frozenset(db_fakes._USER_SETTINGS_COLUMNS) == _COLUMNS_0013 | added
+        assert (
+            frozenset(db_fakes._USER_SETTINGS_COLUMNS)
+            == ((_COLUMNS_0013 | added) - later_dropped) | later_added
+        )
 
     def test_migration_0015_the_fake_database_types_it_as_a_required_bool(self) -> None:
+        """While the column is shipped; dropped later, the FakeDb has no such column."""
         definition = _masked(_definition())
+        types = db_fakes._SETTINGS_TYPES[_TABLE]
 
         assert re.match(_BOOLEAN, definition), definition
-        assert db_fakes._SETTINGS_TYPES[_TABLE][_COLUMN] == "bool"
         assert _is_required(definition), definition
-        assert _COLUMN not in db_fakes._SETTINGS_NULLABLE[_TABLE]
+        if _COLUMN in _dropped_later():
+            assert _COLUMN not in types
+        else:
+            assert types[_COLUMN] == "bool"
+            assert _COLUMN not in db_fakes._SETTINGS_NULLABLE[_TABLE]
 
     def test_migration_0015_the_fake_database_default_equals_the_sql_default(self) -> None:
-        """A new FakeDb user_settings row takes the shipped default."""
+        """A new FakeDb user_settings row takes the shipped default, while the column is
+        shipped; dropped later, a new row has no such column."""
         sql_default = _SQL_BOOLS.get(_default(_definition()) or "")
         row = db_fakes.FakeDb().settings_defaults(_TABLE, {}, datetime.now(UTC))
 
         assert sql_default is not None
-        assert row[_COLUMN] is sql_default
+        if _COLUMN in _dropped_later():
+            assert _COLUMN not in row
+        else:
+            assert row[_COLUMN] is sql_default
 
 
 # ---------------------------------------------------------------------------

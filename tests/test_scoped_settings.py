@@ -97,13 +97,28 @@ What these tests pin down (the GH-159 and GH-160 implementation contracts):
   (ON DELETE CASCADE).
 - No email, name or model name in any log record; no provider or model value
   in any audit row.
-- GH-35, task-done pings: ``user_settings.notifications_task_done`` (default
-  false, migration 0015) is ``notifications.task_done`` of the response. A
-  read returns the stored value (False without a row) and writes nothing; a
-  patch changes only the fields it gives (a task_done-only patch keeps the
-  theme and ``enabled``, a theme or ``enabled`` patch keeps task_done:
-  neither switch is a master of the other); a later read (the "reload")
-  returns the stored value; another user's row is never touched.
+- GH-35, task-done pings, retargeted by GH-307:
+  ``user_settings.notifications_completed`` (default true, migration 0033) is
+  ``notifications.completed`` of the response (it replaces
+  ``notifications_task_done``; ``notifications_approvals`` replaces
+  ``notifications_enabled``). A read returns the stored value (True without a
+  row) and writes nothing; a patch changes only the fields it gives (a
+  completed-only patch keeps the theme, the density and ``approvals``; a
+  theme or ``approvals`` patch keeps completed: neither switch is a master of
+  the other); a later read (the "reload") returns the stored value; another
+  user's row is never touched.
+- GH-307, account preferences: the user scope is ``appearance {theme,
+  density}`` and ``notifications {approvals, completed}`` (columns theme,
+  density, notifications_approvals, notifications_completed). Without a row a
+  read answers light / comfortable / True / True and writes nothing. An update
+  creates the row from the column defaults and changes only the given fields
+  (a NULL keeps the stored value) in one transaction, through the contract's
+  UPDATE (``$1`` user id, ``$2`` theme, ``$3`` density, ``$4`` approvals,
+  ``$5`` completed, ``coalesce`` for each, RETURNING the four columns); the
+  same patch twice stores and answers the same values. A reset deletes the
+  row and answers the four defaults. Every statement binds the actor's id
+  only: a colleague's or another org's user's row is never read or changed.
+  ``account.manage`` is checked before any statement; nothing is audited.
 - GH-35, ``reset_user_settings(pool, *, actor)``: ``account.manage`` (every
   role) before any statement; reverts only the actor's own ``user_settings``
   row (afterwards absent or exactly the column defaults; the actor's id a
@@ -158,30 +173,34 @@ if TYPE_CHECKING:
 _IP = "203.0.113.7"
 _MIGRATION = "0013_settings_scopes.sql"
 _ALL_ON: dict[str, bool] = dict.fromkeys(TOOL_NAMES, True)
-# GH-35: the notifications gain task_done (default off) — the response shape.
+# GH-307: appearance {theme, density}, notifications {approvals, completed} — the
+# response shape of a user without a row.
 _USER_DEFAULTS = {
-    "appearance": {"theme": "light"},
-    "notifications": {"enabled": True, "task_done": False},
+    "appearance": {"theme": "light", "density": "comfortable"},
+    "notifications": {"approvals": True, "completed": True},
 }
-# The user_settings column defaults (migrations 0013 and 0015), without the key and
+# The user_settings column defaults (migrations 0013 and 0033), without the key and
 # updated_at: what a reset row may hold.
 _USER_COLUMN_DEFAULTS: dict[str, Any] = {
     "theme": "light",
-    "notifications_enabled": True,
-    "notifications_task_done": False,
+    "density": "comfortable",
+    "notifications_approvals": True,
+    "notifications_completed": True,
 }
 # A user_settings row where every setting differs from its default.
 _CUSTOM_USER_ROW: dict[str, Any] = {
     "theme": "dark",
-    "notifications_enabled": False,
-    "notifications_task_done": True,
+    "density": "compact",
+    "notifications_approvals": False,
+    "notifications_completed": False,
 }
 # Rows where exactly one setting differs from its default (a reset reverts each one).
 _ONE_CUSTOM_SETTING = [
     pytest.param({"theme": "dark"}, id="theme-dark"),
     pytest.param({"theme": "system"}, id="theme-system"),
-    pytest.param({"notifications_enabled": False}, id="enabled-off"),
-    pytest.param({"notifications_task_done": True}, id="task_done-on"),
+    pytest.param({"density": "compact"}, id="density-compact"),
+    pytest.param({"notifications_approvals": False}, id="approvals-off"),
+    pytest.param({"notifications_completed": False}, id="completed-off"),
 ]
 _ROLES = ["super_admin", "org_admin", "editor"]
 _MODEL_MARKER = "Zephyrmarker/Model-77"
@@ -529,18 +548,30 @@ def _tools_and_residency(result: Any) -> dict[str, Any]:
 
 
 def _user_values(result: Any) -> tuple[str, bool]:
-    return result.appearance.theme, result.notifications.enabled
+    """(theme, approvals) of a UserSettingsResponse (GH-307: approvals replaces enabled)."""
+    return result.appearance.theme, result.notifications.approvals
 
 
-def _user_all(result: Any) -> tuple[str, bool, bool]:
-    """(theme, enabled, task_done) of a UserSettingsResponse (GH-35)."""
-    return result.appearance.theme, result.notifications.enabled, result.notifications.task_done
+def _user_all(result: Any) -> tuple[str, str, bool, bool]:
+    """(theme, density, approvals, completed) of a UserSettingsResponse (GH-307)."""
+    return (
+        result.appearance.theme,
+        result.appearance.density,
+        result.notifications.approvals,
+        result.notifications.completed,
+    )
 
 
-def _user_row(db: FakeDb, user_id: uuid.UUID) -> tuple[str, bool, bool]:
-    """(theme, notifications_enabled, notifications_task_done) of a stored user_settings row."""
+def _user_row(db: FakeDb, user_id: uuid.UUID) -> tuple[str, str, bool, bool]:
+    """(theme, density, notifications_approvals, notifications_completed) of a stored
+    user_settings row (GH-307)."""
     row = db.user_settings[user_id]
-    return row["theme"], row["notifications_enabled"], row["notifications_task_done"]
+    return (
+        row["theme"],
+        row["density"],
+        row["notifications_approvals"],
+        row["notifications_completed"],
+    )
 
 
 def _custom_user_row(db: FakeDb, user_id: uuid.UUID) -> dict[str, Any]:
@@ -548,15 +579,19 @@ def _custom_user_row(db: FakeDb, user_id: uuid.UUID) -> dict[str, Any]:
     return db.add_user_settings(user_id, **_CUSTOM_USER_ROW)
 
 
+def _without_key_and_updated_at(row: dict[str, Any]) -> dict[str, Any]:
+    """A user_settings row's settings: every column but user_id and updated_at."""
+    return {
+        column: value for column, value in row.items() if column not in {"user_id", "updated_at"}
+    }
+
+
 def _assert_reset_row(db: FakeDb, user_id: uuid.UUID) -> None:
     """After a reset (GH-35) the user's row is gone or holds exactly the column defaults."""
     row = db.user_settings.get(user_id)
     if row is None:
         return
-    values = {
-        column: value for column, value in row.items() if column not in {"user_id", "updated_at"}
-    }
-    assert values == _USER_COLUMN_DEFAULTS
+    assert _without_key_and_updated_at(row) == _USER_COLUMN_DEFAULTS
 
 
 def _migration_tables() -> set[str]:
@@ -943,7 +978,7 @@ class TestUserSettings:
         self, svc: ModuleType, db: FakeDb
     ) -> None:
         actor = _actor(db, "editor")
-        db.add_user_settings(actor.user_id, theme="dark", notifications_enabled=False)
+        db.add_user_settings(actor.user_id, theme="dark", notifications_approvals=False)
 
         result = await svc.get_user_settings(db.pool, actor=actor)
 
@@ -956,7 +991,7 @@ class TestUserSettings:
         actor = _actor(db, "editor")
         other = _actor(db, "org_admin")
         db.add_user_settings(actor.user_id, theme="system")
-        db.add_user_settings(other.user_id, theme="dark", notifications_enabled=False)
+        db.add_user_settings(other.user_id, theme="dark", notifications_approvals=False)
 
         result = await svc.get_user_settings(db.pool, actor=actor)
 
@@ -969,28 +1004,28 @@ class TestUserSettings:
         self, svc: ModuleType, db: FakeDb
     ) -> None:
         actor = _actor(db, "editor")
-        db.add_user_settings(actor.user_id, theme="dark", notifications_enabled=False)
+        db.add_user_settings(actor.user_id, theme="dark", notifications_approvals=False)
 
         result = await svc.update_user_settings(
             db.pool, actor=actor, patch=_user_patch({"appearance": {"theme": "system"}})
         )
 
         row = db.user_settings[actor.user_id]
-        assert (row["theme"], row["notifications_enabled"]) == ("system", False)
+        assert (row["theme"], row["notifications_approvals"]) == ("system", False)
         assert _user_values(result) == ("system", False)
 
     async def test_scoped_settings_update_notifications_keeps_the_theme(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
         actor = _actor(db, "editor")
-        db.add_user_settings(actor.user_id, theme="dark", notifications_enabled=True)
+        db.add_user_settings(actor.user_id, theme="dark", notifications_approvals=True)
 
         result = await svc.update_user_settings(
-            db.pool, actor=actor, patch=_user_patch({"notifications": {"enabled": False}})
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"approvals": False}})
         )
 
         row = db.user_settings[actor.user_id]
-        assert (row["theme"], row["notifications_enabled"]) == ("dark", False)
+        assert (row["theme"], row["notifications_approvals"]) == ("dark", False)
         assert _user_values(result) == ("dark", False)
 
     async def test_scoped_settings_update_creates_a_missing_row_with_the_defaults(
@@ -1000,11 +1035,11 @@ class TestUserSettings:
         actor = _actor(db, "editor")
 
         result = await svc.update_user_settings(
-            db.pool, actor=actor, patch=_user_patch({"notifications": {"enabled": False}})
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"approvals": False}})
         )
 
         row = db.user_settings[actor.user_id]
-        assert (row["theme"], row["notifications_enabled"]) == ("light", False)
+        assert (row["theme"], row["notifications_approvals"]) == ("light", False)
         assert _user_values(result) == ("light", False)
 
     async def test_scoped_settings_update_both_fields(self, svc: ModuleType, db: FakeDb) -> None:
@@ -1016,14 +1051,14 @@ class TestUserSettings:
             db.pool,
             actor=actor,
             patch=_user_patch(
-                {"appearance": {"theme": "dark"}, "notifications": {"enabled": False}}
+                {"appearance": {"theme": "dark"}, "notifications": {"approvals": False}}
             ),
         )
 
         assert isinstance(result, UserSettingsResponse)
         assert _user_values(result) == ("dark", False)
         row = db.user_settings[actor.user_id]
-        assert (row["theme"], row["notifications_enabled"]) == ("dark", False)
+        assert (row["theme"], row["notifications_approvals"]) == ("dark", False)
 
     async def test_scoped_settings_update_never_touches_another_user(
         self, svc: ModuleType, db: FakeDb
@@ -1059,135 +1094,156 @@ class TestUserSettings:
         actor = _actor(db, "editor")
 
         await svc.update_user_settings(
-            db.pool, actor=actor, patch=_user_patch({"notifications": {"enabled": False}})
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"approvals": False}})
         )
 
         assert db.audit == []
 
 
 # ---------------------------------------------------------------------------
-# 3b. Task-done pings (GH-35): notifications.task_done in the user scope
+# 3b. Task-done pings (GH-35), retargeted by GH-307: notifications.completed replaces
+#     task_done and notifications.approvals replaces enabled
 # ---------------------------------------------------------------------------
 
 
-class TestUserTaskDone:
-    """``notifications.task_done`` (``user_settings.notifications_task_done``, default off)
-    is read, patched and kept like the other user settings, independent of ``enabled``."""
+class TestUserCompleted:
+    """``notifications.completed`` (``user_settings.notifications_completed``, default on)
+    is read, patched and kept like the other user settings, independent of ``approvals``."""
 
-    async def test_scoped_settings_get_user_without_a_row_has_task_done_off_and_writes_nothing(
+    async def test_scoped_settings_get_user_without_a_row_has_completed_on_and_writes_nothing(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
         actor = _actor(db, "editor")
 
         result = await svc.get_user_settings(db.pool, actor=actor)
 
-        assert result.notifications.task_done is False
+        assert result.notifications.completed is True
         assert db.user_settings == {}
         assert db.matching(r"^(?:insert|update|delete)\b") == []
 
     @pytest.mark.parametrize("stored", [True, False], ids=["stored-on", "stored-off"])
-    async def test_scoped_settings_get_user_returns_the_stored_task_done(
+    async def test_scoped_settings_get_user_returns_the_stored_completed(
         self, svc: ModuleType, db: FakeDb, stored: bool
     ) -> None:
         actor = _actor(db, "editor")
         db.add_user_settings(
             actor.user_id,
             theme="system",
-            notifications_enabled=False,
-            notifications_task_done=stored,
+            density="compact",
+            notifications_approvals=False,
+            notifications_completed=stored,
         )
 
         result = await svc.get_user_settings(db.pool, actor=actor)
 
-        assert _user_all(result) == ("system", False, stored)
+        assert _user_all(result) == ("system", "compact", False, stored)
         assert db.matching(r"^(?:insert|update|delete)\b") == []
 
-    async def test_scoped_settings_get_user_response_has_the_full_notifications_shape(
+    async def test_scoped_settings_get_user_response_has_the_full_settings_shape(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
-        """The response is {appearance: {theme}, notifications: {enabled, task_done}}."""
+        """The response is {appearance: {theme, density}, notifications: {approvals,
+        completed}}."""
         actor = _actor(db, "org_admin")
         _custom_user_row(db, actor.user_id)
 
         result = await svc.get_user_settings(db.pool, actor=actor)
 
         assert result.model_dump() == {
-            "appearance": {"theme": "dark"},
-            "notifications": {"enabled": False, "task_done": True},
+            "appearance": {"theme": "dark", "density": "compact"},
+            "notifications": {"approvals": False, "completed": False},
         }
 
     @pytest.mark.parametrize("value", [True, False], ids=["switch-on", "switch-off"])
     @pytest.mark.parametrize(
-        ("theme", "enabled"),
-        [("dark", False), ("system", True)],
-        ids=["dark-enabled-off", "system-enabled-on"],
+        ("theme", "density", "approvals"),
+        [("dark", "compact", False), ("system", "comfortable", True)],
+        ids=["dark-compact-approvals-off", "system-comfortable-approvals-on"],
     )
-    async def test_scoped_settings_update_task_done_only_keeps_theme_and_enabled(
-        self, svc: ModuleType, db: FakeDb, theme: str, enabled: bool, value: bool
+    async def test_scoped_settings_update_completed_only_keeps_the_other_settings(
+        self,
+        svc: ModuleType,
+        db: FakeDb,
+        theme: str,
+        density: str,
+        approvals: bool,
+        value: bool,
     ) -> None:
-        """A task_done-only patch persists task_done; the theme and ``enabled`` stay."""
+        """A completed-only patch persists completed; the theme, the density and
+        ``approvals`` stay."""
         actor = _actor(db, "editor")
         db.add_user_settings(
             actor.user_id,
             theme=theme,
-            notifications_enabled=enabled,
-            notifications_task_done=not value,
+            density=density,
+            notifications_approvals=approvals,
+            notifications_completed=not value,
         )
 
         result = await svc.update_user_settings(
-            db.pool, actor=actor, patch=_user_patch({"notifications": {"task_done": value}})
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"completed": value}})
         )
 
-        assert _user_row(db, actor.user_id) == (theme, enabled, value)
-        assert _user_all(result) == (theme, enabled, value)
+        assert _user_row(db, actor.user_id) == (theme, density, approvals, value)
+        assert _user_all(result) == (theme, density, approvals, value)
 
-    async def test_scoped_settings_update_theme_keeps_a_stored_task_done(
+    async def test_scoped_settings_update_theme_keeps_a_stored_completed(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
         actor = _actor(db, "editor")
-        db.add_user_settings(actor.user_id, theme="dark", notifications_task_done=True)
+        db.add_user_settings(actor.user_id, theme="dark", notifications_completed=False)
 
         result = await svc.update_user_settings(
             db.pool, actor=actor, patch=_user_patch({"appearance": {"theme": "system"}})
         )
 
-        assert _user_row(db, actor.user_id) == ("system", True, True)
-        assert _user_all(result) == ("system", True, True)
+        assert _user_row(db, actor.user_id) == ("system", "comfortable", True, False)
+        assert _user_all(result) == ("system", "comfortable", True, False)
 
-    @pytest.mark.parametrize("enabled", [True, False], ids=["enabled-on", "enabled-off"])
-    async def test_scoped_settings_update_enabled_keeps_a_stored_task_done(
-        self, svc: ModuleType, db: FakeDb, enabled: bool
+    @pytest.mark.parametrize("approvals", [True, False], ids=["approvals-on", "approvals-off"])
+    async def test_scoped_settings_update_approvals_keeps_a_stored_completed(
+        self, svc: ModuleType, db: FakeDb, approvals: bool
     ) -> None:
-        """``enabled`` is no master switch: changing it leaves task_done as stored."""
+        """``approvals`` is no master switch: changing it leaves completed as stored."""
         actor = _actor(db, "editor")
         db.add_user_settings(
-            actor.user_id, notifications_enabled=not enabled, notifications_task_done=True
+            actor.user_id, notifications_approvals=not approvals, notifications_completed=False
         )
 
         result = await svc.update_user_settings(
-            db.pool, actor=actor, patch=_user_patch({"notifications": {"enabled": enabled}})
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"approvals": approvals}})
         )
 
-        assert _user_row(db, actor.user_id) == ("light", enabled, True)
-        assert _user_all(result) == ("light", enabled, True)
+        assert _user_row(db, actor.user_id) == ("light", "comfortable", approvals, False)
+        assert _user_all(result) == ("light", "comfortable", approvals, False)
 
-    async def test_scoped_settings_task_done_on_with_enabled_off_both_persist(
-        self, svc: ModuleType, db: FakeDb
+    @pytest.mark.parametrize(
+        ("approvals", "completed"),
+        [(False, True), (True, False)],
+        ids=["approvals-off-completed-on", "approvals-on-completed-off"],
+    )
+    async def test_scoped_settings_approvals_and_completed_opposite_both_persist(
+        self, svc: ModuleType, db: FakeDb, approvals: bool, completed: bool
     ) -> None:
-        """Neither switch is a master of the other: task_done on with ``enabled`` off is
-        stored and returned as given."""
+        """Neither switch is a master of the other: one on with the other off is stored and
+        returned as given (from a row holding the opposite of both)."""
         actor = _actor(db, "org_admin")
+        db.add_user_settings(
+            actor.user_id,
+            notifications_approvals=not approvals,
+            notifications_completed=not completed,
+        )
 
         result = await svc.update_user_settings(
             db.pool,
             actor=actor,
-            patch=_user_patch({"notifications": {"enabled": False, "task_done": True}}),
+            patch=_user_patch({"notifications": {"approvals": approvals, "completed": completed}}),
         )
 
-        assert _user_row(db, actor.user_id) == ("light", False, True)
-        assert _user_all(result) == ("light", False, True)
+        assert _user_row(db, actor.user_id) == ("light", "comfortable", approvals, completed)
+        assert _user_all(result) == ("light", "comfortable", approvals, completed)
 
-    async def test_scoped_settings_update_all_three_settings_at_once(
+    async def test_scoped_settings_update_all_four_settings_at_once(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
         from admino.models import UserSettingsResponse
@@ -1199,41 +1255,41 @@ class TestUserTaskDone:
             actor=actor,
             patch=_user_patch(
                 {
-                    "appearance": {"theme": "dark"},
-                    "notifications": {"enabled": False, "task_done": True},
+                    "appearance": {"theme": "dark", "density": "compact"},
+                    "notifications": {"approvals": False, "completed": False},
                 }
             ),
         )
 
         assert isinstance(result, UserSettingsResponse)
         assert result.model_dump() == {
-            "appearance": {"theme": "dark"},
-            "notifications": {"enabled": False, "task_done": True},
+            "appearance": {"theme": "dark", "density": "compact"},
+            "notifications": {"approvals": False, "completed": False},
         }
-        assert _user_row(db, actor.user_id) == ("dark", False, True)
+        assert _user_row(db, actor.user_id) == ("dark", "compact", False, False)
 
-    async def test_scoped_settings_update_task_done_creates_a_missing_row_with_the_defaults(
+    async def test_scoped_settings_update_completed_creates_a_missing_row_with_the_defaults(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
-        """Only task_done differs from the column defaults."""
+        """Only completed differs from the column defaults."""
         actor = _actor(db, "editor")
 
         result = await svc.update_user_settings(
-            db.pool, actor=actor, patch=_user_patch({"notifications": {"task_done": True}})
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"completed": False}})
         )
 
-        assert _user_row(db, actor.user_id) == ("light", True, True)
-        assert _user_all(result) == ("light", True, True)
+        assert _user_row(db, actor.user_id) == ("light", "comfortable", True, False)
+        assert _user_all(result) == ("light", "comfortable", True, False)
 
-    async def test_scoped_settings_task_done_survives_a_reload(
+    async def test_scoped_settings_completed_survives_a_reload(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
-        """The issue's AC "persists across reload": a later read returns the stored value,
-        also after another setting changed."""
+        """The AC "persists across reload": a later read returns the stored value, also
+        after another setting changed."""
         actor = _actor(db, "editor")
 
         await svc.update_user_settings(
-            db.pool, actor=actor, patch=_user_patch({"notifications": {"task_done": True}})
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"completed": False}})
         )
         reloaded = await svc.get_user_settings(db.pool, actor=actor)
         await svc.update_user_settings(
@@ -1241,10 +1297,10 @@ class TestUserTaskDone:
         )
         reloaded_again = await svc.get_user_settings(db.pool, actor=actor)
 
-        assert _user_all(reloaded) == ("light", True, True)
-        assert _user_all(reloaded_again) == ("dark", True, True)
+        assert _user_all(reloaded) == ("light", "comfortable", True, False)
+        assert _user_all(reloaded_again) == ("dark", "comfortable", True, False)
 
-    async def test_scoped_settings_task_done_update_never_touches_another_user(
+    async def test_scoped_settings_completed_update_never_touches_another_user(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
         """Neither a colleague in the same org nor a user of another org is touched."""
@@ -1258,45 +1314,45 @@ class TestUserTaskDone:
         }
 
         await svc.update_user_settings(
-            db.pool, actor=actor, patch=_user_patch({"notifications": {"task_done": True}})
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"completed": False}})
         )
 
         assert {user_id: db.user_settings[user_id] for user_id in others} == others
         assert not _bound(db, colleague.user_id)
         assert not _bound(db, stranger.user_id)
-        assert _user_row(db, actor.user_id) == ("light", True, True)
+        assert _user_row(db, actor.user_id) == ("light", "comfortable", True, False)
 
-    async def test_scoped_settings_task_done_update_statements_are_constants(
+    async def test_scoped_settings_completed_update_statements_are_constants(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
-        """Switching task_done on or off issues the same SQL text: the value is a bind
+        """Switching completed on or off issues the same SQL text: the value is a bind
         parameter, never part of the statement."""
         first = _actor(db, "editor")
         second = _actor(db, "editor")
-        db.add_user_settings(first.user_id)
-        db.add_user_settings(second.user_id, notifications_task_done=True)
+        db.add_user_settings(first.user_id, notifications_completed=False)
+        db.add_user_settings(second.user_id)
 
         await svc.update_user_settings(
-            db.pool, actor=first, patch=_user_patch({"notifications": {"task_done": True}})
+            db.pool, actor=first, patch=_user_patch({"notifications": {"completed": True}})
         )
         on_count = len(db.calls)
         await svc.update_user_settings(
-            db.pool, actor=second, patch=_user_patch({"notifications": {"task_done": False}})
+            db.pool, actor=second, patch=_user_patch({"notifications": {"completed": False}})
         )
 
         on_sql = [call.sql for call in db.calls[:on_count]]
         off_sql = [call.sql for call in db.calls[on_count:]]
         assert on_sql == off_sql
-        assert _user_row(db, first.user_id)[2] is True
-        assert _user_row(db, second.user_id)[2] is False
+        assert _user_row(db, first.user_id)[3] is True
+        assert _user_row(db, second.user_id)[3] is False
 
-    async def test_scoped_settings_task_done_update_records_no_audit_event(
+    async def test_scoped_settings_completed_update_records_no_audit_event(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
         actor = _actor(db, "editor")
 
         await svc.update_user_settings(
-            db.pool, actor=actor, patch=_user_patch({"notifications": {"task_done": True}})
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"completed": False}})
         )
 
         assert db.audit == []
@@ -1338,7 +1394,8 @@ class TestResetUserSettings:
     async def test_scoped_settings_reset_reverts_each_setting(
         self, svc: ModuleType, db: FakeDb, custom: dict[str, Any]
     ) -> None:
-        """Every column is reverted, task_done included, not only some of them."""
+        """Every column is reverted, density, approvals and completed included, not only
+        some of them."""
         actor = _actor(db, "editor")
         db.add_user_settings(actor.user_id, **custom)
 
@@ -1358,7 +1415,7 @@ class TestResetUserSettings:
         result = await svc.get_user_settings(db.pool, actor=actor)
 
         assert result.model_dump() == _USER_DEFAULTS
-        assert _user_all(result) == ("light", True, False)
+        assert _user_all(result) == ("light", "comfortable", True, True)
 
     async def test_scoped_settings_reset_without_a_row_returns_the_defaults(
         self, svc: ModuleType, db: FakeDb
@@ -1397,8 +1454,8 @@ class TestResetUserSettings:
             db.pool, actor=actor, patch=_user_patch({"appearance": {"theme": "system"}})
         )
 
-        assert _user_all(result) == ("system", True, False)
-        assert _user_row(db, actor.user_id) == ("system", True, False)
+        assert _user_all(result) == ("system", "comfortable", True, True)
+        assert _user_row(db, actor.user_id) == ("system", "comfortable", True, True)
 
     @pytest.mark.parametrize("role", _ROLES)
     async def test_scoped_settings_reset_refused_by_can_is_a_permission_error_before_any_query(
@@ -1526,6 +1583,339 @@ class TestResetUserSettings:
 
         await svc.reset_user_settings(db.pool, actor=actor)
 
+        assert db.audit == []
+        assert db.matching(r"\baudit_events\b") == []
+
+
+# ---------------------------------------------------------------------------
+# 3d. Account preferences (GH-307): density, approvals and completed
+# ---------------------------------------------------------------------------
+
+# The contract's UPDATE (C3): $1 user id, $2 theme, $3 density, $4 approvals,
+# $5 completed; a NULL keeps the stored value.
+_USER_UPDATE_FORM = """
+    UPDATE user_settings
+    SET theme = coalesce($2, theme),
+        density = coalesce($3, density),
+        notifications_approvals = coalesce($4, notifications_approvals),
+        notifications_completed = coalesce($5, notifications_completed),
+        updated_at = now()
+    WHERE user_id = $1
+    RETURNING theme, density, notifications_approvals, notifications_completed
+"""
+# The user_settings column of each patch leaf, in the UPDATE's bind order ($2..$5).
+_USER_LEAVES: dict[str, tuple[str, str]] = {
+    "theme": ("appearance", "theme"),
+    "density": ("appearance", "density"),
+    "notifications_approvals": ("notifications", "approvals"),
+    "notifications_completed": ("notifications", "completed"),
+}
+# Changes (column: value) away from the defaults: each setting alone and combinations.
+_FROM_DEFAULTS = [
+    pytest.param({"theme": "system"}, id="theme"),
+    pytest.param({"density": "compact"}, id="density"),
+    pytest.param({"notifications_approvals": False}, id="approvals"),
+    pytest.param({"notifications_completed": False}, id="completed"),
+    pytest.param({"density": "compact", "notifications_approvals": False}, id="density-approvals"),
+    pytest.param({"theme": "dark", "notifications_completed": False}, id="theme-completed"),
+    pytest.param(dict(_CUSTOM_USER_ROW), id="all-four"),
+]
+# Changes (column: value) away from _CUSTOM_USER_ROW: each setting alone and combinations.
+_FROM_CUSTOM = [
+    pytest.param({"theme": "light"}, id="theme"),
+    pytest.param({"density": "comfortable"}, id="density"),
+    pytest.param({"notifications_approvals": True}, id="approvals"),
+    pytest.param({"notifications_completed": True}, id="completed"),
+    pytest.param({"theme": "system", "density": "comfortable"}, id="theme-density"),
+    pytest.param(
+        {"notifications_approvals": True, "notifications_completed": True}, id="both-notifications"
+    ),
+]
+# One new setting alone (GH-307), as a patch body.
+_NEW_SETTING_PATCHES = [
+    pytest.param({"appearance": {"density": "compact"}}, id="density"),
+    pytest.param({"notifications": {"approvals": False}}, id="approvals"),
+    pytest.param({"notifications": {"completed": False}}, id="completed"),
+]
+
+
+def _patch_body(changes: dict[str, Any]) -> dict[str, Any]:
+    """The PATCH body that sets these user_settings columns."""
+    body: dict[str, dict[str, Any]] = {}
+    for column, value in changes.items():
+        section, field = _USER_LEAVES[column]
+        body.setdefault(section, {})[field] = value
+    return body
+
+
+def _response_of(settings: dict[str, Any]) -> dict[str, Any]:
+    """The UserSettingsResponse dump of these four user_settings columns."""
+    return {
+        "appearance": {"theme": settings["theme"], "density": settings["density"]},
+        "notifications": {
+            "approvals": settings["notifications_approvals"],
+            "completed": settings["notifications_completed"],
+        },
+    }
+
+
+def _sql_form(sql: str) -> str:
+    """The SQL lowercased, whitespace-collapsed, without spaces around ( ) , and =."""
+    return re.sub(r"\s*([(),=])\s*", r"\1", re.sub(r"\s+", " ", sql).strip().lower())
+
+
+def _typed(values: tuple[Any, ...]) -> list[tuple[str, Any]]:
+    """Each value with its type name (so 0 never passes for False)."""
+    return [(type(value).__name__, value) for value in values]
+
+
+def _bound_ids(db: FakeDb) -> set[uuid.UUID]:
+    """Every UUID any recorded statement bound (as a UUID or its string)."""
+    bound: set[uuid.UUID] = set()
+    for call in db.calls:
+        for arg in call.args:
+            if isinstance(arg, uuid.UUID):
+                bound.add(plain(arg))
+            elif isinstance(arg, str):
+                try:
+                    bound.add(uuid.UUID(arg))
+                except ValueError:
+                    continue
+    return bound
+
+
+def _user_update(db: FakeDb) -> Any:
+    """The one UPDATE user_settings statement."""
+    return _one(db.matching(r"^update user_settings\b"))
+
+
+class TestAccountPreferences:
+    """GH-307: appearance {theme, density} and notifications {approvals, completed}, stored
+    per user in the columns of migration 0033."""
+
+    async def test_scoped_settings_get_user_without_a_row_answers_the_four_defaults(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """light, comfortable, approvals on, completed on; the read writes nothing."""
+        actor = _actor(db, "editor")
+
+        result = await svc.get_user_settings(db.pool, actor=actor)
+
+        assert json.loads(result.model_dump_json()) == {
+            "appearance": {"theme": "light", "density": "comfortable"},
+            "notifications": {"approvals": True, "completed": True},
+        }
+        assert db.user_settings == {}
+        assert db.matching(r"^(?:insert|update|delete)\b") == []
+
+    @pytest.mark.parametrize("changes", _FROM_DEFAULTS)
+    async def test_scoped_settings_update_without_a_row_sets_only_the_given_fields(
+        self, svc: ModuleType, db: FakeDb, changes: dict[str, Any]
+    ) -> None:
+        """The row is created from the column defaults; only the given fields differ."""
+        actor = _actor(db, "editor")
+        expected = {**_USER_COLUMN_DEFAULTS, **changes}
+
+        result = await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch(_patch_body(changes))
+        )
+
+        assert _without_key_and_updated_at(db.user_settings[actor.user_id]) == expected
+        assert result.model_dump() == _response_of(expected)
+
+    @pytest.mark.parametrize("changes", _FROM_CUSTOM)
+    async def test_scoped_settings_update_of_a_stored_row_changes_only_the_given_fields(
+        self, svc: ModuleType, db: FakeDb, changes: dict[str, Any]
+    ) -> None:
+        """Every field the patch doesn't name keeps its stored (non-default) value."""
+        actor = _actor(db, "org_admin")
+        _custom_user_row(db, actor.user_id)
+        expected = {**_CUSTOM_USER_ROW, **changes}
+
+        result = await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch(_patch_body(changes))
+        )
+
+        assert _without_key_and_updated_at(db.user_settings[actor.user_id]) == expected
+        assert result.model_dump() == _response_of(expected)
+
+    async def test_scoped_settings_update_null_keeps_the_stored_value(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """A null theme or approvals next to given values keeps what is stored."""
+        actor = _actor(db, "editor")
+        _custom_user_row(db, actor.user_id)
+
+        result = await svc.update_user_settings(
+            db.pool,
+            actor=actor,
+            patch=_user_patch(
+                {
+                    "appearance": {"theme": None, "density": "comfortable"},
+                    "notifications": {"approvals": None, "completed": True},
+                }
+            ),
+        )
+
+        assert _user_row(db, actor.user_id) == ("dark", "comfortable", False, True)
+        assert _user_all(result) == ("dark", "comfortable", False, True)
+        assert _typed(_user_update(db).args[1:]) == _typed((None, "comfortable", None, True))
+
+    async def test_scoped_settings_update_same_patch_twice_is_idempotent(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """The second identical PATCH stores and answers exactly what the first did."""
+        actor = _actor(db, "editor")
+        db.add_user_settings(actor.user_id, theme="system")
+        patch = _user_patch(
+            {"appearance": {"density": "compact"}, "notifications": {"completed": False}}
+        )
+
+        first = await svc.update_user_settings(db.pool, actor=actor, patch=patch)
+        stored_first = _without_key_and_updated_at(db.user_settings[actor.user_id])
+        second = await svc.update_user_settings(db.pool, actor=actor, patch=patch)
+        stored_second = _without_key_and_updated_at(db.user_settings[actor.user_id])
+
+        assert (
+            stored_first
+            == stored_second
+            == {
+                "theme": "system",
+                "density": "compact",
+                "notifications_approvals": True,
+                "notifications_completed": False,
+            }
+        )
+        assert first.model_dump() == second.model_dump() == _response_of(stored_first)
+
+    @pytest.mark.parametrize("changes", _FROM_DEFAULTS)
+    async def test_scoped_settings_update_runs_the_contract_update_with_the_bound_values(
+        self, svc: ModuleType, db: FakeDb, changes: dict[str, Any]
+    ) -> None:
+        """C3's UPDATE: $1 the actor's id, $2..$5 theme, density, approvals, completed
+        (None where not given), each through coalesce, RETURNING the four columns."""
+        actor = _actor(db, "editor")
+
+        await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch(_patch_body(changes))
+        )
+
+        update = _user_update(db)
+        binds = tuple(changes.get(column) for column in _USER_LEAVES)
+        assert _sql_form(update.sql) == _sql_form(_USER_UPDATE_FORM)
+        assert plain(update.args[0]) == actor.user_id
+        assert _typed(update.args[1:]) == _typed(binds)
+
+    async def test_scoped_settings_update_ensures_and_updates_in_one_transaction(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """The row is created (INSERT ... ON CONFLICT DO NOTHING) and updated in one
+        committed transaction."""
+        actor = _actor(db, "editor")
+
+        await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch({"appearance": {"density": "compact"}})
+        )
+
+        ensure = _one(db.matching(r"^insert into user_settings\b"))
+        update = _user_update(db)
+        assert ensure.tx is not None
+        assert ensure.tx == update.tx
+        assert (ensure.tx, "commit") in db.transactions
+        assert db.calls.index(ensure) < db.calls.index(update)
+
+    async def test_scoped_settings_reset_deletes_the_row_and_answers_the_four_defaults(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        actor = _actor(db, "org_admin")
+        _custom_user_row(db, actor.user_id)
+
+        result = await svc.reset_user_settings(db.pool, actor=actor)
+
+        assert actor.user_id not in db.user_settings
+        assert json.loads(result.model_dump_json()) == _USER_DEFAULTS
+        delete = _one(db.matching(r"^delete from user_settings\b"))
+        assert [plain(arg) for arg in delete.args] == [actor.user_id]
+
+    @pytest.mark.parametrize(
+        "operation",
+        ["get", "update-density", "update-approvals", "update-completed", "reset"],
+    )
+    @pytest.mark.parametrize("actor_has_row", [True, False], ids=["with-row", "without-row"])
+    async def test_scoped_settings_user_scope_binds_only_the_actors_id(
+        self, svc: ModuleType, db: FakeDb, operation: str, actor_has_row: bool
+    ) -> None:
+        """Per-user isolation: a colleague's row (same org) and another org's user's row are
+        never read or changed; every statement binds the actor's id and no other."""
+        actor = _actor(db, "editor")
+        colleague = _actor(db, "editor")
+        stranger = _actor(db, "editor", OTHER_ORG_ID)
+        if actor_has_row:
+            db.add_user_settings(actor.user_id, theme="system")
+        others = {
+            colleague.user_id: copy.deepcopy(_custom_user_row(db, colleague.user_id)),
+            stranger.user_id: copy.deepcopy(_custom_user_row(db, stranger.user_id)),
+        }
+        own = {**_USER_COLUMN_DEFAULTS, "theme": "system" if actor_has_row else "light"}
+        patches = {
+            "update-density": {"density": "compact"},
+            "update-approvals": {"notifications_approvals": False},
+            "update-completed": {"notifications_completed": False},
+        }
+
+        if operation == "get":
+            result = await svc.get_user_settings(db.pool, actor=actor)
+            expected = own
+        elif operation == "reset":
+            result = await svc.reset_user_settings(db.pool, actor=actor)
+            expected = dict(_USER_COLUMN_DEFAULTS)
+        else:
+            changes = patches[operation]
+            result = await svc.update_user_settings(
+                db.pool, actor=actor, patch=_user_patch(_patch_body(changes))
+            )
+            expected = {**own, **changes}
+
+        assert result.model_dump() == _response_of(expected)
+        assert {user_id: db.user_settings[user_id] for user_id in others} == others
+        assert db.calls
+        assert _bound_ids(db) == {actor.user_id}
+        for call in db.calls:
+            assert all(str(user_id) not in call.sql for user_id in others), call.sql
+
+    @pytest.mark.parametrize("body", _NEW_SETTING_PATCHES)
+    async def test_scoped_settings_new_setting_update_without_account_manage_is_refused_first(
+        self,
+        svc: ModuleType,
+        db: FakeDb,
+        monkeypatch: pytest.MonkeyPatch,
+        body: dict[str, Any],
+    ) -> None:
+        """account.manage is still checked before any statement: refused, nothing is read
+        or written."""
+        actor = _actor(db, "editor")
+        _custom_user_row(db, actor.user_id)
+        patch = _user_patch(body)
+        before = _state(db)
+        spy = _CanSpy(monkeypatch, svc, deny=frozenset({Capability.ACCOUNT_MANAGE}))
+
+        with pytest.raises(PermissionError):
+            await svc.update_user_settings(db.pool, actor=actor, patch=patch)
+
+        assert Capability.ACCOUNT_MANAGE in spy.capabilities
+        assert db.calls == []
+        assert _state(db) == before
+
+    @pytest.mark.parametrize("body", _NEW_SETTING_PATCHES)
+    async def test_scoped_settings_new_setting_update_records_no_audit_event(
+        self, svc: ModuleType, db: FakeDb, body: dict[str, Any]
+    ) -> None:
+        """The user scope stays out of the audit catalog."""
+        actor = _actor(db, "org_admin")
+
+        await svc.update_user_settings(db.pool, actor=actor, patch=_user_patch(body))
+
+        assert db.user_settings[actor.user_id]
         assert db.audit == []
         assert db.matching(r"\baudit_events\b") == []
 
@@ -3410,7 +3800,7 @@ class TestEachScopeSeededWithDefaults:
 
         assert set(db.user_settings) == set(people)
         for row in db.user_settings.values():
-            assert (row["theme"], row["notifications_enabled"]) == ("light", True)
+            assert _without_key_and_updated_at(row) == _USER_COLUMN_DEFAULTS
 
     async def test_scoped_settings_platform_row_is_seeded_from_the_config(
         self, svc: ModuleType, db: FakeDb, people: list[uuid.UUID]
@@ -3539,20 +3929,20 @@ class TestNoContentInLogs:
 
         assert "zephyrmarker" not in _log_text(caplog).lower()
 
-    async def test_scoped_settings_task_done_and_reset_log_no_content(
+    async def test_scoped_settings_completed_and_reset_log_no_content(
         self,
         svc: ModuleType,
         db: FakeDb,
         caplog: pytest.LogCaptureFixture,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """GH-35: switching task_done, a reset (with a row and without one) and a refused
-        reset log no email or name."""
+        """GH-35 (GH-307: completed): switching completed, a reset (with a row and
+        without one) and a refused reset log no email or name."""
         caplog.set_level(logging.DEBUG)
         actor = _actor(db, "editor", email=_EMAIL_MARKER, name=_NAME_MARKER)
 
         await svc.update_user_settings(
-            db.pool, actor=actor, patch=_user_patch({"notifications": {"task_done": True}})
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"completed": False}})
         )
         await svc.reset_user_settings(db.pool, actor=actor)
         await svc.reset_user_settings(db.pool, actor=actor)

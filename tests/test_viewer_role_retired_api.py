@@ -19,7 +19,7 @@ Decisions 7 and 10, and the Tests section's fourth bullet):
   a session): every ``role`` enum of the member-role request and response
   schemas is exactly ``["org_admin", "editor"]``, and no schema lists the
   retired role anywhere.
-- Reactivating a retired Viewer (the state migration 0033 leaves: a
+- Reactivating a retired Viewer (the state migration 0034 leaves: a
   deactivated ``editor`` with no session and the migration's ``system``
   ``user.deactivate`` row, ``{"reason": "viewer_retired",
   "sessions_revoked": 0}``) is an explicit grant of Editor: ``200`` with role
@@ -217,7 +217,7 @@ def _texts(node: Any, path: str = "") -> Iterator[tuple[str, str]]:
 
 
 def _shipped_retirement_sql() -> str:
-    """The one shipped migration that retires the role (0033, renumbered if needed)."""
+    """The one shipped migration that retires the role (0034, renumbered if needed)."""
     directory = Path(database.__file__).parent / "migrations"
     paths = sorted(directory.glob("[0-9][0-9][0-9][0-9]_retire_viewer_role.sql"))
     assert len(paths) == 1, f"one shipped NNNN_retire_viewer_role.sql expected: {paths}"
@@ -225,7 +225,7 @@ def _shipped_retirement_sql() -> str:
 
 
 def _seed_retired_viewer(db: FakeDb) -> uuid.UUID:
-    """The state migration 0033 leaves for a former Viewer of org A: a deactivated Editor
+    """The state migration 0034 leaves for a former Viewer of org A: a deactivated Editor
     with no session and the migration's system ``user.deactivate`` row."""
     user_id = db.add_account(
         role="editor",
