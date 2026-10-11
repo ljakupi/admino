@@ -5,10 +5,19 @@
 -- account may keep the Viewer role, and none is promoted.
 --
 -- Lock first: the old agent can keep serving while the one-shot migrate step
--- runs, so users, invitations and sessions are locked in EXCLUSIVE mode for
--- the transaction. Reads continue; writes (an invitation accepted, a login)
--- wait for the commit. That keeps every audit row and session count below
--- true to what the statements after it change.
+-- runs, so the tables this migration reads and writes are locked for the
+-- transaction. That keeps every audit row and session count below true to
+-- what the statements after it change.
+--
+-- - users is locked in ACCESS EXCLUSIVE mode up front, the mode the closing
+--   ALTER TABLE users needs anyway: taking a weaker lock and upgrading it
+--   there deadlocks with a request that has read users and then writes.
+--   Reads of users wait the few milliseconds the migration takes.
+-- - invitations and sessions are locked in EXCLUSIVE mode: their reads
+--   continue, writes (an invitation accepted, a login) wait for the commit.
+--
+-- A deadlock or lock failure rolls the whole migration back; rerunning the
+-- migrate step is safe.
 --
 -- Then, in this order:
 --
@@ -44,7 +53,8 @@
 --
 -- Grants: none change.
 
-LOCK TABLE users, invitations, sessions IN EXCLUSIVE MODE;
+LOCK TABLE users IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE invitations, sessions IN EXCLUSIVE MODE;
 
 INSERT INTO audit_events (org_id, actor_kind, action, target_type, target_ids, metadata)
 SELECT u.org_id, 'system', 'invitation.revoke', 'invitation',
