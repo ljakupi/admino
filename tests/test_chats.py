@@ -2681,15 +2681,15 @@ class TestCounts:
 
 
 def _org_chats(db: FakeDb) -> dict[str, Any]:
-    """ORG_ID: Alice (two live, one trashed), Bob and a Viewer (one live each);
+    """ORG_ID: Alice (two live, one trashed), Bob and an Org Admin (one live each);
     OTHER_ORG_ID: Carol (one live). Every chat's last activity is in the past."""
-    alice, bob, viewer = _member(db), _member(db), _member(db, role="viewer")
+    alice, bob, admin = _member(db), _member(db), _member(db, role="org_admin")
     carol = _member(db, org_id=OTHER_ORG_ID)
     live = [
         db.add_chat(alice.user_id, created_at=_PAST),
         db.add_chat(alice.user_id, created_at=_PAST),
         db.add_chat(bob.user_id, created_at=_PAST),
-        db.add_chat(viewer.user_id, created_at=_PAST),
+        db.add_chat(admin.user_id, created_at=_PAST),
     ]
     trashed = db.add_chat(alice.user_id, created_at=_PAST, deleted_at=_PAST)
     foreign = db.add_chat(carol.user_id, created_at=_PAST)
@@ -2845,7 +2845,7 @@ class TestOrgNotice:
     async def test_chats_org_notice_reaches_every_live_chat_of_the_org(
         self, chats: ModuleType, db: FakeDb
     ) -> None:
-        """Called with Bob's context, Alice's and the Viewer's chats get it too; the text
+        """Called with Bob's context, Alice's and the Org Admin's chats get it too; the text
         verbatim, role user, status complete, no tool fields."""
         world = _org_chats(db)
         notice = "Your role changed: you are now an Org Admin.\nReload to see the new tools."

@@ -10,10 +10,11 @@ optional ``PlatformReinviteRequest``. Each test looks the models up on
 What these tests pin down:
 - ``PlatformUserSummary`` has exactly ``id``, ``name``, ``email``, ``role``,
   ``status``, ``created_at`` and ``last_login_at`` (account metadata only).
-  ``role`` is one of the three member roles; ``status`` is ``active``,
-  ``deactivated`` or ``invited`` (the Super Admin's list includes invited
-  accounts, unlike the Org Admin's); ``name`` (None for an invited account)
-  and ``last_login_at`` may be null. ``id`` is a plain ``uuid.UUID``.
+  ``role`` is one of the two member roles (GH-306: the retired ``viewer`` is
+  refused); ``status`` is ``active``, ``deactivated`` or ``invited`` (the
+  Super Admin's list includes invited accounts, unlike the Org Admin's);
+  ``name`` (None for an invited account) and ``last_login_at`` may be null.
+  ``id`` is a plain ``uuid.UUID``.
 - ``PlatformUserListResponse`` is exactly ``{"users": [PlatformUserSummary, ...]}``.
 - ``OrgMetadata`` is exactly ``{"seats": {"used", "limit"}, "storage_used_bytes",
   "chat_count", "file_count"}``: ``seats`` is the existing ``OrgSeats``, every
@@ -63,7 +64,7 @@ _SUMMARY_FIELDS = frozenset(
 )
 _METADATA_FIELDS = frozenset({"seats", "storage_used_bytes", "chat_count", "file_count"})
 _COUNT_FIELDS = ("storage_used_bytes", "chat_count", "file_count")
-_MEMBER_ROLES = ("org_admin", "editor", "viewer")
+_MEMBER_ROLES = ("org_admin", "editor")
 _STATUSES = ("active", "deactivated", "invited")
 _NEW_MODELS = (
     "PlatformUserSummary",
@@ -298,7 +299,8 @@ class TestPlatformUserSummary:
         assert _summary(role=role).role == role
 
     @pytest.mark.parametrize(
-        "role", ["super_admin", "Org_Admin", "ORG_ADMIN", "admin", "owner", "", None, 1]
+        "role",
+        ["super_admin", "viewer", "Org_Admin", "ORG_ADMIN", "admin", "owner", "", None, 1],
     )
     def test_platform_user_models_summary_rejects_role(self, role: Any) -> None:
         """A Super Admin is never an org's account; anything else is not a role."""
@@ -365,7 +367,7 @@ class TestPlatformUserListResponse:
     def test_platform_user_models_list_response_keeps_the_order(self) -> None:
         first = _summary()
         second = _model("PlatformUserSummary").model_validate(_invited_data())
-        third = _summary(id=uuid.uuid4(), email="c@example.ch", role="viewer", status="deactivated")
+        third = _summary(id=uuid.uuid4(), email="c@example.ch", role="editor", status="deactivated")
 
         response = _model("PlatformUserListResponse")(users=[first, second, third])
 

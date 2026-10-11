@@ -1,8 +1,8 @@
 """HTTP spec of blank chat messages (GH-286, Decisions 2 to 4).
 
 The app from ``create_app()`` runs against the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, plus a Super Admin, all with real session cookies). The agent is the stub
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, plus
+a Super Admin, all with real session cookies). The agent is the stub
 of tests/test_chat_attachments_api.py (``_Script``): it binds every call to
 ``Agent.run``'s signature, records it and answers one final reply whose history
 is the history it received plus the user message plus the reply.
@@ -23,8 +23,8 @@ What is pinned:
   (no audit row), nothing in the chat runtime, no agent run, and no log record
   beyond the ones a body-validation 422 of the same route logs, none of them
   holding the text.
-- The order: 401 without a session, the Viewer's and the Super Admin's 403
-  and the CSRF 403 come first; then body validation (an unknown key, more than
+- The order: 401 without a session, the Super Admin's 403 and the CSRF 403
+  come first; then body validation (an unknown key, more than
   32768 characters, a repeated attachment id: the usual 422 list, which no
   longer names ``message`` for ``""``); then the per-user ``/api/message``
   rate limit (a 429 comes before ``message_empty``, and the refused blank
@@ -152,7 +152,7 @@ _STANDARD_RECORD_ATTRS: Final = frozenset(
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database; the
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database; the
     attachments root is under ``tmp_path`` (GH-189: a sent file's derived files)."""
     db = FakeDb()
     built = build_world(db)
@@ -419,7 +419,6 @@ def test_chat_message_empty_refusal_logs_only_what_a_validation_422_logs(
 
 _FIRST_REFUSALS: Final[dict[str, tuple[int, dict[str, str]]]] = {
     "no-session": (401, UNAUTHORIZED),
-    "viewer": (403, FORBIDDEN),
     "super-admin": (403, FORBIDDEN),
     "cross-site": (403, _CSRF_REFUSED),
 }
@@ -430,7 +429,7 @@ _FIRST_REFUSALS: Final[dict[str, tuple[int, dict[str, str]]]] = {
 def test_chat_message_empty_auth_role_and_csrf_refusals_come_first(
     world: World, client: TestClient, script: _Script, route: str, case: str
 ) -> None:
-    """A blank message without a session, from a Viewer or the Super Admin, or
+    """A blank message without a session, from the Super Admin (no chat.send), or
     cross-site gets that refusal (no route statement, nothing changed); the Editor's
     same blank message is then ``message_empty``."""
     db = world.db
@@ -438,7 +437,6 @@ def test_chat_message_empty_auth_role_and_csrf_refusals_come_first(
     chat_id = _chat(db, editor)
     sender: Account | None = {
         "no-session": None,
-        "viewer": world.a["viewer"],
         "super-admin": world.super_admin,
         "cross-site": editor,
     }[case]

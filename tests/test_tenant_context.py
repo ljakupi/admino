@@ -1,9 +1,11 @@
 """Tests for admino.tenancy — the TenantContext scoping rule (GH-145).
 
 Every repository function for org content requires a TenantContext and filters
-by its org_id. A TenantContext can only be built for a member (Org Admin,
-Editor or Viewer): Super Admins never carry an org context, so they can't reach
-content repositories at all.
+by its org_id. A TenantContext can only be built for a member (Org Admin or
+Editor): Super Admins never carry an org context, so they can't reach content
+repositories at all. The retired read-only member role ("viewer", GH-306) is no
+member role: no TenantContext carries it, built directly or from a Principal
+forged to hold it.
 
 (The cross-org isolation suite from #163 owns tests/test_tenancy.py; this file
 covers the TenantContext type itself.)
@@ -19,6 +21,7 @@ Security notes:
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -34,7 +37,10 @@ from admino.tenancy import NoTenantContextError, TenantContext
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-_MEMBER_ROLES: tuple[str, ...] = ("org_admin", "editor", "viewer")
+_MEMBER_ROLES: tuple[str, ...] = ("org_admin", "editor")
+
+# The retired read-only member role (GH-306): only the refusal tests name it.
+_RETIRED_ROLE = "viewer"
 
 
 def _valid_kwargs() -> dict[str, Any]:
@@ -86,6 +92,29 @@ class TestTenantContextModel:
 
         with pytest.raises(ValidationError):
             TenantContext(**kwargs)
+
+    @pytest.mark.parametrize(
+        "build",
+        [
+            pytest.param(lambda fields: TenantContext(**fields), id="keywords"),
+            pytest.param(lambda fields: TenantContext.model_validate(fields), id="model_validate"),
+            pytest.param(
+                lambda fields: TenantContext.model_validate_json(json.dumps(fields, default=str)),
+                id="model_validate_json",
+            ),
+        ],
+    )
+    def test_tenant_context_retired_role_rejected(
+        self, build: Callable[[dict[str, Any]], TenantContext]
+    ) -> None:
+        """GH-306: the retired read-only role is no member role. The same build path makes
+        an Editor's context, and the error points at the role field alone."""
+        assert build(_valid_kwargs()).role == "editor"
+
+        with pytest.raises(ValidationError) as caught:
+            build({**_valid_kwargs(), "role": _RETIRED_ROLE})
+
+        assert [error["loc"] for error in caught.value.errors()] == [("role",)]
 
     @pytest.mark.parametrize("field", ["org_id", "user_id"])
     def test_tenant_context_invalid_uuid_rejected(self, field: str) -> None:
@@ -200,6 +229,12 @@ _FORGED_PRINCIPALS: list[Any] = [
     pytest.param(_PrincipalLookalike, id="lookalike-object"),
 ]
 
+# A validated member left holding the retired role (GH-306) by a validation bypass.
+_RETIRED_ROLE_FORGERIES: list[Any] = [
+    pytest.param(lambda: _forge(_member("editor"), role=_RETIRED_ROLE), id="editor-setattr"),
+    pytest.param(lambda: _forge(_member("org_admin"), role=_RETIRED_ROLE), id="org_admin-setattr"),
+]
+
 
 class TestTenantContextFromForgedPrincipal:
     """from_principal fails closed: only a well-formed member Principal gets an org scope.
@@ -213,6 +248,15 @@ class TestTenantContextFromForgedPrincipal:
         self, forged: Callable[[], Any]
     ) -> None:
         """An inconsistent or non-Principal object raises NoTenantContextError."""
+        with pytest.raises(NoTenantContextError):
+            TenantContext.from_principal(forged())
+
+    @pytest.mark.parametrize("forged", _RETIRED_ROLE_FORGERIES)
+    def test_tenant_context_forged_retired_role_gets_no_context(
+        self, forged: Callable[[], Any]
+    ) -> None:
+        """GH-306: a member forged to hold the retired role gets no org scope (no context
+        carrying that role, and no context at all)."""
         with pytest.raises(NoTenantContextError):
             TenantContext.from_principal(forged())
 

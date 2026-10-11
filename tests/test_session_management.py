@@ -638,7 +638,7 @@ def _users_lookup(db: FakeDb) -> Call:
 class TestForceLogoutPermission:
     """Only an Org Admin (Capability.ORG_USERS_MANAGE) may force a logout."""
 
-    @pytest.mark.parametrize("who", ["editor", "viewer", "super-admin"])
+    @pytest.mark.parametrize("who", ["editor", "super-admin"])
     async def test_session_management_force_logout_refused_without_org_users_manage(
         self, sm: ModuleType, db: FakeDb, who: str
     ) -> None:
@@ -767,7 +767,7 @@ class TestForceLogout:
         assert all(db.session_revoked(token) for token in tokens)
         assert db.audit_rows("session.force_logout")[0]["target_ids"] == [str(admin_id)]
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_session_management_force_logout_any_role_of_the_org(
         self, sm: ModuleType, db: FakeDb, role: str
     ) -> None:

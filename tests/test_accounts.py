@@ -242,7 +242,7 @@ class TestLastAdminGuardDecision:
         assert result is None
 
     async def test_accounts_guard_target_not_an_admin_passes(self, conn: MagicMock) -> None:
-        """The target isn't an active Org Admin (editor, viewer, inactive) → no error."""
+        """The target isn't an active Org Admin (an editor, an inactive admin) → no error."""
         user_id = uuid4()
         conn.fetch.side_effect = None
         conn.fetch.return_value = _rows(user_id, target_is_admin=False, other_admins=1)

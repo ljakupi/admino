@@ -1,8 +1,8 @@
 """HTTP spec of sending files with a chat message (GH-187, contract sections 3.4 and 4 "Send").
 
 The app from ``create_app()`` runs against the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, all with real session cookies). The agent is a stub (the pattern of
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, all
+with real session cookies). The agent is a stub (the pattern of
 tests/test_chat_turns_api.py and tests/test_chat_stream_api.py): its ``run``
 binds every call to ``Agent.run``'s signature, records it, plays one delta into
 a ``RunStream`` when it gets one, awaits a one-shot ``during`` hook and answers
@@ -180,7 +180,7 @@ class _Script:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database; the
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database; the
     attachments root is under ``tmp_path`` (GH-189: a sent file's derived files)."""
     db = FakeDb()
     built = build_world(db)

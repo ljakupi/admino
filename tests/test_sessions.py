@@ -817,17 +817,17 @@ class TestApplyOrgPolicy:
         self,
     ) -> None:
         """Every role and status of the org follows (Org Admin, Editor, a deactivated
-        Viewer, two sessions of one user); another org's member and the Super Admin keep
+        Editor, two sessions of one user); another org's member and the Super Admin keep
         their rows exactly."""
         db = FakeDb()
         admin = db.add_account(org_id=ORG_ID, role="org_admin")
         editor = db.add_account(org_id=ORG_ID, role="editor")
-        viewer = db.add_account(org_id=ORG_ID, role="viewer", status="deactivated")
+        deactivated = db.add_account(org_id=ORG_ID, role="editor", status="deactivated")
         tokens = [
             db.open_session(admin),
             db.open_session(editor),
             db.open_session(editor),
-            db.open_session(viewer),
+            db.open_session(deactivated),
         ]
         others = [
             db.open_session(db.add_account(org_id=OTHER_ORG_ID, role="org_admin")),
@@ -1412,6 +1412,8 @@ _INVALID_PRINCIPAL_ROWS: list[Any] = [
     pytest.param(lambda seen: _row(last_seen_at=seen, org_id=None), id="member-without-org"),
     pytest.param(lambda seen: _row(last_seen_at=seen, role=None), id="member-without-role"),
     pytest.param(lambda seen: _row(last_seen_at=seen, role="owner"), id="member-unknown-role"),
+    # GH-306: the retired read-only role is no member role any more.
+    pytest.param(lambda seen: _row(last_seen_at=seen, role="viewer"), id="member-retired-role"),
     pytest.param(lambda seen: _row(last_seen_at=seen, kind="root"), id="unknown-kind"),
     pytest.param(
         lambda seen: _super_admin_row(last_seen_at=seen, role="org_admin"),
@@ -1477,7 +1479,7 @@ _IDLE_ACCEPTED: list[Any] = [
 class TestResolveSessionAccepts:
     """An active member or Super Admin gets an AuthenticatedSession built from the row."""
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_sessions_resolve_active_member(self, role: str) -> None:
         """The Principal is the row's user, kind, org and role."""
         session = await resolve_session(_Executor([_row(role=role)]), _VALID_TOKEN)
@@ -1531,17 +1533,16 @@ class TestResolveSessionAccepts:
         assert type(session.principal.user_id) is uuid.UUID
         assert type(session.principal.org_id) is uuid.UUID
 
-    @pytest.mark.parametrize(
-        ("role", "allowed"), [("org_admin", True), ("editor", True), ("viewer", False)]
-    )
+    @pytest.mark.parametrize(("role", "manages_users"), [("org_admin", True), ("editor", False)])
     async def test_sessions_resolve_principal_passes_can_for_its_role(
-        self, role: str, allowed: bool
+        self, role: str, manages_users: bool
     ) -> None:
         """A member built from asyncpg UUIDs gets its role's capabilities (the #145 bug)."""
         session = await resolve_session(_Executor([_row(role=role)]), _VALID_TOKEN)
 
         assert session is not None
-        assert can(session.principal, Capability.CHAT_SEND) is allowed
+        assert can(session.principal, Capability.CHAT_SEND) is True
+        assert can(session.principal, Capability.ORG_USERS_MANAGE) is manages_users
         assert can(session.principal, Capability.ACCOUNT_MANAGE) is True
 
     async def test_sessions_resolve_super_admin_passes_can(self) -> None:
@@ -1735,15 +1736,15 @@ class TestResolveSessionAlreadyOpen:
         assert second is None
 
     async def test_sessions_role_change_takes_effect_on_the_next_request(self) -> None:
-        """A demotion (editor → viewer) shows on the next resolve: nothing is cached."""
-        executor = _Executor([_row(role="editor"), _row(role="viewer")])
+        """A demotion (org_admin → editor) shows on the next resolve: nothing is cached."""
+        executor = _Executor([_row(role="org_admin"), _row(role="editor")])
 
         first = await resolve_session(executor, _VALID_TOKEN)
         second = await resolve_session(executor, _VALID_TOKEN)
 
         assert first is not None
         assert second is not None
-        assert (first.principal.role, second.principal.role) == ("editor", "viewer")
+        assert (first.principal.role, second.principal.role) == ("org_admin", "editor")
 
 
 # ---------------------------------------------------------------------------
@@ -1974,14 +1975,14 @@ class TestRevocationDeletesRows:
         db = FakeDb()
         admin = db.add_account(role="org_admin")
         editor = db.add_account(role="editor")
-        viewer = db.add_account(role="viewer", status="deactivated")
+        deactivated = db.add_account(role="editor", status="deactivated")
         outsider = db.add_account(org_id=OTHER_ORG_ID)
         super_admin = db.add_account(kind="super_admin", role=None, org_status=None)
         org_tokens = [
             db.open_session(admin),
             db.open_session(admin),
             db.open_session(editor),
-            db.open_session(viewer),
+            db.open_session(deactivated),
         ]
         kept = [db.open_session(outsider), db.open_session(super_admin)]
 
@@ -2458,7 +2459,7 @@ class TestResolveSessionById:
 
     # -- against the in-memory database ---------------------------------------------
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_sessions_by_id_live_member_session_matches_the_token_lookup(
         self, role: str
     ) -> None:
@@ -2638,7 +2639,7 @@ class TestResolveSessionById:
 
         assert await _by_id(_Executor([row]), _SESSION_ID) is None
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_sessions_by_id_accepts_an_active_member(self, role: str) -> None:
         session = await _by_id(_Executor([_row(role=role)]), _SESSION_ID)
 

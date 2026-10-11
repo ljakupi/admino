@@ -393,7 +393,7 @@ _SYNTHETIC_NEGATIVES: Final = [
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database; every
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database; every
     rate-limit bucket roomy."""
     db = FakeDb()
     built = build_world(db)

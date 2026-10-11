@@ -2,8 +2,8 @@
 
 The app from ``create_app()`` runs the REAL ``admino.agent.Agent`` (with the
 real tool-call recorder of ``main._build_tool_call_recorder()``) against the
-FakeDb world of tests/tenancy_world.py (orgs A and B with an Org Admin, an
-Editor and a Viewer each, all with real session cookies). Only the LLM is a
+FakeDb world of tests/tenancy_world.py (orgs A and B with an Org Admin and an
+Editor each, all with real session cookies). Only the LLM is a
 fake (``_TitleLLM``): its ``chat`` takes the contract's per-call
 ``max_tokens`` keyword and records every call (the messages copied at call
 time, the tools, ``max_tokens``). The agent's own calls come without
@@ -273,7 +273,7 @@ class _TitleLLM:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each, residency off) and a Super Admin, behind FakeDb."""
+    """Orgs A and B (OA/ED each, residency off) and a Super Admin, behind FakeDb."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)

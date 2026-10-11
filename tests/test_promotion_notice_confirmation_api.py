@@ -1,8 +1,8 @@
 """HTTP spec: the GH-66 promotion notice never breaks a chat awaiting a confirmation (GH-24).
 
 The app from ``create_app()`` runs against the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, all with real session cookies). The real promotion flow of GH-161 runs:
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, all
+with real session cookies). The real promotion flow of GH-161 runs:
 the Org Admin promotes ``gmail.send`` with their password, the 5-minute
 cooldown passes on the promotion clock (``admino.org_permissions.current_time``)
 and the org's next request that completes due promotions (the admin's
@@ -401,7 +401,7 @@ def _awaiting_rows(shape: str) -> list[Row]:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)

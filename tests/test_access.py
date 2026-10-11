@@ -5,15 +5,22 @@ matrix (#139 §2.1), row by row, so the implementation cannot drift from the
 spec: every (capability, role) pair is checked, the Capability enum must hold
 exactly these values, and anything outside the matrix is denied by default.
 
+The matrix has three columns (GH-306): the Super Admin and the two member
+roles, Org Admin and Editor. The retired read-only member role ("viewer") is
+no ``MemberRole`` any more: a Principal naming it can't be built, and one
+forged after validation gets no role and no capability. Every capability keeps
+its grants for the remaining roles; those that every member held stay with the
+Org Admin and the Editor.
+
 Security notes:
 - Default-deny: unknown capabilities are refused for every role, including the
   Super Admin (the Super Admin is not a wildcard).
 - Operator blindness: the Super Admin gets no content capability (chat, files,
   projects, exports, account connections, templates).
-- Least privilege: a Viewer is read-only, and member roles never get a
-  platform-level capability.
+- Least privilege: member roles never get a platform-level capability, and the
+  Editor's capabilities are a strict subset of the Org Admin's.
 - Principal mirrors the users-table CHECKs: kind == super_admin iff org_id is
-  NULL iff role is NULL.
+  NULL iff role is NULL, and role is 'org_admin' or 'editor' (GH-306).
 - Isolation: access.py is pure (no I/O) and imports nothing from the server,
   agent, LLM, database, tools, OAuth or audit modules. The tool permission
   engine (permissions.py) stays a separate layer: its one admino import is
@@ -22,7 +29,7 @@ Security notes:
   reachability behind ``GET /api/platform/diagnostics``) is Super Admin only.
 - GH-161: ``org.permissions.view`` (the read-only summary of the org's tool
   permissions behind ``GET /api/permissions/summary``) is granted to every
-  member role (Org Admin, Editor, Viewer) and refused to the Super Admin
+  member role (Org Admin, Editor) and refused to the Super Admin
   (operator blindness: the platform operator doesn't read an org's settings).
   Editing the matrix and the critical permissions stays
   ``org.permissions.manage``, Org Admin only.
@@ -38,16 +45,18 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_args
 from uuid import UUID, uuid4
 
 import pytest
 from asyncpg.pgproto.pgproto import UUID as PgUUID  # noqa: N811
 from pydantic import ValidationError
 
-from admino.access import Capability, Principal, can, principal_role
+from admino import access
+from admino.access import Capability, MemberRole, Principal, can, principal_role
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -59,15 +68,18 @@ if TYPE_CHECKING:
 _SA = "super_admin"
 _OA = "org_admin"
 _ED = "editor"
-_VI = "viewer"
 
-_ROLES: tuple[str, ...] = (_SA, _OA, _ED, _VI)
-_MEMBER_ROLES: tuple[str, ...] = (_OA, _ED, _VI)
+# The retired read-only member role (GH-306): only the refusal tests name it.
+_RETIRED_ROLE = "viewer"
+
+_ROLES: tuple[str, ...] = (_SA, _OA, _ED)
+_MEMBER_ROLES: tuple[str, ...] = (_OA, _ED)
 
 _SA_ONLY: frozenset[str] = frozenset({_SA})
 _ORG_ADMIN_ONLY: frozenset[str] = frozenset({_OA})
 _ORG_ADMIN_AND_EDITOR: frozenset[str] = frozenset({_OA, _ED})
-_ALL_MEMBERS: frozenset[str] = frozenset({_OA, _ED, _VI})
+# Granted to every member role: since GH-306, the Org Admin and the Editor.
+_ALL_MEMBERS: frozenset[str] = frozenset({_OA, _ED})
 _EVERYONE: frozenset[str] = frozenset(_ROLES)
 
 _EXPECTED_MATRIX: dict[str, frozenset[str]] = {
@@ -168,14 +180,25 @@ _CONTENT_PREFIXES: frozenset[str] = frozenset(
     {"chat", "file", "project", "export", "oauth", "template"}
 )
 
-# Everything a Viewer (read-only member) must not do.
-_VIEWER_WRITE_CAPABILITIES: tuple[str, ...] = (
+# The member write capabilities: messages, uploads, projects, the personal default
+# project, account connections and personal templates. Exactly the Org Admin and the
+# Editor hold them; the Super Admin never does.
+_MEMBER_WRITE_CAPABILITIES: tuple[str, ...] = (
     "chat.send",
     "file.upload",
     "project.create",
     "project.personal_default",
     "oauth.connect",
     "template.personal.manage",
+)
+
+# The read capabilities every member held before GH-306 (the retired read-only role
+# included): they stay with the Org Admin and the Editor, never the Super Admin.
+_EVERY_MEMBER_CAPABILITIES: tuple[str, ...] = (
+    "project.read_shared",
+    "org.permissions.view",
+    "export.create",
+    "usage.view.own",
 )
 
 # Platform-level capabilities: no member role ever gets any of them.
@@ -291,11 +314,33 @@ class TestRoleInvariants:
 
         assert granted == []
 
-    @pytest.mark.parametrize("capability", _VIEWER_WRITE_CAPABILITIES)
-    def test_access_viewer_is_read_only(self, capability: str) -> None:
-        """A Viewer can't write: no messages, uploads, projects, personal default
-        project, account connections or personal templates."""
-        assert can(_principal(_VI), Capability(capability)) is False
+    @pytest.mark.parametrize("capability", _MEMBER_WRITE_CAPABILITIES)
+    def test_access_write_capability_is_held_by_org_admin_and_editor_only(
+        self, capability: str
+    ) -> None:
+        """Messages, uploads, projects, the personal default project, account connections
+        and personal templates: the Org Admin and the Editor, nobody else."""
+        holders = {role for role in _ROLES if can(_principal(role), Capability(capability))}
+
+        assert holders == {_OA, _ED}
+
+    @pytest.mark.parametrize("capability", _EVERY_MEMBER_CAPABILITIES)
+    def test_access_every_member_capability_stays_with_org_admin_and_editor(
+        self, capability: str
+    ) -> None:
+        """The capabilities every member held keep their grants for the Org Admin and the
+        Editor (GH-306 changes no other role's capability); the Super Admin gets none."""
+        holders = {role for role in _ROLES if can(_principal(role), Capability(capability))}
+
+        assert holders == {_OA, _ED}
+
+    def test_access_editor_holds_no_capability_the_org_admin_lacks(self) -> None:
+        """Least privilege between the member roles: the Editor's grants are a strict
+        subset of the Org Admin's."""
+        editor = {c for c in Capability if can(_principal(_ED), c)}
+        org_admin = {c for c in Capability if can(_principal(_OA), c)}
+
+        assert editor < org_admin
 
     @pytest.mark.parametrize(
         ("capability", "role"),
@@ -306,7 +351,7 @@ class TestRoleInvariants:
         ],
     )
     def test_access_member_never_gets_platform_capability(self, capability: str, role: str) -> None:
-        """Org Admins, Editors and Viewers never get a platform-level capability."""
+        """Org Admins and Editors never get a platform-level capability."""
         assert can(_principal(role), Capability(capability)) is False
 
     @pytest.mark.parametrize("role", _MEMBER_ROLES)
@@ -342,17 +387,16 @@ class TestOrgPermissionsCapabilities:
 
     @pytest.mark.parametrize("role", _MEMBER_ROLES)
     def test_access_org_permissions_view_is_granted_to_every_member_role(self, role: str) -> None:
-        """Org Admins, Editors and Viewers all see the summary of their org's permissions."""
+        """Org Admins and Editors both see the summary of their org's permissions."""
         assert can(_principal(role), _org_permissions_view()) is True
 
     def test_access_org_permissions_view_is_refused_to_super_admin(self) -> None:
         """The Super Admin has no org and doesn't read an org's settings."""
         assert can(_principal(_SA), _org_permissions_view()) is False
 
-    @pytest.mark.parametrize("role", (_ED, _VI))
-    def test_access_editor_and_viewer_view_but_do_not_manage_permissions(self, role: str) -> None:
+    def test_access_editor_views_but_does_not_manage_permissions(self) -> None:
         """Reading the summary never implies editing the matrix."""
-        principal = _principal(role)
+        principal = _principal(_ED)
 
         assert can(principal, _org_permissions_view()) is True
         assert can(principal, Capability.ORG_PERMISSIONS_MANAGE) is False
@@ -361,11 +405,11 @@ class TestOrgPermissionsCapabilities:
         """Only the Org Admin edits the permissions, and whoever edits them may also read
         the summary."""
         managers = {r for r in _ROLES if can(_principal(r), Capability.ORG_PERMISSIONS_MANAGE)}
-        viewers = {r for r in _ROLES if can(_principal(r), _org_permissions_view())}
+        readers = {r for r in _ROLES if can(_principal(r), _org_permissions_view())}
 
         assert managers == {_OA}
-        assert managers <= viewers
-        assert viewers == set(_MEMBER_ROLES)
+        assert managers <= readers
+        assert readers == set(_MEMBER_ROLES)
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +663,7 @@ class TestPrincipal:
 
     @pytest.mark.parametrize("role", ["owner", "admin", "super_admin", "ORG_ADMIN", ""])
     def test_access_principal_unknown_role_rejected(self, role: str) -> None:
-        """role accepts only 'org_admin', 'editor' or 'viewer'."""
+        """role accepts only 'org_admin' or 'editor'."""
         with pytest.raises(ValidationError):
             Principal(user_id=uuid4(), kind="member", org_id=uuid4(), role=role)
 
@@ -655,7 +699,7 @@ class TestPrincipal:
     )
     def test_access_principal_is_frozen(self, field: str, value: object) -> None:
         """A principal can't be mutated after it is built (e.g. escalating its role)."""
-        principal = Principal(user_id=uuid4(), kind="member", org_id=uuid4(), role="viewer")
+        principal = Principal(user_id=uuid4(), kind="member", org_id=uuid4(), role="editor")
 
         with pytest.raises(ValidationError):
             setattr(principal, field, value)
@@ -742,6 +786,120 @@ class TestPrincipalAsyncpgUuid:
 
         assert principal_role(principal) is None
         assert can(principal, Capability.ORG_USERS_MANAGE) is False
+
+
+# ---------------------------------------------------------------------------
+# 5c. GH-306: two member roles; the retired read-only role is refused
+# ---------------------------------------------------------------------------
+
+
+def _member_fields(role: object) -> dict[str, Any]:
+    """A member's Principal fields with the given role (UUID objects for the IDs)."""
+    return {"user_id": uuid4(), "kind": "member", "org_id": uuid4(), "role": role}
+
+
+def _as_row(fields: dict[str, Any]) -> dict[str, Any]:
+    """The same fields as a users row hands them over: asyncpg UUIDs."""
+    return {
+        **fields,
+        "user_id": PgUUID(str(fields["user_id"])),
+        "org_id": PgUUID(str(fields["org_id"])),
+    }
+
+
+# Every way validation builds a Principal: keyword arguments, a dict, a users row's
+# asyncpg UUIDs, a JSON document, string values and strict validation.
+_PRINCIPAL_BUILDS: list[Any] = [
+    pytest.param(lambda fields: Principal(**fields), id="keywords"),
+    pytest.param(lambda fields: Principal.model_validate(fields), id="model_validate"),
+    pytest.param(
+        lambda fields: Principal.model_validate(_as_row(fields)), id="model_validate-asyncpg-row"
+    ),
+    pytest.param(
+        lambda fields: Principal.model_validate_json(json.dumps(fields, default=str)),
+        id="model_validate_json",
+    ),
+    pytest.param(
+        lambda fields: Principal.model_validate_strings({k: str(v) for k, v in fields.items()}),
+        id="model_validate_strings",
+    ),
+    pytest.param(
+        lambda fields: Principal.model_validate(fields, strict=True), id="model_validate-strict"
+    ),
+]
+
+
+def _dict_forge(principal: Principal, **fields: object) -> Principal:
+    """Overwrite fields through the instance __dict__ (another validation bypass)."""
+    for name, value in fields.items():
+        principal.__dict__[name] = value
+    return principal
+
+
+# A validated member left holding the retired role by a validation bypass.
+_RETIRED_ROLE_FORGERIES: list[Any] = [
+    pytest.param(lambda: _forge(_member(_ED), role=_RETIRED_ROLE), id="editor-setattr"),
+    pytest.param(lambda: _forge(_member(_OA), role=_RETIRED_ROLE), id="org_admin-setattr"),
+    pytest.param(lambda: _dict_forge(_member(_ED), role=_RETIRED_ROLE), id="editor-dict-write"),
+    pytest.param(
+        lambda: _forge(Principal.model_validate(_as_row(_member_fields(_ED))), role=_RETIRED_ROLE),
+        id="editor-from-asyncpg-row-setattr",
+    ),
+]
+
+
+class TestRetiredMemberRole:
+    """GH-306: MemberRole is Org Admin or Editor; nothing builds or honours the old role."""
+
+    def test_access_member_role_is_org_admin_and_editor_only(self) -> None:
+        """MemberRole lists exactly the two member roles, in the matrix's order."""
+        assert get_args(MemberRole) == (_OA, _ED)
+
+    @pytest.mark.parametrize("build", _PRINCIPAL_BUILDS)
+    def test_access_principal_with_the_retired_role_is_refused(
+        self, build: Callable[[dict[str, Any]], Principal]
+    ) -> None:
+        """The same build path that makes an Editor refuses the retired role, and the
+        error points at the role field alone."""
+        assert build(_member_fields(_ED)).role == _ED
+
+        with pytest.raises(ValidationError) as caught:
+            build(_member_fields(_RETIRED_ROLE))
+
+        assert [error["loc"] for error in caught.value.errors()] == [("role",)]
+
+    @pytest.mark.parametrize("forged", _RETIRED_ROLE_FORGERIES)
+    def test_access_forged_retired_role_has_no_principal_role(
+        self, forged: Callable[[], Principal]
+    ) -> None:
+        """principal_role fails closed: the retired role is no matrix role."""
+        assert principal_role(forged()) is None
+
+    @pytest.mark.parametrize("forged", _RETIRED_ROLE_FORGERIES)
+    def test_access_forged_retired_role_gets_no_capability(
+        self, forged: Callable[[], Principal]
+    ) -> None:
+        """Not even the capabilities the role held before GH-306 (account.manage, the
+        shared-project read, exports, own usage, the permissions summary)."""
+        principal = forged()
+
+        assert [c.value for c in Capability if can(principal, c)] == []
+
+    def test_access_principal_role_answers_only_the_three_roles(self) -> None:
+        """Over the Super Admin and a member of every MemberRole, principal_role answers
+        exactly "super_admin", "org_admin" and "editor"."""
+        principals = [
+            _super_admin(),
+            *(Principal(**_member_fields(role)) for role in get_args(MemberRole)),
+        ]
+
+        assert {principal_role(principal) for principal in principals} == {_SA, _OA, _ED}
+
+    def test_access_matrix_grants_only_the_three_roles(self) -> None:
+        """No capability of the matrix names the retired role (or any role but the three)."""
+        granted_roles = set().union(*access._MATRIX.values())
+
+        assert granted_roles == {_SA, _OA, _ED}
 
 
 # ---------------------------------------------------------------------------
@@ -1033,7 +1191,7 @@ class TestPlatformUserAdminCapabilities:
         self, name: str, role: str
     ) -> None:
         """An Org Admin manages its own org's users through org.users.*, never through the
-        platform capability; Editors and Viewers get neither."""
+        platform capability; Editors get neither."""
         assert can(_principal(role), _gh167_capability(name)) is False
 
     @pytest.mark.parametrize("name", _GH167_NAMES)

@@ -42,8 +42,8 @@ What these tests pin down:
   target → 409 ``invalid_status``.
 - All three routes depend on ``require_session`` (401 without a session),
   authorize through ``admino.access.can`` (``org.users.view`` /
-  ``org.users.manage`` / ``org.users.role_change``): an Editor, a Viewer and a
-  Super Admin get 403 ``{"detail": "Forbidden"}``; each has its own per-user
+  ``org.users.manage`` / ``org.users.role_change``): an Editor and a Super
+  Admin get 403 ``{"detail": "Forbidden"}``; each has its own per-user
   rate-limit bucket; the two writes are refused cross-origin; an audit failure
   is a 500 with nothing changed; nothing identifying reaches a log line.
 
@@ -121,7 +121,7 @@ _INVALID_STATUS = {
     "reason": "invalid_status",
 }
 _SUMMARY_KEYS = frozenset({"id", "name", "email", "role", "status", "created_at", "last_login_at"})
-_NOT_ADMINS = ["editor", "viewer", "super_admin"]
+_NOT_ADMINS = ["editor", "super_admin"]
 _OUTSIDERS = ["other-org", "unknown", "invited", "deleted", "super-admin"]
 # Lowercase marker put in submitted VALUES only (never in a key: a 422 loc repeats keys).
 _ECHO = "echomark42"
@@ -464,7 +464,7 @@ class TestRoutes:
 
 
 class TestAuthorization:
-    """Editors, Viewers and Super Admins get 403; can() decides."""
+    """Editors and Super Admins get 403; can() decides."""
 
     @pytest.mark.parametrize("who", _NOT_ADMINS)
     def test_org_users_api_list_forbidden_for_non_admins(self, db: FakeDb, who: str) -> None:
@@ -483,7 +483,7 @@ class TestAuthorization:
     @pytest.mark.parametrize(
         "body",
         [
-            pytest.param({"role": "viewer"}, id="role"),
+            pytest.param({"role": "org_admin"}, id="role"),
             pytest.param({"name": "Changed Name"}, id="name"),
             pytest.param({"email": "changed.address@example.ch"}, id="email"),
         ],
@@ -551,7 +551,7 @@ class TestAuthorization:
         _, token = _admin(db)
         target = db.add_account(role="editor")
 
-        response = _patch(_client(_app()), token, target, {"role": "viewer"})
+        response = _patch(_client(_app()), token, target, {"role": "org_admin"})
 
         assert response.status_code == 200
         assert Capability.ORG_USERS_MANAGE in spy.capabilities
@@ -583,7 +583,7 @@ class TestAuthorization:
         before = _state(db)
 
         response = _patch(
-            _client(_app()), token, target, {"role": "viewer", "name": "Changed Name"}
+            _client(_app()), token, target, {"role": "org_admin", "name": "Changed Name"}
         )
 
         assert (response.status_code, response.json()) == (403, _FORBIDDEN)
@@ -644,7 +644,7 @@ class TestList:
         created = datetime(2026, 9, 1, 9, 0, tzinfo=UTC)
         last_login = datetime(2026, 9, 30, 8, 15, tzinfo=UTC)
         target = db.add_account(
-            role="viewer",
+            role="org_admin",
             email="Shape.Person@Example.ch",
             name="Shape Person",
             created_at=created,
@@ -661,7 +661,7 @@ class TestList:
         assert (item["name"], item["email"], item["role"], item["status"]) == (
             "Shape Person",
             "Shape.Person@Example.ch",
-            "viewer",
+            "org_admin",
             "active",
         )
         assert _parsed(item["created_at"]) == created
@@ -681,7 +681,7 @@ class TestList:
         a deleted user, another org's user or a Super Admin."""
         admin, token = _admin(db)
         editor = db.add_account(role="editor")
-        viewer = db.add_account(role="viewer")
+        second_admin = db.add_account(role="org_admin")
         deactivated = db.add_account(role="editor", status="deactivated")
         _invited(db)
         db.add_account(deleted_at=_DELETED_AT)
@@ -694,7 +694,7 @@ class TestList:
         assert {item["id"] for item in users} == {
             str(admin),
             str(editor),
-            str(viewer),
+            str(second_admin),
             str(deactivated),
         }
         statuses = {item["id"]: item["status"] for item in users}
@@ -754,7 +754,7 @@ class TestPatchChanges:
 
     @pytest.mark.parametrize(
         ("old_role", "new_role"),
-        [("editor", "viewer"), ("viewer", "org_admin"), ("org_admin", "editor")],
+        [("editor", "org_admin"), ("org_admin", "editor")],
     )
     def test_org_users_api_patch_role_change(
         self, db: FakeDb, old_role: str, new_role: str
@@ -779,7 +779,7 @@ class TestPatchChanges:
         admin, token = _admin(db)
         target = db.add_account(role="editor")
 
-        response = _patch(_client(_app(), ip=_IP_B), token, target, {"role": "viewer"})
+        response = _patch(_client(_app(), ip=_IP_B), token, target, {"role": "org_admin"})
 
         assert response.status_code == 200
         row = _only_event(db, "user.role_change")
@@ -788,7 +788,7 @@ class TestPatchChanges:
             actor=admin,
             target=target,
             ip=_IP_B,
-            metadata={"old_role": "editor", "new_role": "viewer"},
+            metadata={"old_role": "editor", "new_role": "org_admin"},
         )
         assert [row["action"] for row in db.audit] == ["user.role_change"]
         assert db.outbox == []
@@ -871,10 +871,10 @@ class TestPatchChanges:
         _, token = _admin(db)
         target = db.add_account(role="editor", name="Old Name")
 
-        response = _patch(_client(_app()), token, target, {"role": "viewer", "name": "New Name"})
+        response = _patch(_client(_app()), token, target, {"role": "org_admin", "name": "New Name"})
 
         assert response.status_code == 200
-        assert (db.users[target]["role"], db.users[target]["name"]) == ("viewer", "New Name")
+        assert (db.users[target]["role"], db.users[target]["name"]) == ("org_admin", "New Name")
         assert [row["action"] for row in db.audit] == ["user.role_change", "user.profile_change"]
 
     def test_org_users_api_patch_unchanged_values_write_nothing(self, db: FakeDb) -> None:
@@ -906,17 +906,17 @@ class TestPatchChanges:
         assert response.status_code == 200
         assert db.users[target]["email"] == "Case.Person@Example.ch"
 
-    def test_org_users_api_patch_demotion_to_viewer_deletes_nothing(self, db: FakeDb) -> None:
-        """Sessions, OAuth connections and memory are kept (#162 derives the effect from the
-        role); the demoted user's session still works."""
+    def test_org_users_api_patch_demotion_deletes_nothing(self, db: FakeDb) -> None:
+        """A second Org Admin demoted to Editor keeps their sessions, OAuth connections and
+        memory (#162 derives the effect from the role); their session still works."""
         _, token = _admin(db)
-        target = db.add_account(role="editor")
+        target = db.add_account(role="org_admin")
         target_tokens = [db.open_session(target), db.open_session(target)]
         db.add_oauth_token(target, "google", encrypted_refresh_token="gAAAA-fake-ciphertext")
         db.add_memory(target, "favourite.colour", "blue")
         client = _client(_app())
 
-        response = _patch(client, token, target, {"role": "viewer"})
+        response = _patch(client, token, target, {"role": "editor"})
 
         assert response.status_code == 200
         assert not any(db.session_revoked(session) for session in target_tokens)
@@ -967,7 +967,7 @@ class TestPatchRefusals:
             _client(_app()),
             token,
             target,
-            {"role": "viewer", "name": "Changed Name", "email": "changed@example.ch"},
+            {"role": "org_admin", "name": "Changed Name", "email": "changed@example.ch"},
         )
 
         assert response.status_code == 404
@@ -979,18 +979,17 @@ class TestPatchRefusals:
         targets = [_outsider(db, case) for case in _OUTSIDERS]
         client = _client(_app())
 
-        responses = [_patch(client, token, target, {"role": "viewer"}) for target in targets]
+        responses = [_patch(client, token, target, {"role": "org_admin"}) for target in targets]
 
         assert {response.status_code for response in responses} == {404}
         assert len({response.content for response in responses}) == 1
 
-    @pytest.mark.parametrize("new_role", ["editor", "viewer"])
     @pytest.mark.parametrize(
         "other",
         ["none", "admin-deactivated", "admin-invited", "admin-in-other-org"],
     )
     def test_org_users_api_patch_self_demotion_of_last_active_admin_is_409(
-        self, db: FakeDb, new_role: str, other: str
+        self, db: FakeDb, other: str
     ) -> None:
         """The org's only ACTIVE Org Admin demoting themselves → 409 last_admin; the role
         and the name sent along are unchanged and nothing is audited."""
@@ -1003,7 +1002,7 @@ class TestPatchRefusals:
             db.add_account(role="org_admin", org_id=OTHER_ORG_ID)
         before = _state(db)
 
-        response = _patch(_client(_app()), token, admin, {"role": new_role, "name": "Changed"})
+        response = _patch(_client(_app()), token, admin, {"role": "editor", "name": "Changed"})
 
         assert response.status_code == 409
         assert response.json() == _LAST_ADMIN
@@ -1023,10 +1022,10 @@ class TestPatchRefusals:
         _, token = _admin(db)
         target = db.add_account(role="org_admin", status="deactivated")
 
-        response = _patch(_client(_app()), token, target, {"role": "viewer"})
+        response = _patch(_client(_app()), token, target, {"role": "editor"})
 
         assert response.status_code == 200
-        assert db.users[target]["role"] == "viewer"
+        assert db.users[target]["role"] == "editor"
 
     def test_org_users_api_patch_org_admin_on_the_last_admin_is_a_no_op(self, db: FakeDb) -> None:
         """Setting org_admin on the last admin passes the guard and writes nothing."""
@@ -1086,7 +1085,7 @@ class TestPatchRefusals:
             _client(_app(), ip=_IP_B),
             token,
             target,
-            {"role": "viewer", "name": "Changed Name", "email": "Taken.Person@example.ch"},
+            {"role": "org_admin", "name": "Changed Name", "email": "Taken.Person@example.ch"},
         )
 
         assert response.status_code == 409
@@ -1111,7 +1110,7 @@ class TestPatchRefusals:
             pytest.param({"name": "Valid Name", "user_id": _ECHO}, id="user_id"),
             pytest.param({"name": "Valid Name", "status": "deactivated-" + _ECHO}, id="status"),
             pytest.param({"name": "Valid Name", "password": "Violet-" + _ECHO}, id="password"),
-            pytest.param({"role": "viewer", "kind": "super_admin"}, id="kind"),
+            pytest.param({"role": "editor", "kind": "super_admin"}, id="kind"),
             pytest.param({"role": "super_admin"}, id="role-super-admin"),
             pytest.param({"role": _ECHO}, id="role-unknown"),
             pytest.param({"role": "Editor"}, id="role-capitalized"),
@@ -1213,17 +1212,17 @@ class TestRefusedEmailBudget:
         app = _app()
         monkeypatch.setitem(server._RATE_LIMITS, _KEY_REFUSED, (0.001, 5))
         _, token = _admin(db)
-        target = db.add_account(role="editor")
+        target = db.add_account(role="org_admin")
         client = _client(app)
         for email in self._taken(db, 5):
             assert _patch(client, token, target, {"email": email}).status_code == 409
 
         renamed = _patch(client, token, target, {"name": "Still Allowed"})
-        demoted = _patch(client, token, target, {"role": "viewer"})
+        demoted = _patch(client, token, target, {"role": "editor"})
 
         assert renamed.status_code == 200
         assert demoted.status_code == 200
-        assert (db.users[target]["name"], db.users[target]["role"]) == ("Still Allowed", "viewer")
+        assert (db.users[target]["name"], db.users[target]["role"]) == ("Still Allowed", "editor")
 
     def test_org_users_api_refused_budget_is_per_admin(
         self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
@@ -1536,7 +1535,7 @@ class TestCrossOrigin:
         target = db.add_account(role="editor")
         before = _state(db)
 
-        response = _patch(_client(_app()), token, target, {"role": "viewer"}, **headers)
+        response = _patch(_client(_app()), token, target, {"role": "org_admin"}, **headers)
 
         assert response.status_code == 403
         assert response.json() == _CSRF_REFUSED
@@ -1571,7 +1570,7 @@ class TestAuditFailure:
     @pytest.mark.parametrize(
         "body",
         [
-            pytest.param({"role": "viewer"}, id="role"),
+            pytest.param({"role": "org_admin"}, id="role"),
             pytest.param({"name": "Changed Name"}, id="name"),
             pytest.param({"email": "changed.address@example.ch"}, id="email"),
         ],
@@ -1624,7 +1623,7 @@ class TestOneTransaction:
             _client(_app()),
             token,
             target,
-            {"role": "viewer", "name": "New Name", "email": "new.address@example.ch"},
+            {"role": "org_admin", "name": "New Name", "email": "new.address@example.ch"},
         )
 
         assert response.status_code == 200
@@ -1763,15 +1762,15 @@ class TestListSeats:
         assert all(type(value) is int for value in seats.values())
 
     def test_org_users_api_seats_count_active_and_invited_users_only(self, db: FakeDb) -> None:
-        """Counted: the admin, an Editor, a Viewer, a pending and an expired invitation (5).
+        """Counted: the admin, two Editors, a pending and an expired invitation (5).
         Not counted: a deactivated user, a deleted user, another org's users and
         invitations, a Super Admin."""
         db.add_org(ORG_ID, seats=_SEATS)
         _, token = _admin(db)
         db.add_account(role="editor")
-        db.add_account(role="viewer")
+        db.add_account(role="editor")
         _invited(db)
-        expired = db.add_account(role="viewer", status="invited", name=None, password_hash=None)
+        expired = db.add_account(role="editor", status="invited", name=None, password_hash=None)
         db.add_invitation(expired, sent_ago=timedelta(days=10))
         db.add_account(role="editor", status="deactivated")
         db.add_account(deleted_at=_DELETED_AT)
@@ -1847,7 +1846,7 @@ class TestListSeats:
     def test_org_users_api_seats_follow_a_deletion(self, db: FakeDb) -> None:
         db.add_org(ORG_ID, seats=_SEATS)
         _, token = _admin(db)
-        target = db.add_account(role="viewer")
+        target = db.add_account(role="editor")
         client = _client(_app())
         before = _seats(client, token)
 

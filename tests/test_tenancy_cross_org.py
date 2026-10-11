@@ -2,8 +2,8 @@
 
 Org A's callers against org B's resources, through the real app, real session
 cookies and the in-memory database of tests/db_fakes.py (the world of
-tests/tenancy_world.py: two orgs, each with an Org Admin, an Editor and a
-Viewer, plus a Super Admin):
+tests/tenancy_world.py: two orgs, each with an Org Admin and an Editor, plus a
+Super Admin):
 
 - ``path_id`` routes (a resource id in the path, or the chat confirmation):
   another org's id answers 404 with exactly the body of an unknown id, never
@@ -17,8 +17,8 @@ Viewer, plus a Super Admin):
   "chat_not_found"}`` like an unknown id; B's row, messages and pending
   confirmation stay, no ``chat.delete`` row is written, the agent never runs
   and B's title and content never appear. Chats are private to their owner: a
-  colleague's chat in the caller's own org (an Org Admin's, an Editor's, a
-  Viewer's) is the same 404, for an Org Admin too. The stop route answers
+  colleague's chat in the caller's own org (an Org Admin's, an Editor's) is
+  the same 404, for an Org Admin too. The stop route answers
   ``200 {"stopped": false}`` on the caller's own idle chat (the control).
 - GH-187's attachment routes: an upload (``POST /api/chats/{chat_id}/attachments``,
   a raw body) into org B's chat, a colleague's chat or an unknown id is the
@@ -49,7 +49,7 @@ Viewer, plus a Super Admin):
   ``DELETE /api/trash`` purges only the caller's own (``own_user``); a
   colleague's trash and the role refusals are in tests/test_trash_isolation.py.
 - GH-245: ``POST /api/chats/{chat_id}/retry`` (no body) on org B's chat, a
-  colleague's (an Org Admin's, an Editor's, a Viewer's; for an Org Admin too) or an
+  colleague's (an Org Admin's, an Editor's; for an Org Admin too) or an
   unknown id is the chat routes' ``chat_not_found`` 404, also when that chat's
   last turn failed and its owner could retry it: nothing runs, the failed turn
   stays (its messages and their statuses), no statement deletes it. The control
@@ -68,7 +68,9 @@ Viewer, plus a Super Admin):
   a deactivated user, an invited account) is a 404 "User not found" for org
   A's Org Admin, never a 409 that would tell its state, and B's user keeps
   its row, sessions, connections, notes, settings, reset token, queued emails
-  and in-memory state.
+  and in-memory state. The PATCH demotes to Editor (GH-306: a real role change
+  that runs the last-admin guard): its controls act on a second Org Admin of
+  the caller's org.
 - ``own_user`` routes: only the caller's own data: sessions, settings, the
   account, logout, OAuth connections (and the data residency of the caller's
   own org), the chat list and chat creation (GH-176: the caller's org and
@@ -165,8 +167,9 @@ _A_DEACTIVATED: Final = "a-deactivated-164@example.ch"
 _B_DEACTIVATED: Final = "b-deactivated-164@example.ch"
 _B_INVITED: Final = "b-invited-164@example.ch"
 _USER_NOT_FOUND: Final = {"detail": "User not found"}
-# One PATCH that changes every field the body allows: role, name and email.
-_USER_PATCH: Final = {"role": "viewer", "name": "Umbenannt 164", "email": "renamed-164@example.ch"}
+# One PATCH that changes every field the body allows on an Org Admin: role (a demotion,
+# through the last-admin guard, GH-306), name and email.
+_USER_PATCH: Final = {"role": "editor", "name": "Umbenannt 164", "email": "renamed-164@example.ch"}
 _PROVIDERS: Final = ("google", "microsoft")
 _LABELS: Final = {"google": "Google", "microsoft": "Microsoft"}
 
@@ -511,10 +514,25 @@ def _a_editor_id(world: World, _client: TestClient) -> str:
     return str(world.a["editor"].user_id)
 
 
+def _second_org_admin(world: World, org_id: uuid.UUID) -> str:
+    """A second active Org Admin of the org (the world's stays), with a live session; its id."""
+    user_id = world.db.add_account(role="org_admin", org_id=org_id)
+    world.db.open_session(user_id)
+    return str(user_id)
+
+
+def _b_second_org_admin(world: World, _client: TestClient) -> str:
+    return _second_org_admin(world, world.org_b)
+
+
+def _a_second_org_admin(world: World, _client: TestClient) -> str:
+    return _second_org_admin(world, world.org_a)
+
+
 def _deactivated(world: World, org_id: uuid.UUID, email: str) -> str:
-    """A deactivated Viewer of the org (no session); its id."""
+    """A deactivated Editor of the org (no session); its id."""
     return str(
-        world.db.add_account(role="viewer", org_id=org_id, status="deactivated", email=email)
+        world.db.add_account(role="editor", org_id=org_id, status="deactivated", email=email)
     )
 
 
@@ -877,12 +895,13 @@ _PATH_ID_CASES: Final[dict[Route, _PathIdCase]] = {
         send=_force_logout,
         unknown_id=_uuid_id,
     ),
+    # GH-306: the PATCH demotes; its targets are second Org Admins (each org keeps its own).
     ("PATCH", "/api/org/users/{user_id}"): _PathIdCase(
         caller="org_admin",
         detail="User not found",
         own_status=200,
-        seed_foreign=_b_editor_id,
-        seed_own=_a_editor_id,
+        seed_foreign=_b_second_org_admin,
+        seed_own=_a_second_org_admin,
         send=_patch_user,
         unknown_id=_uuid_id,
     ),
@@ -1014,7 +1033,6 @@ _CHAT_ROUTE_PARAMS: Final = [
 _COLLEAGUE_PAIRS: Final = [
     pytest.param("editor", "org_admin", id="editor-on-org-admins-chat"),
     pytest.param("org_admin", "editor", id="org-admin-on-editors-chat"),
-    pytest.param("org_admin", "viewer", id="org-admin-on-viewers-chat"),
 ]
 
 # GH-187: the attachment reads (metadata and download) that name an attachment, and
@@ -1055,7 +1073,7 @@ _USER_ROUTE_PARAMS: Final = [
 ]
 # Every kind of org B account a user route could be pointed at. B's Org Admin is
 # B's only one: a guard that ran before the org check would answer 409 last_admin.
-_FOREIGN_KINDS: Final = ("org_admin", "editor", "viewer", "deactivated", "invited")
+_FOREIGN_KINDS: Final = ("org_admin", "editor", "deactivated", "invited")
 
 
 def _foreign_account(world: World, kind: str) -> str:
@@ -1250,8 +1268,8 @@ class TestPathIdSideEffects:
     def test_cross_org_user_route_on_any_kind_of_foreign_account_is_404_and_changes_nothing(
         self, world: World, client: TestClient, route: Route, kind: str
     ) -> None:
-        """B's last Org Admin, Editor, Viewer, a deactivated user and an invited account
-        are each a 404 "User not found" for A's Org Admin, never a 409 (last_admin,
+        """B's last Org Admin, Editor, a deactivated user and an invited account are
+        each a 404 "User not found" for A's Org Admin, never a 409 (last_admin,
         invalid_status, seat_limit) that would tell the account's state; nothing changes."""
         sender = _PATH_ID_CASES[route].send
         target = _foreign_account(world, kind)
@@ -1552,7 +1570,7 @@ class TestChatRetryPathRoute:
         owner_role: MemberRole,
     ) -> None:
         """A colleague's chat in the caller's own org whose answer failed (an Org Admin's,
-        an Editor's, a Viewer's; an Org Admin calling too): the same 404 as an unknown
+        an Editor's; an Org Admin calling too): the same 404 as an unknown
         id, nothing changes (tables, chat runtime, files), no run, and the owner's
         title, content and chat id never appear."""
         chat_id = _failed_marked_chat(world, world.a[owner_role], "A-colleague-245")
@@ -1608,8 +1626,8 @@ class TestAttachmentPathRoutes:
         caller_role: MemberRole,
         owner_role: MemberRole,
     ) -> None:
-        """A colleague's attachment in the caller's own org (an Org Admin's, an Editor's, a
-        Viewer's) is the same 404 as an unknown id, for an Org Admin too (the chat's owner
+        """A colleague's attachment in the caller's own org (an Org Admin's, an Editor's)
+        is the same 404 as an unknown id, for an Org Admin too (the chat's owner
         only, V1); nothing changes and the name and bytes never appear."""
         case = _PATH_ID_CASES[route]
         attachment_id = _marked_attachment(world, world.a[owner_role], "A-colleague-187")
@@ -1874,7 +1892,7 @@ class TestOwnOrgRoutes:
         assert b_before[("gmail", "send")]["pending_at"] is not None
 
     @covers(("GET", "/api/permissions/summary"))
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     def test_cross_org_permissions_summary_reflects_only_the_callers_org(
         self, world: World, client: TestClient, role: MemberRole
     ) -> None:
@@ -1960,10 +1978,10 @@ class TestOwnOrgRoutes:
     def test_cross_org_org_user_seats_count_only_the_callers_org(
         self, world: World, client: TestClient
     ) -> None:
-        """GH-165: org A (12 seats) and org B (40 seats) each hold their three members.
+        """GH-165: org A (12 seats) and org B (40 seats) each hold their two members.
         A invites one user; B invites one, has a pending and an expired invited account, a
-        deactivated user and three more Editors. A's seats are {"used": 4, "limit": 12}
-        (B's active and invited users never count, A's own limit), B's {"used": 9,
+        deactivated user and three more Editors. A's seats are {"used": 3, "limit": 12}
+        (B's active and invited users never count, A's own limit), B's {"used": 8,
         "limit": 40}; neither is shifted by the other org or by the Super Admin."""
         world.db.add_org(world.org_a, seats=12)
         world.db.add_org(world.org_b, seats=40)
@@ -1971,7 +1989,7 @@ class TestOwnOrgRoutes:
         _invite(client, world.b["org_admin"], _B_INVITEE)
         _b_invited(world)
         expired = world.db.add_account(
-            role="viewer", org_id=world.org_b, status="invited", name=None, password_hash=None
+            role="editor", org_id=world.org_b, status="invited", name=None, password_hash=None
         )
         world.db.add_invitation(expired, sent_ago=timedelta(days=10))
         _b_deactivated(world, client)
@@ -1983,8 +2001,8 @@ class TestOwnOrgRoutes:
 
         assert a_view.status_code == 200, a_view.text
         assert b_view.status_code == 200, b_view.text
-        assert a_view.json().get("seats") == {"used": 4, "limit": 12}
-        assert b_view.json().get("seats") == {"used": 9, "limit": 40}
+        assert a_view.json().get("seats") == {"used": 3, "limit": 12}
+        assert b_view.json().get("seats") == {"used": 8, "limit": 40}
 
 
 # ---------------------------------------------------------------------------
@@ -1995,10 +2013,8 @@ _EVERYONE: Final = (
     "super_admin",
     "a.org_admin",
     "a.editor",
-    "a.viewer",
     "b.org_admin",
     "b.editor",
-    "b.viewer",
 )
 
 
@@ -2037,7 +2053,7 @@ class TestOwnUserAccountRoutes:
         assert response.status_code == 204, response.text
         assert world.db.session_revoked(caller.token)
         others = [account for account in world.everyone() if account != caller]
-        assert [world.db.session_revoked(account.token) for account in others] == [False] * 6
+        assert [world.db.session_revoked(account.token) for account in others] == [False] * 4
         assert client.get("/api/auth/me", headers=world.b["editor"].cookie).status_code == 200
 
     @covers(("GET", "/api/me/sessions"))
@@ -2197,7 +2213,7 @@ class TestOwnUserAccountRoutes:
 
         assert response.status_code == 204, response.text
         assert world.db.sessions_of(caller.user_id) == []
-        assert [world.db.session_revoked(account.token) for account in others] == [False] * 6
+        assert [world.db.session_revoked(account.token) for account in others] == [False] * 4
         assert {
             account.user_id: world.db.users[account.user_id]["password_hash"] for account in others
         } == hashes
@@ -2572,7 +2588,7 @@ def _platform_target(world: World, action: str) -> str:
     """The org B account ``action`` applies to on org B's own path; its id.
 
     An active Editor (deactivate, password reset; it has a second session and a
-    live reset token), a deactivated Viewer (reactivate), or B's first Org
+    live reset token), a deactivated Editor (reactivate), or B's first Org
     Admin, still invited with a pending invitation, while neither org has an
     active Org Admin (re-invite: on org A's path a leaked target would be
     resent, not refused for another reason).
@@ -2609,8 +2625,8 @@ class TestPlatformUserRoutes:
     def test_cross_org_platform_user_action_on_any_kind_of_other_org_account_is_404(
         self, world: World, client: TestClient, action: str, kind: str
     ) -> None:
-        """B's last Org Admin, Editor, Viewer, a deactivated user and an invited account are
-        each a 404 "User not found" on org A's path, never a 409 (last_admin,
+        """B's last Org Admin, Editor, a deactivated user and an invited account are each
+        a 404 "User not found" on org A's path, never a 409 (last_admin,
         invalid_status, seat_limit, has_active_admin) that would tell the account's
         state; nothing changes."""
         target = _foreign_account(world, kind)
@@ -2695,7 +2711,7 @@ class TestPlatformUserRoutes:
         world.db.add_org(world.org_a, seats=12)
         a_off = _a_deactivated(world, client)
         a_invited = world.db.add_account(
-            role="viewer",
+            role="editor",
             org_id=world.org_a,
             status="invited",
             name=None,
@@ -2727,7 +2743,7 @@ class TestPlatformUserRoutes:
         ]
         assert [mark for mark in others if mark in users.text] == []
         assert metadata.status_code == 200, metadata.text
-        assert metadata.json()["seats"] == {"used": 4, "limit": 12}
+        assert metadata.json()["seats"] == {"used": 3, "limit": 12}
 
 
 # ---------------------------------------------------------------------------

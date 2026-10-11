@@ -36,7 +36,7 @@ What is pinned:
   colleague's (an Org Admin's request on an Editor's item included), an unknown,
   an already trashed item and a file of a trashed chat, nothing changed (rows,
   files, audit), at retention 0 too; a non-UUID id 422.
-- Roles (``chat.send``): Org Admin and Editor may, Viewer and Super Admin 403,
+- Roles (``chat.send``): Org Admin and Editor may, the Super Admin 403,
   no session 401; CSRF; the ``/api/attachments/delete`` bucket (0.5, 5) per user
   and ``/api/chats/delete`` unchanged; the route's declared 204.
 - No log record carries a title or a file name.
@@ -124,7 +124,7 @@ def root(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, root: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database, the
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database, the
     attachments root at ``root``, every rate-limit bucket roomy."""
     db = FakeDb()
     built = build_world(db)
@@ -620,18 +620,15 @@ class TestDeleteAttachmentGuards:
         assert response.status_code == 204, response.text
         assert _trash_columns(world.db.attachment_row(file_id)) == (True, str(file_id))
 
-    @pytest.mark.parametrize("role", ["viewer", "super_admin"])
-    def test_trash_delete_attachment_viewer_and_super_admin_are_403_and_change_nothing(
-        self, world: World, client: TestClient, role: str
+    def test_trash_delete_attachment_super_admin_is_403_and_changes_nothing(
+        self, world: World, client: TestClient
     ) -> None:
-        """The Viewer on their own file and the Super Admin on an Editor's: 403 Forbidden,
-        nothing changed."""
-        caller = world.super_admin if role == "super_admin" else world.a["viewer"]
-        owner = world.a["viewer"] if role == "viewer" else world.a["editor"]
-        file_id = _file(world.db, _chat(world.db, owner))
+        """The Super Admin (no ``chat.send``) on an Editor's file: 403 Forbidden, nothing
+        changed."""
+        file_id = _file(world.db, _chat(world.db, world.a["editor"]))
         before = _state(world.db)
 
-        response = _delete_file(client, caller, file_id)
+        response = _delete_file(client, world.super_admin, file_id)
 
         assert _outcome(response) == (403, FORBIDDEN)
         assert _state(world.db) == before

@@ -6,8 +6,8 @@ Admin (the operator) sees no content. It runs in ``make check`` with the rest
 of tests/ and is made of five files:
 
 - ``tests/tenancy_world.py``: the shared world (orgs A and B, each with an Org
-  Admin, an Editor and a Viewer, plus a Super Admin, all with live sessions in
-  the FakeDb of tests/db_fakes.py) and the route catalog: ``ROUTES`` (every
+  Admin and an Editor, plus a Super Admin, all with live sessions in the FakeDb
+  of tests/db_fakes.py) and the route catalog: ``ROUTES`` (every
   registered API route with its audience, gating capability and isolation
   kind), ``ROLE_MATRIX`` (#139 §2.1 spelled out from the tracker),
   ``PENDING_CAPABILITIES``, ``SERVICE_CAPABILITIES`` and ``PROJECT_ROLES``
@@ -16,7 +16,8 @@ of tests/ and is made of five files:
   check; route enumeration (every registered route has a catalog row and the
   catalog has no stale row, every non-public route depends on
   ``server.require_session``, every capability is routed (by a route or by
-  a route's service) or pending, the catalog agrees with ``access.can``);
+  a route's service) or pending, the catalog agrees with ``access.can``, and
+  its roles are every role a ``Principal`` can hold);
   operator blindness (the Super Admin gets 403/404 with a bare
   ``{"detail": ...}`` on every member route, and platform response models
   carry no title/name/content/file name field except the org name); request
@@ -54,6 +55,10 @@ a trashed chat (``/api/trash/chats/{chat_id}``) and of a file trashed on its own
 GH-245 adds ``POST /api/chats/{chat_id}/retry`` (no body; a request on a chat of the
 caller's own whose one turn failed, so the stub agent re-runs it: 200). Its section 7
 pins the retry's cross-site refusal (403, nothing run or changed).
+GH-306 retires the read-only member role: the world has five accounts, and the org
+user requests that change an account (force logout, role change, deactivation,
+password reset, the Super Admin's deactivation and password reset) act on a fresh
+member of org A seeded per request, never on an account of the world.
 
 Adding a route (each later issue): give it a ``RouteSpec`` row in
 ``ROUTES`` (tests/tenancy_world.py), a well-formed request in ``_REQUESTS``
@@ -151,7 +156,7 @@ _SMUGGLED_FIELDS: Final = ("org_id", "user_id")
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
-    """Orgs A and B with an Org Admin, an Editor and a Viewer each, plus a Super Admin.
+    """Orgs A and B with an Org Admin and an Editor each, plus a Super Admin.
 
     The FakeDb backs ``admino.database.get_pool()``; passwords hash fast; every
     rate bucket is roomy (the rate-limit tests read the bucket keys, not the
@@ -237,31 +242,42 @@ def _own_second_session(world: World, caller: Account, _client: TestClient) -> _
     return _Request("DELETE", f"/api/me/sessions/{world.db.session_id_of(token)}")
 
 
-def _org_user_logout(world: World, _caller: Account, _client: TestClient) -> _Request:
-    """Force logout of org A's Viewer."""
-    return _Request("POST", f"/api/org/users/{world.a['viewer'].user_id}/logout")
-
-
-def _org_a_member(world: World, *, status: str = "active") -> str:
-    """Seed a fresh Editor of org A (never the last Org Admin); return its id."""
+def _org_a_member(world: World, *, status: str = "active", role: str = "editor") -> str:
+    """Seed a fresh member of org A with ``role`` (an Editor by default; never the
+    org's last Org Admin) in ``status``; return its id."""
     return str(
         world.db.add_account(
-            role="editor",
+            role=role,
             org_id=world.org_a,
             status=status,
-            email=f"managed-{status}-164@example.ch",
+            email=f"managed-{role.replace('_', '-')}-{status}-164@example.ch",
         )
     )
 
 
+def _org_a_live_member(world: World, *, role: str = "editor") -> str:
+    """Seed a fresh active member of org A with ``role`` and a live session (GH-306: the
+    target of an action that changes the account, never an account of the world); its id."""
+    user_id = _org_a_member(world, role=role)
+    world.db.open_session(uuid.UUID(user_id))
+    return user_id
+
+
+def _org_user_logout(world: World, _caller: Account, _client: TestClient) -> _Request:
+    """Force logout of a fresh active Editor of org A (it has a live session)."""
+    return _Request("POST", f"/api/org/users/{_org_a_live_member(world)}/logout")
+
+
 def _org_user_patch(world: World, _caller: Account, _client: TestClient) -> _Request:
-    """PATCH org A's Viewer to Editor (GH-164)."""
-    return _Request("PATCH", f"/api/org/users/{world.a['viewer'].user_id}", {"role": "editor"})
+    """PATCH a fresh second Org Admin of org A to Editor (GH-164: a real role change, a
+    demotion through the last-admin guard; org A keeps its own Org Admin)."""
+    target = _org_a_live_member(world, role="org_admin")
+    return _Request("PATCH", f"/api/org/users/{target}", {"role": "editor"})
 
 
 def _org_user_deactivate(world: World, _caller: Account, _client: TestClient) -> _Request:
-    """Deactivate org A's (active) Viewer."""
-    return _Request("POST", f"/api/org/users/{world.a['viewer'].user_id}/deactivate")
+    """Deactivate a fresh active Editor of org A (it has a live session)."""
+    return _Request("POST", f"/api/org/users/{_org_a_live_member(world)}/deactivate")
 
 
 def _org_user_reactivate(world: World, _caller: Account, _client: TestClient) -> _Request:
@@ -277,8 +293,8 @@ def _org_user_delete(world: World, _caller: Account, _client: TestClient) -> _Re
 
 
 def _org_user_password_reset(world: World, _caller: Account, _client: TestClient) -> _Request:
-    """Send org A's (active) Viewer a password reset link."""
-    return _Request("POST", f"/api/org/users/{world.a['viewer'].user_id}/password-reset")
+    """Send a fresh active Editor of org A (it has a live session) a password reset link."""
+    return _Request("POST", f"/api/org/users/{_org_a_live_member(world)}/password-reset")
 
 
 def _pending_invitation_id(world: World) -> str:
@@ -475,9 +491,10 @@ def _platform_org_user(action: str, target: Callable[[World], str]) -> _Builder:
     return build
 
 
-def _org_a_viewer(world: World) -> str:
-    """Org A's active Viewer (never the org's last Org Admin)."""
-    return str(world.a["viewer"].user_id)
+def _org_a_active(world: World) -> str:
+    """A fresh active Editor of org A with a live session (never the org's last Org
+    Admin, never an account of the world)."""
+    return _org_a_live_member(world)
 
 
 def _org_a_deactivated(world: World) -> str:
@@ -650,13 +667,13 @@ _REQUESTS: Final[dict[tuple[str, str], _Builder]] = {
     ("GET", "/api/platform/orgs/{org_id}/users"): _platform_org("GET", "/users"),
     ("GET", "/api/platform/orgs/{org_id}/metadata"): _platform_org("GET", "/metadata"),
     ("POST", "/api/platform/orgs/{org_id}/users/{user_id}/deactivate"): _platform_org_user(
-        "deactivate", _org_a_viewer
+        "deactivate", _org_a_active
     ),
     ("POST", "/api/platform/orgs/{org_id}/users/{user_id}/reactivate"): _platform_org_user(
         "reactivate", _org_a_deactivated
     ),
     ("POST", "/api/platform/orgs/{org_id}/users/{user_id}/password-reset"): _platform_org_user(
-        "password-reset", _org_a_viewer
+        "password-reset", _org_a_active
     ),
     ("POST", "/api/platform/orgs/{org_id}/users/{user_id}/invitation"): _platform_reinvite,
     ("GET", "/api/platform/diagnostics"): _plain("GET", "/api/platform/diagnostics"),
@@ -781,6 +798,16 @@ def _body_annotation(route: APIRoute) -> Any:
     return route.body_field.field_info.annotation
 
 
+def _literal_values(annotation: Any) -> set[str]:
+    """Every string value of the ``Literal`` types inside a type (through Optional/unions)."""
+    if typing.get_origin(annotation) is typing.Literal:
+        return {value for value in typing.get_args(annotation) if isinstance(value, str)}
+    found: set[str] = set()
+    for arg in typing.get_args(annotation):
+        found |= _literal_values(arg)
+    return found
+
+
 def _writes_since(db: FakeDb, mark: int) -> list[str]:
     """Data-changing statements since call ``mark``, except the session refresh."""
     return [
@@ -797,10 +824,10 @@ def _writes_since(db: FakeDb, mark: int) -> list[str]:
 
 
 class TestWorld:
-    """Two orgs x (Org Admin, Editor, Viewer), plus a Super Admin."""
+    """Two orgs x (Org Admin, Editor), plus a Super Admin."""
 
-    def test_tenancy_world_has_seven_distinct_accounts(self, world: World) -> None:
-        """Exactly the seven accounts, each with its own id, email and token."""
+    def test_tenancy_world_has_five_distinct_accounts(self, world: World) -> None:
+        """Exactly the five accounts, each with its own id, email and token."""
         accounts = world.everyone()
 
         assert (
@@ -809,7 +836,7 @@ class TestWorld:
             len({a.email for a in accounts}),
             len({a.token for a in accounts}),
             len(world.db.users),
-        ) == (7, 7, 7, 7, 7)
+        ) == (5, 5, 5, 5, 5)
 
     def test_tenancy_world_has_two_distinct_orgs(self, world: World) -> None:
         """Org A and org B are different organizations, both stored."""
@@ -1050,6 +1077,20 @@ class TestCatalogConsistency:
         assert {role for role, principal in principals.items() if can(principal, capability)} == (
             set(ROLE_MATRIX[capability])
         )
+
+    def test_tenancy_suite_roles_are_every_role_a_principal_can_hold(self) -> None:
+        """GH-306: the suite's roles are the Super Admin plus exactly the member roles a
+        ``Principal`` accepts (its ``role`` field; #139 §2.1 has three columns), so no
+        role reaches ``access.can`` without the role cases of this suite, and the matrix
+        check above sees every role."""
+        member_roles = _literal_values(Principal.model_fields["role"].annotation)
+        kinds = _literal_values(Principal.model_fields["kind"].annotation)
+
+        assert (sorted(member_roles), sorted(kinds)) == (
+            sorted(MEMBER_ROLES),
+            ["member", "super_admin"],
+        )
+        assert sorted(ROLES) == sorted({"super_admin", *MEMBER_ROLES})
 
     def test_tenancy_audiences_match_their_capabilities(self) -> None:
         """Public rows are ungated; account rows admit the SA; member rows refuse the SA;

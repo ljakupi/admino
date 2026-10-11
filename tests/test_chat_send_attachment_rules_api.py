@@ -1,8 +1,8 @@
 """HTTP spec of GH-189's send rules on ``POST /api/chats/{chat_id}/messages`` (Decision 7).
 
 The app from ``create_app()`` runs against the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, all with real session cookies). The agent is the stub of
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, all
+with real session cookies). The agent is the stub of
 tests/test_chat_attachments_api.py (``_Script``): it binds every call to
 ``Agent.run``'s signature (``attachments`` included, C11), records it and answers
 one final reply. Attachment rows are seeded with ``FakeDb.add_attachment``; a
@@ -146,7 +146,7 @@ def root(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, root: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database, with
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database, with
     the attachments root at ``root``."""
     db = FakeDb()
     built = build_world(db)

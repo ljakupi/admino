@@ -299,7 +299,7 @@ class TestNewLoginAfterAChange:
                 ORG_ID, session_idle_timeout_minutes=stored[0], session_max_lifetime_hours=stored[1]
             )
         admin_token = _admin_session(db)
-        member = _account(db, "viewer")
+        member = _account(db, "editor")
         client = _client()
 
         response = _patch(client, admin_token, _security(*patch))
@@ -323,7 +323,7 @@ class TestNewLoginAfterAChange:
 class TestOpenSessionsFollow:
     """Every live session of every user of the org takes the new policy."""
 
-    @pytest.mark.parametrize("role", ["editor", "viewer", "org_admin"])
+    @pytest.mark.parametrize("role", ["editor", "org_admin"])
     def test_org_session_policy_open_session_follows_the_change(
         self, db: FakeDb, role: str
     ) -> None:
@@ -606,10 +606,10 @@ class TestSameTransaction:
     def test_org_session_policy_audit_counts_the_retimed_sessions(self, db: FakeDb) -> None:
         """One org.settings_change event: the old and new values of both fields and
         sessions_updated = the org's live sessions (the Org Admin's, an Editor's and a
-        Viewer's: 3), not the ended one, another org's or the Super Admin's."""
+        second Org Admin's: 3), not the ended one, another org's or the Super Admin's."""
         admin_token = _admin_session(db)
         db.open_session(_account(db, "editor"))
-        db.open_session(_account(db, "viewer"))
+        db.open_session(_account(db, "org_admin"))
         db.open_session(_account(db), last_seen_ago=timedelta(minutes=70))
         db.open_session(_account(db, "editor", OTHER_ORG_ID))
         db.open_session(_super_admin(db))

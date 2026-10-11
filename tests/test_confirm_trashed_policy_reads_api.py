@@ -16,8 +16,8 @@ The negative: the same flow on a live chat with nothing due answers ``200``.
 
 Harness (copied from tests/test_confirm_policy_lock_wait_api.py and
 tests/test_confirm_lock_wait_api.py): the app from ``create_app()`` on the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer each, a
-Super Admin, real session cookies), org A storing ``memory.store`` at ``confirm``. The
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, a Super
+Admin, real session cookies), org A storing ``memory.store`` at ``confirm``. The
 REAL ``Agent`` (real tool-call recorder) runs around a fake LLM that always answers a
 final reply; a subclass records every run's ``tool_policy``. The registry is swapped for
 an unfrozen one holding only ``memory.store`` with a recording handler. The Editor's chat
@@ -229,7 +229,7 @@ class _Clock:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database; org A
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database; org A
     stores memory.store at 'confirm' (org B keeps the default 'allow')."""
     db = FakeDb()
     built = build_world(db)

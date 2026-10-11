@@ -33,10 +33,12 @@ What these tests pin down (GH-162, contract sections 5, 7, 8, 9 and 10):
   the ``tool.call`` audit row says ``deny``. The stored connection is kept.
   Off, ``gmail.search`` is advertised and dispatched with the caller's
   ``TenantContext``. Residency is read per org and per request.
-- Roles: a Viewer gets 403 on POST /api/message (no LLM call, no tool, no
-  token); a demoted user's oauth_tokens row and notes are kept, and promoting
-  them back reactivates both (their recall works, their token getter receives
-  their tenant).
+- Roles: a member whose role lacks ``chat.send`` (withdrawn from the matrix
+  for the test, since every member role holds it) gets 403 on POST
+  /api/message (no LLM call, no tool, no token); their oauth_tokens row and
+  notes are kept, and once their role can chat again (the capability back,
+  as an Editor or promoted to Org Admin) both work (their recall works, their
+  token getter receives their tenant).
 - Tokens per user: concurrent chats of two users (same org or not) that both
   search Gmail each send only their own access token; the token refresh is
   keyed by the tenant and never handed another user's cached token.
@@ -67,6 +69,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 from unittest.mock import AsyncMock
 
@@ -74,9 +77,9 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from admino import access, oauth, server
 from admino import main as main_module
-from admino import oauth, server
-from admino.access import Principal
+from admino.access import Capability, Principal
 from admino.agent import Agent
 from admino.config import AppConfig
 from admino.llm import LLMResponse
@@ -994,13 +997,14 @@ class TestResidency:
 
 
 # ---------------------------------------------------------------------------
-# 4. Roles: Viewers have no tools; demotion keeps rows inactive
+# 4. Roles: a role without chat.send runs no tool; its rows are kept inactive
 # ---------------------------------------------------------------------------
 
 
 class TestRolesAndDemotion:
-    """A Viewer can't chat, so no tool runs; demotion keeps connections and notes, and
-    promotion reactivates both (contract 10)."""
+    """A member whose role lacks ``chat.send`` can't chat, so no tool runs; their
+    connections and notes are kept, and both work again once the role can chat
+    (contract 10). No member role lacks it, so the test withdraws it from the matrix."""
 
     @pytest.mark.parametrize("restored_role", ["editor", "org_admin"])
     def test_per_user_connections_demoted_users_rows_are_kept_and_come_back(
@@ -1011,6 +1015,7 @@ class TestRolesAndDemotion:
         getters: dict[str, AsyncMock],
         api: _Api,
         restored_role: MemberRole,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         user = _member(db, "editor")
         db.add_oauth_token(user.id, "google", encrypted_refresh_token=_ENCRYPTED)
@@ -1018,8 +1023,10 @@ class TestRolesAndDemotion:
         client = _client(app)
         message = llm.script("recall the plan, then search my mail", _recall(), _search())
 
-        db.users[user.id]["role"] = "viewer"
-        refused = _chat(client, user, message, chat_id="as-viewer")
+        granted = access._MATRIX
+        withdrawn = MappingProxyType({**granted, Capability.CHAT_SEND: frozenset({"org_admin"})})
+        monkeypatch.setattr(access, "_MATRIX", withdrawn)
+        refused = _chat(client, user, message, chat_id="without-chat-send")
 
         assert (refused.status_code, refused.json()) == (403, _FORBIDDEN)
         assert llm.calls == []
@@ -1031,6 +1038,7 @@ class TestRolesAndDemotion:
         assert db.memories_of(user.id) == {_KEY: "my own plan"}
         assert db.matching(r"^delete from (?:oauth_tokens|memory)\b") == []
 
+        monkeypatch.setattr(access, "_MATRIX", granted)
         db.users[user.id]["role"] = restored_role
         restored = _chat(client, user, message, chat_id="restored")
 

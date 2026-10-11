@@ -4,7 +4,7 @@
 ``PATCH /api/chats/{chat_id}`` and ``DELETE /api/chats/{chat_id}``. The app
 from ``create_app()`` (a stub agent: none of these routes runs the LLM) runs
 against the FakeDb world of tests/tenancy_world.py (orgs A and B with an Org
-Admin, an Editor and a Viewer each, plus a Super Admin, all with real session
+Admin and an Editor each, plus a Super Admin, all with real session
 cookies resolved by the real ``server.require_session``). The real
 ``admino.chats`` repository, ``admino.audit_events`` and the module-level
 ``server._chat_runtime`` (``ChatRuntime``) run; nothing is mocked but the
@@ -12,9 +12,9 @@ database and the agent.
 
 What these tests pin down:
 - Access: no cookie is 401 ``{"detail": "Unauthorized"}``; the Org Admin and
-  the Editor use every route; the Viewer (on their own stored chat) and the
-  Super Admin get 403 ``{"detail": "Forbidden"}`` on every route with no
-  statement naming ``chats`` or ``chat_messages`` and nothing changed. A
+  the Editor use every route; the Super Admin (on an Editor's stored chat) gets
+  403 ``{"detail": "Forbidden"}`` on every route with no statement naming
+  ``chats`` or ``chat_messages`` and nothing changed. A
   cross-origin ``Origin`` on POST/PATCH/DELETE is refused by the CSRF
   middleware with nothing changed (the same request from the same origin
   succeeds). Each route has its own per-user bucket in ``server._RATE_LIMITS``
@@ -117,7 +117,7 @@ if TYPE_CHECKING:
     import httpx
     from fastapi.testclient import TestClient
 
-    from tests.tenancy_world import Account, MemberRole, Role, World
+    from tests.tenancy_world import Account, MemberRole, World
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -256,7 +256,7 @@ _BAD_TITLES: Final = [
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database; every
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database; every
     rate-limit bucket roomy (the rate-limit tests set their own)."""
     db = FakeDb()
     built = build_world(db)
@@ -570,16 +570,14 @@ class TestChatsAccess:
         assert _chat_statements(world.db, since) == []
         assert _chat_state(world.db) == before
 
-    @pytest.mark.parametrize("role", ["viewer", "super_admin"])
     @pytest.mark.parametrize("op", _EVERY_OP)
-    def test_chats_api_viewer_and_super_admin_are_403_before_any_chat_statement(
-        self, world: World, client: TestClient, op: _Op, role: Role
+    def test_chats_api_super_admin_is_403_before_any_chat_statement(
+        self, world: World, client: TestClient, op: _Op
     ) -> None:
-        """The Viewer asks for their own stored chat (from before a demotion), the Super
-        Admin for an Editor's: 403 Forbidden, no chat statement, nothing changed."""
-        caller = world.by_role(role)
-        owner = caller if role == "viewer" else world.a["editor"]
-        chat = world.db.add_chat(owner.user_id, title="Kept")
+        """The Super Admin (no chat.send) asks for an Editor's stored chat: 403
+        Forbidden, no chat statement, nothing changed."""
+        caller = world.super_admin
+        chat = world.db.add_chat(world.a["editor"].user_id, title="Kept")
         world.db.add_chat_message(chat, "user", "Earlier question")
         before = _chat_state(world.db)
         since = len(world.db.calls)

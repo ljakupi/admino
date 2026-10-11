@@ -108,7 +108,7 @@ class _Chats:
     """The chats every test may ask for (ids)."""
 
     own: uuid.UUID  # org A editor's live chat
-    colleague: uuid.UUID  # org A viewer's live chat
+    colleague: uuid.UUID  # org A Org Admin's live chat
     other_org: uuid.UUID  # org B editor's live chat
     trashed: uuid.UUID  # org A editor's trashed chat
 
@@ -128,9 +128,9 @@ def world() -> World:
     db.add_permissions(built.org_b, {"google_calendar": {"read": "confirm"}})
     db.users[built.b["editor"].user_id]["personal_instructions"] = FOREIGN_CANARY
     db.users[built.b["editor"].user_id]["response_language"] = "it"
-    db.users[built.a["viewer"].user_id]["personal_instructions"] = COLLEAGUE_CANARY
-    db.users[built.a["viewer"].user_id]["response_language"] = "de"
-    db.users[built.a["viewer"].user_id]["timezone"] = "America/New_York"
+    db.users[built.a["org_admin"].user_id]["personal_instructions"] = COLLEAGUE_CANARY
+    db.users[built.a["org_admin"].user_id]["response_language"] = "de"
+    db.users[built.a["org_admin"].user_id]["timezone"] = "America/New_York"
     return built
 
 
@@ -140,7 +140,7 @@ def seeded(world: World) -> _Chats:
     trashed chat of the org A editor."""
     db = world.db
     own = seed_chat(db, world.a["editor"], title=TITLE_CANARY, messages=[("user", MESSAGE_CANARY)])
-    colleague = seed_chat(db, world.a["viewer"], title=TITLE_CANARY)
+    colleague = seed_chat(db, world.a["org_admin"], title=TITLE_CANARY)
     other_org = seed_chat(db, world.b["editor"], title=TITLE_CANARY)
     trashed = db.add_chat(
         world.a["editor"].user_id, title=TITLE_CANARY, deleted_at=datetime.now(UTC)

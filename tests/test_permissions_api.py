@@ -19,7 +19,7 @@ What these tests pin down (the GH-161 implementation contract):
   ``(key, "user:<id>")``, before any permissions / org_settings / audit
   statement), then the capability (403 ``{"detail": "Forbidden"}``, before any
   of those statements): ``org.permissions.manage`` (Org Admin only) for the
-  matrix, ``org.permissions.view`` (Org Admin, Editor, Viewer; never the Super
+  matrix, ``org.permissions.view`` (Org Admin and Editor; never the Super
   Admin) for the summary. The old ``/api/permissions`` routes and rate keys
   are gone (404 / 405).
 - The matrix is the Org Admin's own org: GET lists the org's stored rows
@@ -672,7 +672,7 @@ class TestAuthorization:
     """The matrix is the Org Admin's; the summary every member's; the Super Admin gets
     neither. A refusal reads and writes nothing."""
 
-    @pytest.mark.parametrize("role", ["editor", "viewer", "super_admin"])
+    @pytest.mark.parametrize("role", ["editor", "super_admin"])
     @pytest.mark.parametrize("action", _MATRIX_ACTIONS)
     def test_permissions_api_non_admin_gets_403_on_the_matrix(
         self, db: FakeDb, app: FastAPI, agent: _SpyAgent, action: str, role: str
@@ -690,7 +690,7 @@ class TestAuthorization:
         assert _state(db) == before
         _assert_agent_untouched(agent)
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     def test_permissions_api_member_may_read_the_summary(
         self, db: FakeDb, app: FastAPI, role: str
     ) -> None:
@@ -1327,7 +1327,7 @@ class TestEnabledServicesPerOrg:
 class TestSummary:
     """Every member reads the effective state of each of their own org's tool actions."""
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     def test_permissions_api_summary_returns_the_callers_org_effective_states(
         self, db: FakeDb, app: FastAPI, role: str
     ) -> None:
@@ -1355,7 +1355,7 @@ class TestSummary:
         self, db: FakeDb, app: FastAPI
     ) -> None:
         _seed_distinct_orgs(db)
-        _, token_b = _login(db, "viewer", OTHER_ORG_ID)
+        _, token_b = _login(db, "editor", OTHER_ORG_ID)
         since = len(db.calls)
 
         response = _call(_client(app), "summary_get", token_b)
@@ -1374,15 +1374,15 @@ class TestSummary:
         self, db: FakeDb, app: FastAPI
     ) -> None:
         _, admin_a = _login(db, "org_admin", ORG_ID)
-        _, viewer_a = _login(db, "viewer", ORG_ID)
-        _, viewer_b = _login(db, "viewer", OTHER_ORG_ID)
+        _, editor_a = _login(db, "editor", ORG_ID)
+        _, editor_b = _login(db, "editor", OTHER_ORG_ID)
         client = _client(app)
 
         patched = client.patch(
             _ORG_SETTINGS, headers=_headers(admin_a), json={"tools": {"memory": False}}
         )
-        read_a = _call(client, "summary_get", viewer_a)
-        read_b = _call(client, "summary_get", viewer_b)
+        read_a = _call(client, "summary_get", editor_a)
+        read_b = _call(client, "summary_get", editor_b)
 
         assert patched.status_code == 200, patched.text
         assert (read_a.status_code, read_b.status_code) == (200, 200), read_a.text
@@ -1411,7 +1411,7 @@ class TestDataResidency:
     """A residency org's runs and summary have every Google/Microsoft tool off; memory and
     the other orgs are unaffected; nothing is written."""
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     def test_permissions_api_summary_of_a_residency_org_disables_the_connector_tools(
         self, db: FakeDb, app: FastAPI, role: str
     ) -> None:
@@ -1438,12 +1438,12 @@ class TestDataResidency:
         for org_id in (ORG_ID, OTHER_ORG_ID):
             db.add_permissions(org_id, {"gmail": {"send": "confirm"}})
         db.add_org(ORG_ID, data_residency=True)
-        _, viewer_a = _login(db, "viewer", ORG_ID)
-        _, viewer_b = _login(db, "viewer", OTHER_ORG_ID)
+        _, editor_a = _login(db, "editor", ORG_ID)
+        _, editor_b = _login(db, "editor", OTHER_ORG_ID)
         client = _client(app)
 
-        read_a = _call(client, "summary_get", viewer_a)
-        read_b = _call(client, "summary_get", viewer_b)
+        read_a = _call(client, "summary_get", editor_a)
+        read_b = _call(client, "summary_get", editor_b)
 
         assert (read_a.status_code, read_b.status_code) == (200, 200), read_a.text
         assert _states(read_a.json())[("gmail", "send")] == "disabled"

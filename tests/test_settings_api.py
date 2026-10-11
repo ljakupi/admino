@@ -211,7 +211,7 @@ _CSRF_REFUSED = {"detail": "Cross-origin request refused"}
 _RATE_LIMITED = {"detail": "Rate limit exceeded"}
 _CLIENT_FAILED = {"detail": "Failed to create LLM client for the selected provider"}
 _ALL_ON: dict[str, bool] = dict.fromkeys(TOOL_NAMES, True)
-_ROLES = ["super_admin", "org_admin", "editor", "viewer"]
+_ROLES = ["super_admin", "org_admin", "editor"]
 _MODEL_MARKER = "Zephyrmarker/Model-77"
 _KEY_MARKER = "sk-ant-zephyrmarker-key-0000000000000000"
 _TOKEN_MARKER = "ik-zephyrmarker-token-1111111111"
@@ -1216,7 +1216,7 @@ class TestMySettings:
     """Each user reads and changes their own theme and notifications."""
 
     def test_settings_api_me_get_defaults_without_a_row(self, db: FakeDb, app: FastAPI) -> None:
-        _, token = _login(db, "viewer")
+        _, token = _login(db, "editor")
 
         response = _call(_client(app), "me_get", token)
 
@@ -1244,7 +1244,7 @@ class TestMySettings:
     def test_settings_api_me_patch_notifications_keeps_the_theme(
         self, db: FakeDb, app: FastAPI
     ) -> None:
-        user_id, token = _login(db, "viewer")
+        user_id, token = _login(db, "editor")
         db.add_user_settings(user_id, theme="system")
 
         response = _call(
@@ -2952,7 +2952,7 @@ class TestPlatformDefaultsAccess:
     one PATCH bucket."""
 
     @pytest.mark.parametrize("body", _MEMBER_SECTION_BODIES)
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     def test_settings_api_member_patch_of_a_section_is_403_and_touches_nothing(
         self, db: FakeDb, app: FastAPI, role: str, body: dict[str, Any]
     ) -> None:
@@ -3094,7 +3094,7 @@ class TestNotificationToggles:
     def test_settings_api_me_get_returns_the_stored_completed(
         self, db: FakeDb, app: FastAPI
     ) -> None:
-        user_id, token = _login(db, "viewer")
+        user_id, token = _login(db, "editor")
         db.add_user_settings(user_id, theme="dark", notifications_completed=False)
 
         response = _call(_client(app), "me_get", token)
@@ -3161,7 +3161,7 @@ class TestNotificationToggles:
         assert reloaded.json() == _me(completed=False)
 
     def test_settings_api_me_patch_theme_keeps_completed(self, db: FakeDb, app: FastAPI) -> None:
-        user_id, token = _login(db, "viewer")
+        user_id, token = _login(db, "editor")
         db.add_user_settings(user_id, notifications_completed=False)
 
         response = _call(_client(app), "me_patch", token, body={"appearance": {"theme": "dark"}})
@@ -3174,7 +3174,7 @@ class TestNotificationToggles:
         self, db: FakeDb, app: FastAPI
     ) -> None:
         """Approval notifications off is not a master switch: completed stays on."""
-        user_id, token = _login(db, "viewer")
+        user_id, token = _login(db, "editor")
         db.add_user_settings(user_id, notifications_completed=True)
 
         response = _call(
@@ -3453,7 +3453,7 @@ class TestResetMySettings:
         assert db.audit == []
 
     def test_settings_api_reset_without_a_row_is_idempotent(self, db: FakeDb, app: FastAPI) -> None:
-        user_id, token = _login(db, "viewer")
+        user_id, token = _login(db, "editor")
         client = _client(app)
 
         first = _reset(client, token)

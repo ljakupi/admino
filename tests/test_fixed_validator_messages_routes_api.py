@@ -12,7 +12,7 @@ request model that reaches it (the invitation email check through
 ``OrgSettingsPatch.profile.display_name``; the chat title check through chat
 create and chat update), one case per (raise site, route):
 - the real route of the tenancy world (tests/tenancy_world.py), called by a role
-  it allows (Org Admin, Editor or Viewer of org A, or the Super Admin; the
+  it allows (Org Admin or Editor of org A, or the Super Admin; the
   invitation acceptance is public), with an input that trips exactly that
   validator, answers ``422 {"detail": [...]}`` holding exactly one error
   ``{"loc": <FastAPI's loc>, "msg": <the C3 text, byte for byte>, "type":
@@ -111,7 +111,7 @@ _CONFIRMATION_ID: Final = "conf-gh304"
 _PROBE_CHAT_ID: Final = "8f0c6a8e-3b0e-4d5e-9f43-3d1c2b0a9e01"
 _DUPLICATE_ID: Final = "0b8f2f57-6f0c-4b55-8a6e-2c9a4f1d7e30"
 
-Who = Literal["org_admin", "editor", "viewer", "super_admin", "public"]
+Who = Literal["org_admin", "editor", "super_admin", "public"]
 
 
 def _org_create(**fields: Any) -> dict[str, Any]:
@@ -195,7 +195,7 @@ _CASES: Final[dict[str, _Case]] = {
     ),
     # 2181 UserSettingsPatch._check_something_given
     "me-settings:nothing-given": _Case(
-        "viewer",
+        "editor",
         "PATCH",
         _fixed("/api/me/settings"),
         {"appearance": {"theme": None}, "notifications": {}},
@@ -330,7 +330,7 @@ _CASES: Final[dict[str, _Case]] = {
     ),
     # 3150 / 3159 / 3172 / 3181 / 3187 MyAccountPatch
     "me:name": _Case(
-        "viewer",
+        "editor",
         "PATCH",
         _fixed("/api/me"),
         {"name": f"{_CANARY}{_ZWSP}Ada"},
@@ -338,7 +338,7 @@ _CASES: Final[dict[str, _Case]] = {
         _NAME_CHARS,
     ),
     "me:timezone": _Case(
-        "viewer",
+        "editor",
         "PATCH",
         _fixed("/api/me"),
         {"timezone": f"Europe/{_CANARY}"},
@@ -346,7 +346,7 @@ _CASES: Final[dict[str, _Case]] = {
         _UNKNOWN_TIMEZONE,
     ),
     "me:personal-instructions": _Case(
-        "viewer",
+        "editor",
         "PATCH",
         _fixed("/api/me"),
         {"personal_instructions": f"Be brief {_CANARY}{_ZWSP}."},
@@ -354,7 +354,7 @@ _CASES: Final[dict[str, _Case]] = {
         _PERSONAL_INSTRUCTIONS_CHARS,
     ),
     "me:nothing-given": _Case(
-        "viewer",
+        "editor",
         "PATCH",
         _fixed("/api/me"),
         {},
@@ -362,7 +362,7 @@ _CASES: Final[dict[str, _Case]] = {
         _ONE_FIELD,
     ),
     "me:null-for-a-required-field": _Case(
-        "viewer",
+        "editor",
         "PATCH",
         _fixed("/api/me"),
         {"timezone": None},
@@ -492,7 +492,7 @@ _NEGATIVES: Final = [
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database; every
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database; every
     rate-limit bucket roomy."""
     db = FakeDb()
     built = build_world(db)

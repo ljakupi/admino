@@ -463,7 +463,7 @@ class TestGetAccount:
         assert result.timezone is None
         assert result.personal_instructions == ""
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_my_account_get_works_for_every_member_role(
         self, ma: ModuleType, db: FakeDb, role: str
     ) -> None:
@@ -855,7 +855,7 @@ class TestChangePasswordSuccess:
     async def test_my_account_change_password_records_one_audit_row_for_a_member(
         self, ma: ModuleType, db: FakeDb
     ) -> None:
-        principal = _member(db, role="viewer")
+        principal = _member(db, role="editor")
         for _ in range(3):
             db.open_session(principal.user_id)
 

@@ -1,8 +1,8 @@
 """HTTP spec of streamed chat turns (GH-8, contract C5.1 to C5.6, with C2, C3 and C6).
 
 The app from ``create_app()`` runs against the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, plus a Super Admin, all with real session cookies). The agent is a stub
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, plus
+a Super Admin, all with real session cookies). The agent is a stub
 (``_Script``, the pattern of tests/test_chat_turns_api.py): its ``run`` binds
 every call to ``Agent.run``'s contract signature (now with the keyword-only
 ``stream``), records the arguments and the exact keyword set, and answers a
@@ -34,8 +34,8 @@ What is pinned:
   ``stream``); a streamed turn or approval passes an ``admino.streaming.RunStream``
   whose ``stop`` is not set.
 - Refusals before the run with ``Accept: text/event-stream`` are the usual JSON
-  error, the same status and body as without the header: 401, CSRF 403, Viewer
-  and Super Admin 403 (no chat statement), 422 (extra field, over the stored
+  error, the same status and body as without the header: 401, CSRF 403, the
+  Super Admin's 403 (no chat statement), 422 (extra field, over the stored
   ``max_message_length``, a non-UUID id; the input never echoed), the identical
   404 ``chat_not_found`` (unknown, other org, colleague, trashed), the 503
   ``chats_busy`` (a full runtime with nothing to evict), 429, and the confirm
@@ -544,7 +544,7 @@ class _ParkedTitleLLM(_TitleLLM):
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)
@@ -1060,7 +1060,6 @@ def test_chat_stream_only_a_streamed_approval_passes_a_run_stream(
 _REFUSALS: Final = (
     "no_session",
     "cross_site",
-    "viewer",
     "super_admin",
     "extra_field",
     "over_stored_length",
@@ -1082,7 +1081,7 @@ def test_chat_stream_refusal_before_the_run_is_the_usual_json_error(
 ) -> None:
     """With ``Accept: text/event-stream`` the refusal is the JSON error it is without the
     header (same status and body, ``application/json``, the input never echoed): no run,
-    nothing stored, and for a Viewer or a Super Admin no chat statement. The Editor's
+    nothing stored, and for the Super Admin (no chat.send) no chat statement. The Editor's
     valid streamed send to their own chat then streams (the refusal is the gate's)."""
     editor = world.a["editor"]
     db = world.db
@@ -1096,9 +1095,6 @@ def test_chat_stream_refusal_before_the_run_is_the_usual_json_error(
     elif case == "cross_site":
         headers["Sec-Fetch-Site"] = "cross-site"
         expected = (403, _CSRF_REFUSED)
-    elif case == "viewer":
-        viewer = world.a["viewer"]
-        headers, target, expected = dict(viewer.cookie), _chat(db, viewer), (403, FORBIDDEN)
     elif case == "super_admin":
         headers, expected = dict(world.super_admin.cookie), (403, FORBIDDEN)
     elif case == "extra_field":
@@ -1137,7 +1133,7 @@ def test_chat_stream_refusal_before_the_run_is_the_usual_json_error(
         assert all("input" not in error for error in detail)
     assert agent.run.await_count == 0
     assert len(db.chat_messages) == message_count
-    if case in ("viewer", "super_admin"):
+    if case == "super_admin":
         assert _chat_calls(db, before) == []
     assert _names(_stream(_send(client, editor, own, "Go on")))[0] == "run_started"
 

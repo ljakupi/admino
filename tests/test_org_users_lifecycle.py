@@ -8,7 +8,7 @@ Admin manage the users of their own organization. These tests run the real
 service against the in-memory database of tests/db_fakes.py.
 
 What these tests pin down:
-- Authorization first: an Editor, a Viewer or a Super Admin principal gets
+- Authorization first: an Editor or a Super Admin principal gets
   ``PermissionError`` before any query is issued (``db.calls`` stays empty) and
   nothing changes.
 - Tenant isolation: a user of another org, an unknown id, an invited account,
@@ -147,7 +147,7 @@ def _admin(db: FakeDb, **fields: Any) -> tuple[uuid.UUID, Principal]:
 
 
 def _forbidden_actor(db: FakeDb, kind: str) -> Principal:
-    """An Editor or Viewer of ORG_ID, or a Super Admin: none may manage users."""
+    """An Editor of ORG_ID or a Super Admin: neither may manage users."""
     if kind == "super_admin":
         user_id = db.add_account(kind="super_admin", role=None)
         return Principal(user_id=user_id, kind="super_admin")
@@ -318,7 +318,7 @@ class TestLifecycleAuthorization:
     """Only an Org Admin (ORG_USERS_MANAGE) may act; the refusal issues no query."""
 
     @pytest.mark.parametrize("action", _ACTIONS)
-    @pytest.mark.parametrize("kind", ["editor", "viewer", "super_admin"])
+    @pytest.mark.parametrize("kind", ["editor", "super_admin"])
     async def test_org_users_lifecycle_without_manage_capability_is_forbidden_before_any_query(
         self, ou: ModuleType, db: FakeDb, action: str, kind: str
     ) -> None:
@@ -393,7 +393,7 @@ class TestDeactivate:
         target = _target(
             db,
             "deactivate",
-            role="viewer",
+            role="org_admin",
             email="summary.target@example.test",
             name="Summary Person",
             created_at=created,
@@ -416,7 +416,7 @@ class TestDeactivate:
             target,
             "Summary Person",
             "summary.target@example.test",
-            "viewer",
+            "org_admin",
             "deactivated",
             created,
             last_login,
@@ -503,7 +503,7 @@ class TestDeactivate:
         assert db.memories_of(target) == {"favourite_colour": "blue"}
         assert db.user_settings[target]["theme"] == "dark"
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_org_users_deactivate_any_role_of_the_org(
         self, ou: ModuleType, db: FakeDb, role: str
     ) -> None:
@@ -1212,7 +1212,7 @@ class TestTriggerPasswordReset:
 
         assert result is None
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_org_users_reset_any_role_of_the_org(
         self, ou: ModuleType, db: FakeDb, role: str
     ) -> None:

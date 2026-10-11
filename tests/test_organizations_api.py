@@ -10,7 +10,7 @@ through the real ``require_session``; only Argon2 is replaced by a fast fake.
 What these tests pin down:
 - Eight routes, each behind a session (401 ``{"detail": "Unauthorized"}``
   without one) and ``admino.access.can`` (403 ``{"detail": "Forbidden"}`` for an
-  Org Admin, an Editor and a Viewer, with nothing written and no audit row):
+  Org Admin and an Editor, with nothing written and no audit row):
   ``GET /api/platform/orgs`` → 200 ``{"organizations": [...]}`` (every status,
   by created_at then id); ``POST /api/platform/orgs`` → 201 ``{"organization",
   "invitation"}``; ``PATCH .../{org_id}/limits``, ``POST .../{org_id}/deactivate``,
@@ -142,7 +142,7 @@ _SUMMARY_KEYS = frozenset(
     }
 )
 _INVITATION_KEYS = frozenset({"id", "email", "role", "sent_at", "expires_at", "expired"})
-_MEMBER_ROLES = ["org_admin", "editor", "viewer"]
+_MEMBER_ROLES = ["org_admin", "editor"]
 _STATUSES = ["active", "deactivated", "pending_deletion"]
 
 # action -> (method, path template)
@@ -606,7 +606,7 @@ class TestRoutes:
 
 
 class TestAuthorization:
-    """Org Admins, Editors and Viewers get 403; the route asks can() for its capability."""
+    """Org Admins and Editors get 403; the route asks can() for its capability."""
 
     @pytest.mark.parametrize("role", _MEMBER_ROLES)
     @pytest.mark.parametrize("action", _ALL_ACTIONS)
@@ -1397,7 +1397,7 @@ class TestStatusRoutes:
         db.add_org(ORG_ID)
         admin = db.add_account(role="org_admin")
         editor = db.add_account(role="editor")
-        invitee = db.add_account(role="viewer", status="invited", name=None, password_hash=None)
+        invitee = db.add_account(role="editor", status="invited", name=None, password_hash=None)
         db.add_invitation(invitee)
         mine = [db.open_session(admin), db.open_session(editor), db.open_session(editor)]
         theirs = db.open_session(db.add_account(role="editor", org_id=OTHER_ORG_ID))
@@ -1426,7 +1426,6 @@ class TestStatusRoutes:
         db.add_account(role="org_admin", status="invited", name=None, password_hash=None)
         db.add_account(role="org_admin", deleted_at=_DELETED_AT)
         db.add_account(role="editor")
-        db.add_account(role="viewer")
         db.add_account(role="org_admin", org_id=OTHER_ORG_ID)
         _, token = _super_admin(db)
 

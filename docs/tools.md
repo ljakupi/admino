@@ -26,9 +26,8 @@ destructive actions are **denied by design**. Every call is checked by the
   [Getting Started → Connect your accounts](getting-started.md#connect-your-accounts).
 - A connection belongs to the user who made it. The agent uses it only in that user's own
   chats, never in a colleague's, and nobody can connect an account for someone else.
-- Org Admins and Editors connect accounts. Viewers can't chat, so they have no
-  connections. A user demoted to Viewer keeps their connections, unused, until they're
-  promoted back.
+- Org Admins and Editors connect accounts. The Super Admin can't chat and has no
+  connections.
 - The Tools page shows each service's state: active, turned off by your organization,
   restricted by data residency, or not connected. An Org Admin turns services on or off
   for the whole organization under **Organization → Settings** (**Tools and

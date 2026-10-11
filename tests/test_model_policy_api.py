@@ -688,7 +688,7 @@ class TestCapabilityPatch:
         assert accepted.status_code == 200, accepted.text
         assert _row(db)[_COLUMNS[field]] == _VALID[field]
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     @pytest.mark.parametrize("field", list(_VALID))
     def test_model_policy_api_member_capability_patch_is_403_before_any_write(
         self, db: FakeDb, app: FastAPI, role: str, field: str

@@ -303,7 +303,7 @@ class _PrincipalLookalike:
 
 def _unauthorized(db: FakeDb, world: _World, who: str) -> Any:
     """An actor without platform.users.manage."""
-    if who in {"org_admin", "editor", "viewer"}:
+    if who in {"org_admin", "editor"}:
         user_id = db.add_account(role=who, org_id=world.org_id)
         return Principal(user_id=user_id, kind="member", org_id=world.org_id, role=who)
     if who == "operator":
@@ -327,7 +327,6 @@ def _unauthorized(db: FakeDb, world: _World, who: str) -> Any:
 _UNAUTHORIZED = [
     "org_admin",
     "editor",
-    "viewer",
     "operator",
     "member-forged-as-super-admin",
     "super-admin-given-an-org",
@@ -433,8 +432,8 @@ def _wrong_status_target(db: FakeDb, world: _World, case: str) -> uuid.UUID:
         return db.add_account(role="org_admin", org_id=world.org_id, status="deactivated")
     if case == "deactivated-editor":
         return db.add_account(role="editor", org_id=world.org_id, status="deactivated")
-    if case in {"invited-editor", "invited-viewer"}:
-        return _invited(db, world.org_id, case.removeprefix("invited-"))
+    if case == "invited-editor":
+        return _invited(db, world.org_id, "editor")
     assert case == "invited-org-admin-without-invitation", case
     del db.invitations[world.invitation_id]
     return world.user_id
@@ -445,7 +444,6 @@ _WRONG_STATUS = [
     "deactivated-org-admin",
     "deactivated-editor",
     "invited-editor",
-    "invited-viewer",
     "invited-org-admin-without-invitation",
 ]
 

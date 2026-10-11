@@ -19,7 +19,7 @@ org's other live chats get its notice once, the chat being approved none (it sti
 its confirmation, #24 contract section 2), org B's chat none.
 
 Harness: the app from ``create_app()`` on the FakeDb world of tests/tenancy_world.py
-(orgs A and B with an Org Admin, an Editor and a Viewer each, a Super Admin, real session
+(orgs A and B with an Org Admin and an Editor each, a Super Admin, real session
 cookies), org A storing ``memory.store`` at ``confirm``. The REAL ``Agent`` (real
 tool-call recorder, so every dispatch writes its ``tool.call`` row) runs around a fake LLM
 that always answers a final reply; a subclass records the ``tool_policy`` of every run.
@@ -222,7 +222,7 @@ class _Clock:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database; org A
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database; org A
     stores memory.store at 'confirm' (org B keeps the default 'allow')."""
     db = FakeDb()
     built = build_world(db)

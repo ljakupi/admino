@@ -6,8 +6,8 @@ colleague's and another chat's files never reach the slot), no content in
 logs, content-free audit rows.
 
 Harness: the app from ``create_app()`` on the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, real session cookies), the attachments root pointed at ``tmp_path``
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, real
+session cookies), the attachments root pointed at ``tmp_path``
 (``use_attachment_storage``) and derived files written with
 tests/attachment_derived.py. Two agents:
 - A stub bound to ``Agent.run``'s signature (``attachments`` included, default
@@ -465,7 +465,7 @@ class _Real:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)

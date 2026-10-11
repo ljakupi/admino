@@ -32,7 +32,9 @@ Outputs (asserted):
   request, no restart; an approved confirmation resumes with a freshly loaded
   context;
 - org B's runs never carry org A's instructions (same chat id, after A ran);
-- Viewers and the Super Admin are refused before any load or run;
+- a member without ``chat.send`` (an Editor, with the capability withdrawn
+  from the matrix for that test) and the Super Admin are refused before any
+  load or run;
 - a failing load is a 500 ``{"detail": "Internal error"}``, the agent isn't
   run, and neither the body nor any log record echoes the failure's text;
 - with the real Agent: exactly one system message at index 0 of every LLM
@@ -61,15 +63,16 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 
 import asyncpg
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
+from admino import access, org_permissions, prompt_assembly, scoped_settings
 from admino import main as main_module
-from admino import org_permissions, prompt_assembly, scoped_settings
-from admino.access import Principal
+from admino.access import Capability, Principal
 from admino.agent import Agent
 from admino.llm import LLMResponse
 from admino.models import (
@@ -680,22 +683,34 @@ class TestConfirmContext:
 
 
 class TestRefusedCallers:
-    """Viewers and the Super Admin can't chat: nothing is loaded, nothing runs."""
+    """A caller without ``chat.send`` can't chat: nothing is loaded, nothing runs.
+
+    The Super Admin never has it; a member is refused through an Editor with the
+    capability withdrawn from the matrix for the test (every member role holds it).
+    """
 
     @pytest.mark.parametrize("route", ["message", "confirm"])
-    @pytest.mark.parametrize("who", ["org-a-viewer", "org-b-viewer", "super-admin"])
+    @pytest.mark.parametrize(
+        "who", ["org-a-editor-without-chat-send", "org-b-editor-without-chat-send", "super-admin"]
+    )
     def test_prompt_context_api_refused_caller_loads_no_context(
         self,
         world: World,
         client: TestClient,
         stub: MagicMock,
         loader: _LoaderSpy,
+        monkeypatch: pytest.MonkeyPatch,
         who: str,
         route: str,
     ) -> None:
+        monkeypatch.setattr(
+            access,
+            "_MATRIX",
+            MappingProxyType({**access._MATRIX, Capability.CHAT_SEND: frozenset({"org_admin"})}),
+        )
         accounts = {
-            "org-a-viewer": world.a["viewer"],
-            "org-b-viewer": world.b["viewer"],
+            "org-a-editor-without-chat-send": world.a["editor"],
+            "org-b-editor-without-chat-send": world.b["editor"],
             "super-admin": world.super_admin,
         }
         caller = accounts[who]

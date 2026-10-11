@@ -8,8 +8,8 @@ every role, another org's and a colleague's file, CSRF, the per-user rate limit,
 422 without echo, content-free audit rows and logs.
 
 The app from ``create_app()`` runs against the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, plus a Super Admin, real session cookies). Attachment rows are seeded with
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, plus a
+Super Admin, real session cookies). Attachment rows are seeded with
 ``FakeDb.add_attachment`` (``active=False`` seeds an excluded file: the fake
 models migration 0030 once it ships); a ready file's derived files are written
 with tests/attachment_derived.py under a ``tmp_path`` attachments root. The agent
@@ -30,8 +30,8 @@ What is pinned:
 - 404 ``attachment_not_found`` for another org's, a colleague's (an Org Admin's
   request on an Editor's file too), a trashed and an unknown attachment, nothing
   changed; a non-UUID id is 422.
-- Roles (``chat.send``): the Org Admin and the Editor may; the Viewer (on their
-  own file) and the Super Admin get 403 and nothing changes. No session: 401.
+- Roles (``chat.send``): the Org Admin and the Editor may; the Super Admin gets
+  403 and nothing changes. No session: 401.
 - CSRF: a cross-site ``Origin`` or ``Sec-Fetch-Site`` is refused (403), the
   same request from the app's origin succeeds.
 - Rate limit ``/api/attachments/patch`` (0.5, 5), per user: an empty bucket is
@@ -238,7 +238,7 @@ def root(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, root: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database, the
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database, the
     attachments root at ``root``, every rate-limit bucket roomy."""
     db = FakeDb()
     built = build_world(db)
@@ -737,19 +737,16 @@ class TestExclusionRefusals:
 
         assert response.status_code == 422, response.text
 
-    @pytest.mark.parametrize("role", ["viewer", "super_admin"])
-    def test_attachment_exclusion_viewer_and_super_admin_are_403_and_change_nothing(
-        self, world: World, root: Path, client: TestClient, role: str
+    def test_attachment_exclusion_super_admin_is_403_and_changes_nothing(
+        self, world: World, root: Path, client: TestClient
     ) -> None:
-        """The Viewer on their own file (from before a demotion), the Super Admin on an
-        Editor's: exactly 403 Forbidden, no statement on attachments, nothing changed."""
-        caller = world.super_admin if role == "super_admin" else world.a["viewer"]
-        owner = world.a["viewer"] if role == "viewer" else world.a["editor"]
-        file_id = _file(world.db, root, _chat(world.db, owner))
+        """The Super Admin (no ``chat.send``) on an Editor's file: exactly 403 Forbidden, no
+        statement on attachments, nothing changed."""
+        file_id = _file(world.db, root, _chat(world.db, world.a["editor"]))
         before = _tables(world.db)
         since = len(world.db.calls)
 
-        response = _patch(client, caller, file_id, {"active": False})
+        response = _patch(client, world.super_admin, file_id, {"active": False})
 
         assert _outcome(response) == (403, FORBIDDEN)
         assert [

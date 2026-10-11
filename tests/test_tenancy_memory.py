@@ -11,8 +11,8 @@ something), and the LLM is a
 scripted fake (``_FakeLLM``: each user message picks a script of tool calls;
 it records every message text it is fed and the tool results of the turn).
 The database is the FakeDb world of tests/tenancy_world.py: orgs A and B with
-an Org Admin, an Editor and a Viewer each, plus a Super Admin, all with real
-session cookies resolved by the real ``server.require_session``. Every user
+an Org Admin and an Editor each, plus a Super Admin, all with real session
+cookies resolved by the real ``server.require_session``. Every user
 chats under the same chat session id, so a history keyed by chat id alone
 would hand one user's notes to another's LLM.
 
@@ -30,9 +30,11 @@ Inputs: the world, the fake LLM's scripts. Outputs (asserted):
   of B's run carries B's user id and org id, never A's.
 - A's note value is never fed to B's LLM, never in B's HTTP responses, and no
   note value is in any app log record (#139 section 5).
-- A Viewer (either org) and the Super Admin get ``403 {"detail": "Forbidden"}``
-  on the memory path: no LLM call, no handler, no memory statement, no audit
-  row (role gate, operator blindness).
+- The Super Admin gets ``403 {"detail": "Forbidden"}`` on the memory path: no
+  LLM call, no handler, no memory statement, no audit row (role gate, operator
+  blindness). GH-306: every member role chats, so the Super Admin is the role
+  the chat route's ``chat.send`` check refuses (a member without it is pinned
+  in tests/test_tenancy_roles.py).
 
 All database calls are faked. No network, no real PostgreSQL, no real LLM.
 
@@ -233,7 +235,8 @@ class _Handlers:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+    """Orgs A and B (an Org Admin and an Editor each) and a Super Admin, behind the fake
+    database."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)
@@ -694,26 +697,7 @@ def _assert_refused_without_memory_access(
 
 
 class TestMemoryPathRoles:
-    """Only members who may chat reach memory; Viewers and the Super Admin get 403."""
-
-    @pytest.mark.parametrize("org", ["a", "b"])
-    def test_tenancy_memory_viewer_is_refused_before_any_memory_access(
-        self,
-        world: World,
-        client: TestClient,
-        llm: _FakeLLM,
-        handlers: _Handlers,
-        org: str,
-    ) -> None:
-        owner = world.a["editor"]
-        world.db.add_memory(owner.user_id, _KEY, _A_SECRET)
-        viewer = (world.a if org == "a" else world.b)["viewer"]
-        message = llm.script("Viewer: what is the plan?", _recall(), _list())
-
-        response = _chat(client, viewer, message)
-
-        _assert_refused_without_memory_access(world, response, llm, handlers)
-        assert world.db.memories_of(owner.user_id) == {_KEY: _A_SECRET}
+    """Only members who may chat reach memory; the Super Admin gets 403."""
 
     def test_tenancy_memory_super_admin_is_refused_before_any_memory_access(
         self,

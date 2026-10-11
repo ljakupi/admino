@@ -592,7 +592,7 @@ class TestMigration0026FakeDb:
         db = FakeDb()
         admin = db.add_account(org_id=ORG_ID, role="org_admin")
         target = db.add_account(org_id=ORG_ID)
-        colleague = db.add_account(org_id=ORG_ID, role="viewer")
+        colleague = db.add_account(org_id=ORG_ID, role="editor")
         doomed = _owned_chats(db, target)
         kept = _owned_chats(db, colleague)
         actor = Principal(user_id=admin, kind="member", org_id=ORG_ID, role="org_admin")

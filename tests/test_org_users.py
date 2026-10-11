@@ -10,14 +10,15 @@ and the admin-triggered password reset are covered in another file.)
 What these tests pin down:
 - Authorization comes first, through ``access.can``: listing needs
   ``ORG_USERS_VIEW``; a change needs ``ORG_USERS_MANAGE``, plus
-  ``ORG_USERS_ROLE_CHANGE`` when the patch carries a role. An Editor, a Viewer or a
-  Super Admin gets ``PermissionError`` before any statement runs.
+  ``ORG_USERS_ROLE_CHANGE`` when the patch carries a role. An Editor or a Super
+  Admin gets ``PermissionError`` before any statement runs.
 - The list holds the actor's org's ``active`` and ``deactivated`` users only (no
   invited account, no deleted row, no Super Admin, no other org's user), with
   name, email, role, status, created_at and last_login_at, ordered by created_at,
   then id. It is one query with the org id as a bind parameter.
 - A role change is audited as ``user.role_change`` (``{"old_role", "new_role"}``);
-  demoting to Viewer deletes nothing (sessions, OAuth connections, memory stay).
+  demoting an Org Admin to Editor deletes nothing (sessions, OAuth connections,
+  memory stay).
 - The last-admin guard (``accounts.ensure_not_last_active_admin``, inside the
   transaction, before the change) refuses to demote the org's last active Org
   Admin with ``accounts.LastAdminError``: nothing changes, nothing is audited.
@@ -36,8 +37,8 @@ What these tests pin down:
   nothing is changed or queued.
 - No name or email in any audit row or log line; the module imports no server,
   agent, LLM, tools or OAuth module and builds no SQL from values.
-- Seat usage (GH-165): ``ORG_USERS_VIEW`` is checked before any query (an Editor,
-  a Viewer or a Super Admin gets ``PermissionError`` and nothing is queried);
+- Seat usage (GH-165): ``ORG_USERS_VIEW`` is checked before any query (an Editor
+  or a Super Admin gets ``PermissionError`` and nothing is queried);
   ``limit`` is the org's ``organizations.seats``; ``used`` counts the org's
   ``active`` and ``invited`` users that aren't deleted (an expired invitation
   still holds its seat; deactivated and deleted users, other orgs' users and
@@ -131,7 +132,7 @@ def _admin(db: FakeDb, org_id: uuid.UUID = ORG_ID, **fields: Any) -> tuple[uuid.
 
 
 def _actor(db: FakeDb, who: str) -> Principal:
-    """A stored Editor, Viewer or Super Admin of ORG_ID and their Principal."""
+    """A stored Editor or Super Admin of ORG_ID and their Principal."""
     if who == "super_admin":
         return _principal(db, db.add_account(kind="super_admin", role=None))
     return _principal(db, db.add_account(role=who))
@@ -420,7 +421,7 @@ def _formatted_sql_sites() -> list[str]:
 # 2. Authorization: access.can before any statement
 # ---------------------------------------------------------------------------
 
-_REFUSED = ["editor", "viewer", "super_admin"]
+_REFUSED = ["editor", "super_admin"]
 
 
 class TestAuthorization:
@@ -442,7 +443,7 @@ class TestAuthorization:
     @pytest.mark.parametrize(
         "fields",
         [
-            pytest.param({"role": "viewer"}, id="role"),
+            pytest.param({"role": "org_admin"}, id="role"),
             pytest.param({"name": _NEW_NAME}, id="name"),
             pytest.param({"email": _NEW_EMAIL}, id="email"),
         ],
@@ -497,7 +498,7 @@ class TestAuthorization:
         target = db.add_account(role="editor")
         seen = _spy_can(monkeypatch)
 
-        await _update(db, admin, target, role="viewer")
+        await _update(db, admin, target, role="org_admin")
 
         assert Capability.ORG_USERS_MANAGE in seen
         assert Capability.ORG_USERS_ROLE_CHANGE in seen
@@ -513,7 +514,7 @@ class TestAuthorization:
         db.calls.clear()
 
         with pytest.raises(PermissionError):
-            await _update(db, admin, target, role="viewer", name=_NEW_NAME)
+            await _update(db, admin, target, role="org_admin", name=_NEW_NAME)
 
         assert db.calls == []
         assert _state(db) == before
@@ -533,7 +534,7 @@ class TestAuthorization:
     @pytest.mark.parametrize(
         "fields",
         [
-            pytest.param({"role": "viewer"}, id="role"),
+            pytest.param({"role": "org_admin"}, id="role"),
             pytest.param({"name": _NEW_NAME}, id="name"),
         ],
     )
@@ -565,8 +566,8 @@ class TestListOrgUsers:
     ) -> None:
         admin_id, admin = _admin(db)
         editor = db.add_account(role="editor")
-        deactivated = db.add_account(role="viewer", status="deactivated")
-        db.add_account(role="viewer", status="invited", name=None, password_hash=None)
+        deactivated = db.add_account(role="editor", status="deactivated")
+        db.add_account(role="editor", status="invited", name=None, password_hash=None)
         db.add_account(role="editor", deleted_at=datetime.now(UTC) - timedelta(days=2))
         db.add_account(kind="super_admin", role=None)
         db.add_account(role="org_admin", org_id=OTHER_ORG_ID)
@@ -581,16 +582,16 @@ class TestListOrgUsers:
         db.add_account(role="org_admin")
         db.add_account(role="editor")
         other_admin_id, other_admin = _admin(db, OTHER_ORG_ID)
-        other_viewer = db.add_account(role="viewer", org_id=OTHER_ORG_ID)
+        other_editor = db.add_account(role="editor", org_id=OTHER_ORG_ID)
 
         users = await org_users.list_org_users(db.pool, actor=other_admin)
 
-        assert {summary.id for summary in users} == {other_admin_id, other_viewer}
+        assert {summary.id for summary in users} == {other_admin_id, other_editor}
 
     async def test_org_users_list_returns_every_summary_field(self, db: FakeDb) -> None:
         _, admin = _admin(db, created_at=_CREATED - timedelta(days=30))
         target = db.add_account(
-            role="viewer",
+            role="org_admin",
             status="deactivated",
             email="Mixed.Case@Example.test",
             name="Ada Beispiel",
@@ -607,7 +608,7 @@ class TestListOrgUsers:
             "id": target,
             "name": "Ada Beispiel",
             "email": "Mixed.Case@Example.test",
-            "role": "viewer",
+            "role": "org_admin",
             "status": "deactivated",
             "created_at": _CREATED,
             "last_login_at": _LAST_LOGIN,
@@ -682,10 +683,7 @@ class TestListOrgUsers:
 
 
 _ROLE_CHANGES = [
-    pytest.param("editor", "viewer", id="editor-to-viewer"),
-    pytest.param("viewer", "editor", id="viewer-to-editor"),
     pytest.param("editor", "org_admin", id="editor-to-org_admin"),
-    pytest.param("viewer", "org_admin", id="viewer-to-org_admin"),
     pytest.param("org_admin", "editor", id="second-admin-to-editor"),
 ]
 
@@ -735,40 +733,40 @@ class TestRoleChange:
         admin_id, admin = _admin(db)
         target = db.add_account(role="editor")
 
-        await _update(db, admin, target, ip=None, role="viewer")
+        await _update(db, admin, target, ip=None, role="org_admin")
 
         assert [_audit_view(row) for row in db.audit] == [
             _expected_audit(
                 "user.role_change",
                 admin_id,
                 target,
-                {"old_role": "editor", "new_role": "viewer"},
+                {"old_role": "editor", "new_role": "org_admin"},
                 ip=None,
             )
         ]
 
     async def test_org_users_update_role_in_another_org_is_audited_there(self, db: FakeDb) -> None:
         admin_id, admin = _admin(db, OTHER_ORG_ID)
-        target = db.add_account(role="viewer", org_id=OTHER_ORG_ID)
+        target = db.add_account(role="editor", org_id=OTHER_ORG_ID)
 
-        await _update(db, admin, target, role="editor")
+        await _update(db, admin, target, role="org_admin")
 
-        assert db.users[target]["role"] == "editor"
+        assert db.users[target]["role"] == "org_admin"
         assert [_audit_view(row) for row in db.audit] == [
             _expected_audit(
                 "user.role_change",
                 admin_id,
                 target,
-                {"old_role": "viewer", "new_role": "editor"},
+                {"old_role": "editor", "new_role": "org_admin"},
                 org_id=OTHER_ORG_ID,
             )
         ]
 
-    async def test_org_users_update_role_to_viewer_deletes_nothing(self, db: FakeDb) -> None:
-        """#162: the role is read on every request; sessions, connections, memory, settings
-        and a pending reset token are kept."""
+    async def test_org_users_update_role_demotion_deletes_nothing(self, db: FakeDb) -> None:
+        """#162: the role is read on every request; demoting a second Org Admin to Editor
+        keeps their sessions, connections, memory, settings and a pending reset token."""
         _, admin = _admin(db)
-        target = db.add_account(role="editor")
+        target = db.add_account(role="org_admin")
         db.open_session(target)
         db.open_session(target, last_seen_ago=timedelta(minutes=5))
         db.add_oauth_token(target, "google", encrypted_refresh_token="enc-google")
@@ -778,7 +776,7 @@ class TestRoleChange:
         db.add_reset_token(target)
         before = _state(db)
 
-        await _update(db, admin, target, role="viewer")
+        await _update(db, admin, target, role="editor")
 
         after = _state(db)
         for table in ("sessions", "oauth_tokens", "memory", "user_settings", "tokens", "outbox"):
@@ -789,21 +787,23 @@ class TestRoleChange:
         _, admin = _admin(db)
         target = db.add_account(role="editor")
 
-        await _update(db, admin, target, role="viewer")
+        await _update(db, admin, target, role="org_admin")
 
         assert db.outbox == []
 
     async def test_org_users_update_role_change_runs_in_one_committed_transaction(
         self, db: FakeDb
     ) -> None:
-        """The guard, the UPDATE and the audit INSERT share one connection and transaction."""
+        """The guard, the UPDATE and the audit INSERT share one connection and transaction
+        (a second Org Admin demoted to Editor, so the guard runs)."""
         _, admin = _admin(db)
-        target = db.add_account(role="editor")
+        target = db.add_account(role="org_admin")
         db.calls.clear()
 
-        await _update(db, admin, target, role="viewer")
+        await _update(db, admin, target, role="editor")
 
         writes = [call for call in db.calls if _is_write(call)]
+        assert _guard_calls(db)
         assert db.matching(r"^update users\b")
         assert db.matching(r"^insert into audit_events\b")
         assert len({(call.via, call.tx) for call in writes}) == 1
@@ -811,13 +811,14 @@ class TestRoleChange:
         assert db.transactions == [(writes[0].tx, "commit")]
 
     async def test_org_users_update_sql_never_holds_ids_names_or_emails(self, db: FakeDb) -> None:
-        """Values are bind parameters: no id, name or email in any statement's text."""
+        """Values are bind parameters: no id, name or email in any statement's text (a
+        second Org Admin demoted to Editor, so the guard's statement is checked too)."""
         admin_id, admin = _admin(db)
-        target = db.add_account(role="editor", email=_OLD_EMAIL, name=_OLD_NAME)
+        target = db.add_account(role="org_admin", email=_OLD_EMAIL, name=_OLD_NAME)
         db.add_reset_token(target)
         db.calls.clear()
 
-        await _update(db, admin, target, role="viewer", name=_NEW_NAME, email=_NEW_EMAIL)
+        await _update(db, admin, target, role="editor", name=_NEW_NAME, email=_NEW_EMAIL)
 
         assert db.calls
         for call in db.calls:
@@ -841,17 +842,14 @@ class TestRoleChange:
 class TestLastAdminGuard:
     """An org always keeps at least one active Org Admin."""
 
-    @pytest.mark.parametrize("new_role", ["editor", "viewer"])
-    async def test_org_users_demoting_the_last_active_admin_is_refused(
-        self, db: FakeDb, new_role: str
-    ) -> None:
+    async def test_org_users_demoting_the_last_active_admin_is_refused(self, db: FakeDb) -> None:
         """LastAdminError; nothing changes, nothing is audited or queued."""
         admin_id, admin = _admin(db)
         db.add_account(role="editor")
         before = _state(db)
 
         with pytest.raises(accounts.LastAdminError):
-            await _update(db, admin, admin_id, role=new_role)
+            await _update(db, admin, admin_id, role="editor")
 
         assert _state(db) == before
         assert db.audit == []
@@ -863,7 +861,7 @@ class TestLastAdminGuard:
         before = _state(db)
 
         with pytest.raises(accounts.LastAdminError):
-            await _update(db, admin, admin_id, role="viewer", name=_NEW_NAME)
+            await _update(db, admin, admin_id, role="editor", name=_NEW_NAME)
 
         assert _state(db) == before
 
@@ -900,10 +898,10 @@ class TestLastAdminGuard:
         admin_id, admin = _admin(db)
         db.add_account(role="org_admin")
 
-        summary = await _update(db, admin, admin_id, role="viewer")
+        summary = await _update(db, admin, admin_id, role="editor")
 
-        assert db.users[admin_id]["role"] == "viewer"
-        assert summary.role == "viewer"
+        assert db.users[admin_id]["role"] == "editor"
+        assert summary.role == "editor"
         assert [row["action"] for row in db.audit] == ["user.role_change"]
 
     async def test_org_users_a_deactivated_second_admin_does_not_count(self, db: FakeDb) -> None:
@@ -930,7 +928,7 @@ class TestLastAdminGuard:
         db.add_account(role="org_admin", org_id=OTHER_ORG_ID)
 
         with pytest.raises(accounts.LastAdminError):
-            await _update(db, admin, admin_id, role="viewer")
+            await _update(db, admin, admin_id, role="editor")
 
         assert db.users[admin_id]["role"] == "org_admin"
 
@@ -1029,7 +1027,7 @@ class TestProfileChange:
 
     async def test_org_users_email_change_is_stored_returned_and_audited(self, db: FakeDb) -> None:
         admin_id, admin = _admin(db)
-        target = db.add_account(role="viewer", email=_OLD_EMAIL, name=_OLD_NAME)
+        target = db.add_account(role="editor", email=_OLD_EMAIL, name=_OLD_NAME)
 
         summary = await _update(db, admin, target, email=_NEW_EMAIL)
 
@@ -1139,12 +1137,15 @@ class TestProfileChange:
         admin_id, admin = _admin(db)
         target = db.add_account(role="editor", name=_OLD_NAME)
 
-        await _update(db, admin, target, role="viewer", name=_NEW_NAME)
+        await _update(db, admin, target, role="org_admin", name=_NEW_NAME)
 
-        assert (db.users[target]["role"], db.users[target]["name"]) == ("viewer", _NEW_NAME)
+        assert (db.users[target]["role"], db.users[target]["name"]) == ("org_admin", _NEW_NAME)
         assert [_audit_view(row) for row in db.audit] == [
             _expected_audit(
-                "user.role_change", admin_id, target, {"old_role": "editor", "new_role": "viewer"}
+                "user.role_change",
+                admin_id,
+                target,
+                {"old_role": "editor", "new_role": "org_admin"},
             ),
             _expected_audit(
                 "user.profile_change",
@@ -1158,9 +1159,9 @@ class TestProfileChange:
         self, db: FakeDb
     ) -> None:
         _, admin = _admin(db)
-        target = db.add_account(role="viewer", email=_OLD_EMAIL)
+        target = db.add_account(role="editor", email=_OLD_EMAIL)
 
-        await _update(db, admin, target, role="editor", email=_NEW_EMAIL)
+        await _update(db, admin, target, role="org_admin", email=_NEW_EMAIL)
 
         assert [row["action"] for row in db.audit] == ["user.role_change", "user.profile_change"]
         assert db.audit[1]["metadata"] == {"name_changed": False, "email_changed": True}
@@ -1217,9 +1218,9 @@ class TestProfileChange:
         self, db: FakeDb
     ) -> None:
         _, admin = _admin(db)
-        target = db.add_account(role="viewer", name=_OLD_NAME)
+        target = db.add_account(role="org_admin", name=_OLD_NAME)
 
-        await _update(db, admin, target, role="viewer", name=_NEW_NAME)
+        await _update(db, admin, target, role="org_admin", name=_NEW_NAME)
 
         assert [row["action"] for row in db.audit] == ["user.profile_change"]
         assert db.audit[0]["metadata"] == {"name_changed": True, "email_changed": False}
@@ -1301,7 +1302,7 @@ class TestEmailUniqueness:
         before = _state(db)
 
         with pytest.raises(accounts.DuplicateEmailError):
-            await _update(db, admin, target, role="viewer", name=_NEW_NAME, email=requested)
+            await _update(db, admin, target, role="org_admin", name=_NEW_NAME, email=requested)
 
         after = _state(db)
         assert after["users"] == before["users"]
@@ -1318,7 +1319,7 @@ class TestEmailUniqueness:
         _add_occupant(db, holder, _TAKEN_EMAIL)
 
         with pytest.raises(accounts.DuplicateEmailError):
-            await _update(db, admin, target, role="viewer", email=_TAKEN_EMAIL.upper())
+            await _update(db, admin, target, role="org_admin", email=_TAKEN_EMAIL.upper())
 
         assert [_audit_view(row) for row in db.audit] == [
             _expected_audit("user.profile_change", admin_id, target, {"email_taken": True})
@@ -1403,7 +1404,7 @@ def _add_unreachable(db: FakeDb, kind: str) -> uuid.UUID:
 
 _UNREACHABLE = ["other_org", "other_org_admin", "unknown", "invited", "deleted", "super_admin"]
 _PATCHES = [
-    pytest.param({"role": "viewer"}, id="role"),
+    pytest.param({"role": "editor"}, id="role"),
     pytest.param({"role": "org_admin"}, id="promote"),
     pytest.param({"name": _NEW_NAME}, id="name"),
     pytest.param({"email": _NEW_EMAIL}, id="email"),
@@ -1478,10 +1479,10 @@ class TestFailClosed:
     @pytest.mark.parametrize(
         "fields",
         [
-            pytest.param({"role": "viewer"}, id="role"),
+            pytest.param({"role": "org_admin"}, id="role"),
             pytest.param({"name": _NEW_NAME}, id="name"),
             pytest.param({"email": _NEW_EMAIL}, id="email"),
-            pytest.param({"role": "viewer", "name": _NEW_NAME, "email": _NEW_EMAIL}, id="all"),
+            pytest.param({"role": "org_admin", "name": _NEW_NAME, "email": _NEW_EMAIL}, id="all"),
         ],
     )
     async def test_org_users_audit_failure_changes_nothing(
@@ -1510,7 +1511,7 @@ class TestFailClosed:
         db.fail_audit_when = lambda row: row["action"] == "user.profile_change"
 
         with pytest.raises(AuditRecordError):
-            await _update(db, admin, target, role="viewer", name=_NEW_NAME)
+            await _update(db, admin, target, role="org_admin", name=_NEW_NAME)
 
         assert _state(db) == before
         assert db.audit == []
@@ -1531,7 +1532,7 @@ class TestNoContent:
         _add_occupant(db, "other_org", _TAKEN_EMAIL)
         db.add_reset_token(target)
         await org_users.list_org_users(db.pool, actor=admin)
-        await _update(db, admin, target, role="viewer", name=_NEW_NAME, email=_NEW_EMAIL)
+        await _update(db, admin, target, role="org_admin", name=_NEW_NAME, email=_NEW_EMAIL)
         with pytest.raises(accounts.DuplicateEmailError):
             await _update(db, admin, target, email=_TAKEN_EMAIL)
         with pytest.raises(accounts.UserNotInOrgError):
@@ -1610,21 +1611,21 @@ def _invited_account(
 def _mixed_org(db: FakeDb) -> Principal:
     """ORG_ID (10 seats) with users of every kind, OTHER_ORG_ID with its own; the admin.
 
-    Counted in ORG_ID: the admin, an Editor, a Viewer, a second Org Admin, a pending and
-    an expired invited account (6). Not counted: a deactivated user, a deleted active
+    Counted in ORG_ID: the admin, two Editors, a second Org Admin, a pending and an
+    expired invited account (6). Not counted: a deactivated user, a deleted active
     and a deleted invited account, a Super Admin, and every OTHER_ORG_ID account.
     """
     db.add_org(ORG_ID, seats=_SEATS)
     _, admin = _admin(db)
     db.add_account(role="editor")
-    db.add_account(role="viewer")
+    db.add_account(role="editor")
     db.add_account(role="org_admin")
     _invited_account(db)
     _invited_account(db, sent_ago=_EXPIRED_AGO)
     db.add_account(role="editor", status="deactivated")
     db.add_account(role="editor", deleted_at=datetime.now(UTC) - timedelta(days=2))
     db.add_account(
-        role="viewer",
+        role="editor",
         status="invited",
         name=None,
         password_hash=None,
@@ -1670,7 +1671,7 @@ class TestSeatUsageAuthorization:
     async def test_org_users_seat_usage_refused_without_org_users_view(
         self, db: FakeDb, who: str
     ) -> None:
-        """An Editor, a Viewer or a Super Admin: PermissionError and no statement at all."""
+        """An Editor or a Super Admin: PermissionError and no statement at all."""
         db.add_org(ORG_ID, seats=_SEATS)
         db.add_account(role="org_admin")
         actor = _actor(db, who)
@@ -1720,7 +1721,7 @@ class TestSeatUsageCounts:
 
         assert _numbers(await _seat_usage(db, admin)) == (1, _SEATS)
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_org_users_seat_usage_counts_an_active_member_of_any_role(
         self, db: FakeDb, role: str
     ) -> None:

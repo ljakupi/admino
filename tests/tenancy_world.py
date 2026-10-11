@@ -7,10 +7,10 @@ resolved by the real ``server.require_session``.
 
 Inputs: a ``FakeDb``. Outputs:
 - ``build_world(db)``: two active organizations (A = ``ORG_ID``, B =
-  ``OTHER_ORG_ID``), each with an Org Admin, an Editor and a Viewer, plus a
-  Super Admin; every account has a live session and the password
-  ``PASSWORD``. Both orgs have data residency off, the default tool
-  permission matrix and an org_settings row; the platform settings row exists.
+  ``OTHER_ORG_ID``), each with an Org Admin and an Editor, plus a Super
+  Admin; every account has a live session and the password ``PASSWORD``.
+  Both orgs have data residency off, the default tool permission matrix and
+  an org_settings row; the platform settings row exists.
 - ``make_app(agent)`` / ``make_client(app)``: the app and a TestClient.
 - ``seed_chat`` / ``seed_pending_confirmation`` / ``chat_runtime_state``: a
   persisted chat of an account, a pending confirmation of it in the server's
@@ -39,7 +39,7 @@ catalog imports before access.py defines them (see its docstring).
 GH-176 (persisted, owner-private chats): the six chat routes (POST and GET
 /api/chats, GET/PATCH/DELETE /api/chats/{chat_id}, POST
 /api/chats/{chat_id}/messages) are member rows gated by ``chat.send`` (Org
-Admin, Editor; a Viewer and the Super Admin get 403). Not found, another
+Admin, Editor; the Super Admin gets 403). Not found, another
 org's and another user's chat all answer ``CHAT_NOT_FOUND``. Chats live in the
 FakeDb's ``chats`` / ``chat_messages`` tables (so ``db.snapshot()`` holds
 them); the only in-memory chat state is ``server._chat_runtime`` (per-chat
@@ -74,7 +74,7 @@ owner reaches them: anything but the caller's own live attachment is
 file, migration 0030) through to ``db.add_attachment`` with the other fields.
 
 GH-194 (the trash): seven member rows gated by ``chat.send`` (Org Admin,
-Editor; a Viewer and the Super Admin get 403). ``GET /api/trash`` (the
+Editor; the Super Admin gets 403). ``GET /api/trash`` (the
 caller's own trash, paged) and ``DELETE /api/trash`` (empty it) are
 ``own_user``; ``POST /api/trash/chats/{chat_id}/restore``, ``POST
 /api/trash/attachments/{attachment_id}/restore``, ``DELETE
@@ -100,6 +100,13 @@ turn, so another org's, a colleague's and an unknown chat answer
 ``CHAT_NOT_FOUND``. ``seed_failed_chat`` stores a chat whose one turn failed (the
 question, then the answer stored ``error`` or ``stopped``, as the server stores a
 failed run's last message): the state a retry acts on.
+
+GH-306 (the read-only member role retired): #139 §2.1 has three columns, the
+Super Admin, the Org Admin and the Editor, so ``Role`` / ``MEMBER_ROLES`` and
+``ROLE_MATRIX`` hold those three and every org of the world has exactly an
+Org Admin and an Editor. A capability of every member (``_MEMBERS``) stays
+with Org Admins and Editors. The project roles of §2.2 (``PROJECT_ROLES``) are
+a separate, pending catalog and don't change.
 
 Security notes:
 - Passwords, tokens and emails here are fixed fake values, never secrets.
@@ -137,11 +144,11 @@ if TYPE_CHECKING:
 # Accounts
 # ---------------------------------------------------------------------------
 
-Role = Literal["super_admin", "org_admin", "editor", "viewer"]
-MemberRole = Literal["org_admin", "editor", "viewer"]
+Role = Literal["super_admin", "org_admin", "editor"]
+MemberRole = Literal["org_admin", "editor"]
 
-ROLES: Final[tuple[Role, ...]] = ("super_admin", "org_admin", "editor", "viewer")
-MEMBER_ROLES: Final[tuple[MemberRole, ...]] = ("org_admin", "editor", "viewer")
+ROLES: Final[tuple[Role, ...]] = ("super_admin", "org_admin", "editor")
+MEMBER_ROLES: Final[tuple[MemberRole, ...]] = ("org_admin", "editor")
 
 SESSION_COOKIE: Final = "admino_session"
 PASSWORD: Final = "tenancy-Suite-163-quartz"
@@ -194,7 +201,7 @@ class World:
         return self.super_admin if role == "super_admin" else self.a[role]
 
     def everyone(self) -> list[Account]:
-        """All seven accounts: the Super Admin, then org A's and org B's members."""
+        """All five accounts: the Super Admin, then org A's and org B's members."""
         return [self.super_admin, *self.a.values(), *self.b.values()]
 
 
@@ -547,7 +554,7 @@ def use_roomy_rate_limits(monkeypatch: pytest.MonkeyPatch) -> None:
 _SA: Final[frozenset[Role]] = frozenset({"super_admin"})
 _OA: Final[frozenset[Role]] = frozenset({"org_admin"})
 _OA_ED: Final[frozenset[Role]] = frozenset({"org_admin", "editor"})
-_MEMBERS: Final[frozenset[Role]] = frozenset({"org_admin", "editor", "viewer"})
+_MEMBERS: Final[frozenset[Role]] = frozenset({"org_admin", "editor"})
 _ALL: Final[frozenset[Role]] = frozenset(ROLES)
 
 

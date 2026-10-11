@@ -8,8 +8,8 @@ org's and a colleague's chat, the per-user rate limit, 422 without echo,
 operator blindness.
 
 The app from ``create_app()`` (a stub agent) runs against the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, plus a Super Admin, real session cookies). Attachment rows are seeded with
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, plus
+a Super Admin, real session cookies). Attachment rows are seeded with
 ``FakeDb.add_attachment`` (``active=False`` needs migration 0030, which the fake
 models once it ships).
 
@@ -33,9 +33,9 @@ What is pinned:
 - 404 ``chat_not_found`` for another org's, a colleague's (an Org Admin's request
   on an Editor's chat too), a trashed and an unknown chat, with no statement on
   attachments and no file name in the body; a non-UUID chat id is 422.
-- Roles (``chat.send``): the Org Admin and the Editor list their own; the Viewer
-  (their own chat) and the Super Admin get exactly 403 Forbidden, no statement
-  on chats or attachments, never a file name. No session: 401.
+- Roles (``chat.send``): the Org Admin and the Editor list their own; the Super
+  Admin (an Editor's chat) gets exactly 403 Forbidden, no statement on chats or
+  attachments, never a file name. No session: 401.
 - Rate limit ``/api/chats/attachments/list`` (1.0, 10), per user.
 - The route declares ``AttachmentListResponse``.
 
@@ -130,7 +130,7 @@ def root(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, root: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database, the
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database, the
     attachments root at ``root``, every rate-limit bucket roomy."""
     db = FakeDb()
     built = build_world(db)
@@ -681,20 +681,16 @@ class TestAttachmentListAccess:
 
         assert response.status_code == 422, response.text
 
-    @pytest.mark.parametrize("role", ["viewer", "super_admin"])
-    def test_chat_attachment_list_viewer_and_super_admin_are_403_and_see_no_name(
-        self, world: World, client: TestClient, role: str
+    def test_chat_attachment_list_super_admin_is_403_and_sees_no_name(
+        self, world: World, client: TestClient
     ) -> None:
-        """The Viewer on their own chat (from before a demotion), the Super Admin on an
-        Editor's (operator blindness): exactly 403 Forbidden, no statement on chats or
-        attachments, no file name."""
-        caller = world.super_admin if role == "super_admin" else world.a["viewer"]
-        owner = world.a["viewer"] if role == "viewer" else world.a["editor"]
-        chat_id = _chat(world.db, owner)
+        """The Super Admin (no chat.send) on an Editor's chat (operator blindness):
+        exactly 403 Forbidden, no statement on chats or attachments, no file name."""
+        chat_id = _chat(world.db, world.a["editor"])
         _seed(world.db, chat_id, created_at=_at())
         since = len(world.db.calls)
 
-        response = _list(client, caller, chat_id)
+        response = _list(client, world.super_admin, chat_id)
 
         assert _outcome(response) == (403, FORBIDDEN)
         assert _statements(world.db, since, _CHAT_TABLES_SQL) == []

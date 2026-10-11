@@ -2,7 +2,8 @@
 
 Every capability of #139 §2.1 that has a route is checked at the HTTP layer
 against each role: every non-public row of ``ROUTES`` (tests/tenancy_world.py)
-is sent by the Super Admin and by org A's Org Admin, Editor and Viewer.
+is sent by the Super Admin and by org A's Org Admin and Editor (GH-306: #139
+§2.1 has these three columns; the read-only member role is retired).
 
 Inputs: the world of ``build_world`` (two orgs, one account per member role,
 a Super Admin; real session cookies resolved by the real
@@ -14,34 +15,34 @@ second session, a pending confirmation or promotion, an OAuth connection, a
 target org for the platform routes, a fresh active or deactivated user of org
 B for the Super Admin's user actions and an org whose first Org Admin is still
 invited for the re-invite (GH-167)). GH-176: the chat routes act on a persisted
-chat of the caller's own (a Viewer's too: chats from before a demotion stay
-stored, so its 403 is the role's, not a missing chat's) with a live pending
-confirmation in ``server._chat_runtime``; the Super Admin, who can own no chat,
-is pointed at org A's Org Admin's. The legacy confirm acts on the caller's
-legacy chat (``chats.legacy_session_id``) and its pending confirmation. GH-8:
+chat of the caller's own with a live pending confirmation in
+``server._chat_runtime``; the Super Admin, who can own no chat, is pointed at
+org A's Org Admin's (so its 403 is the role's, not a missing chat's). The legacy
+confirm acts on the caller's legacy chat (``chats.legacy_session_id``) and its
+pending confirmation. GH-8:
 the stop route acts on the caller's own idle chat (no run to stop: ``200
 {"stopped": false}``) and never touches the chat runtime. GH-187: the upload
 sends a short text file (raw body, ``X-Attachment-Name``) into a chat of the
-caller's own (a Viewer's too); the attachment reads name an attachment of a
+caller's own; the attachment reads name an attachment of a
 chat of the caller's own, its file under a per-test attachments root; orgs A
 and B have a storage quota. The Super Admin's requests name org A's Org
 Admin's chat and attachment. GH-190: the exclusion (``PATCH
 /api/attachments/{attachment_id}`` with ``{"active": false}``) and the list of
 a chat's files (``GET /api/chats/{chat_id}/attachments``) act on an attachment
-and a chat of the caller's own (a Viewer's too). GH-194: the trash routes act
-on the caller's own items (a Viewer's too: items trashed before a demotion
-stay in its trash, so its 403 is the role's): ``DELETE
+and a chat of the caller's own. GH-194: the trash routes act on the caller's
+own items: ``DELETE
 /api/attachments/{attachment_id}`` on a live file, ``GET`` and ``DELETE
 /api/trash`` on a trash holding a trashed chat, restore and delete forever on
 a trashed chat (with a message and a file in its group) and on a file trashed
 on its own; the Super Admin's requests name org A's Org Admin's items.
 GH-245: the retry (``POST
 /api/chats/{chat_id}/retry``, no body) acts on a chat of the caller's own whose one
-turn failed (the answer stored ``error``; a Viewer owns one from before a demotion):
-an Org Admin's and an Editor's re-run it with the stub agent (200, the deterministic
-success: the failed turn is retryable, the stub answers a final reply); the Viewer and
-the Super Admin (pointed at org A's Org Admin's failed chat) get 403 and nothing runs
-or changes.
+turn failed (the answer stored ``error``): an Org Admin's and an Editor's re-run it
+with the stub agent (200, the deterministic success: the failed turn is retryable, the
+stub answers a final reply); the Super Admin (pointed at org A's Org Admin's failed
+chat) gets 403 and nothing runs or changes. GH-306: the role change demotes a fresh
+second Org Admin to Editor (a real change through the last-admin guard), and a
+pending invitation is an invited Editor's.
 
 Outputs (the expectations):
 - a role outside ``allowed_roles(spec)`` (the spelled-out ``ROLE_MATRIX``)
@@ -59,6 +60,14 @@ Outputs (the expectations):
   request is a 403 that changes nothing. GH-190's two attachment rows
   (``chat.send``) are checked the same way, and so are GH-194's seven trash
   rows (``chat.send``, never ``file.upload``).
+- GH-306: with the read-only member role retired, every capability of the Org
+  Admin and the Editor has the same roles (``chat.send``, ``file.upload``,
+  ``oauth.connect``, ``org.permissions.view``), so no role case tells which one
+  a route checks, and no member is refused by it. Every other member row of
+  those roles (the chat, OAuth and permission summary routes) is checked with
+  its row's capability withdrawn from the Editor alone (``access._MATRIX``, for
+  one test): the Editor's valid request is a 403 that changes nothing, and the
+  same request succeeds once the matrix is restored.
 
 Completeness: a new non-public ``ROUTES`` row fails
 ``test_tenancy_roles_every_non_public_route_has_a_setup`` until it gets a
@@ -80,6 +89,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final
 from unittest.mock import AsyncMock
 
@@ -138,7 +148,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
-    """Orgs A and B with an Org Admin, an Editor and a Viewer each, plus a Super Admin.
+    """Orgs A and B with an Org Admin and an Editor each, plus a Super Admin.
 
     GH-187: attachments live under ``tmp_path``; both orgs have a storage quota.
     """
@@ -249,12 +259,15 @@ def _force_logout(world: World, caller: Account) -> _Request:
     return _Request("POST", f"/api/org/users/{target}/logout")
 
 
-def _disposable_member(world: World, caller: Account, *, status: str = "active") -> Any:
-    """A fresh Editor of the caller's org, created per request: never the caller, never
-    the org's last Org Admin. An active one has a live session; a deactivated one has
-    none (deactivation revoked them). The org keeps free seats (100, 3 members)."""
+def _disposable_member(
+    world: World, caller: Account, *, status: str = "active", role: str = "editor"
+) -> Any:
+    """A fresh member (an Editor by default) of the caller's org, created per request:
+    never the caller, never the org's last Org Admin. An active one has a live session; a
+    deactivated one has none (deactivation revoked them). The org keeps free seats (100,
+    2 members)."""
     target = world.db.add_account(
-        role="editor", org_id=_caller_org(world, caller), status=status, email=_MANAGED_EMAIL
+        role=role, org_id=_caller_org(world, caller), status=status, email=_MANAGED_EMAIL
     )
     if status == "active":
         world.db.open_session(target)
@@ -262,10 +275,10 @@ def _disposable_member(world: World, caller: Account, *, status: str = "active")
 
 
 def _patch_org_user(world: World, caller: Account) -> _Request:
-    """Change a fresh Editor's role to Viewer (a real change: ORG_USERS_ROLE_CHANGE)."""
-    return _Request(
-        "PATCH", f"/api/org/users/{_disposable_member(world, caller)}", json={"role": "viewer"}
-    )
+    """Demote a fresh second Org Admin of the caller's org to Editor (a real change:
+    ORG_USERS_ROLE_CHANGE, through the last-admin guard; the org keeps its Org Admin)."""
+    target = _disposable_member(world, caller, role="org_admin")
+    return _Request("PATCH", f"/api/org/users/{target}", json={"role": "editor"})
 
 
 def _deactivate_org_user(world: World, caller: Account) -> _Request:
@@ -290,9 +303,9 @@ def _org_user_password_reset(world: World, caller: Account) -> _Request:
 
 
 def _pending_invitation(world: World, caller: Account) -> Any:
-    """A pending invitation into the caller's org; its id."""
+    """A pending invitation (an invited Editor) into the caller's org; its id."""
     invitee = world.db.add_account(
-        role="viewer",
+        role="editor",
         org_id=_caller_org(world, caller),
         status="invited",
         name=None,
@@ -344,9 +357,8 @@ def _own_chat(
 ) -> Callable[[World, Account], _Request]:
     """A request on a chat of the caller's own (GH-176), with a live pending confirmation.
 
-    The chat has a title and, with ``history``, a question and its answer. A Viewer
-    owns one too (from before a demotion); the Super Admin's request names org A's
-    Org Admin's chat.
+    The chat has a title and, with ``history``, a question and its answer. The Super
+    Admin's request names org A's Org Admin's chat.
     """
 
     def prepare(world: World, caller: Account) -> _Request:
@@ -367,9 +379,8 @@ def _own_chat(
 
 def _own_failed_chat(world: World, caller: Account) -> _Request:
     """GH-245: retry (no body) a chat of the caller's own whose one turn failed (the
-    answer stored ``error``). A Viewer owns one from before a demotion; the Super Admin's
-    request names org A's Org Admin's. No pending confirmation: a chat whose latest
-    message failed has none."""
+    answer stored ``error``). The Super Admin's request names org A's Org Admin's. No
+    pending confirmation: a chat whose latest message failed has none."""
     chat_id = seed_failed_chat(
         world.db,
         _chat_owner(world, caller),
@@ -381,8 +392,8 @@ def _own_failed_chat(world: World, caller: Account) -> _Request:
 
 
 def _upload_attachment(world: World, caller: Account) -> _Request:
-    """GH-187: a short text file into a chat of the caller's own (a Viewer owns one from
-    before a demotion; the Super Admin's request names org A's Org Admin's chat)."""
+    """GH-187: a short text file into a chat of the caller's own (the Super Admin's
+    request names org A's Org Admin's chat)."""
     chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Rollen Chat 187")
     return _Request(
         "POST",
@@ -961,6 +972,93 @@ class TestAttachmentRouteCapabilities:
 
 
 # ---------------------------------------------------------------------------
+# GH-306: the other member routes of the Org Admin and the Editor check their own
+# row's capability too
+# ---------------------------------------------------------------------------
+
+_MEMBER_PAIR: Final[frozenset[Role]] = frozenset({"org_admin", "editor"})
+# Every member row of exactly those two roles that _ATTACHMENT_ROUTES leaves out: the
+# chat, OAuth and permission summary routes. The retired read-only role read the
+# permission summary but neither chatted nor connected accounts, so its column told
+# these capabilities apart and was the member each route's own check refused.
+_MEMBER_PAIR_ROUTES: Final[tuple[tuple[str, str], ...]] = tuple(
+    (spec.method, spec.path)
+    for spec in _NON_PUBLIC
+    if spec.capability is not None
+    and allowed_roles(spec) == _MEMBER_PAIR
+    and (spec.method, spec.path) not in _ATTACHMENT_ROUTES
+)
+
+
+def _send(client: Any, request: _Request, caller: Account) -> Any:
+    """Send ``request`` with its own headers plus the caller's session cookie."""
+    return client.request(
+        request.method,
+        request.url,
+        params=request.params,
+        json=request.json,
+        content=request.content,
+        headers={**request.headers, **caller.cookie},
+    )
+
+
+class TestMemberPairRouteCapabilities:
+    """GH-306: the Org Admin and the Editor share every member capability they have, so a
+    route's own check refuses no member of the matrix: withdrawing the row's capability
+    from the Editor alone (``access._MATRIX``, for one test) shows the route checks it."""
+
+    @pytest.mark.parametrize(
+        "route",
+        [pytest.param(route, id=f"{route[0]}:{route[1]}") for route in _MEMBER_PAIR_ROUTES],
+    )
+    def test_tenancy_roles_member_route_refuses_an_editor_without_its_rows_capability(
+        self, world: World, monkeypatch: pytest.MonkeyPatch, route: tuple[str, str]
+    ) -> None:
+        """With the row's capability withdrawn from the Editor alone, org A's Editor's valid
+        request is 403 Forbidden and changes nothing (no table, audit row, write
+        statement, in-memory state or file; no agent run). Control: with the matrix
+        restored, the same request gets the route's documented status."""
+        spec = next(spec for spec in ROUTES if (spec.method, spec.path) == route)
+        assert spec.capability is not None
+        setup = _SETUPS[route]
+        caller = world.a["editor"]
+        agent = stub_agent()
+        client = make_client(make_app(agent))
+        request = setup.prepare(world, caller)
+        matrix = access._MATRIX
+        withdrawn = MappingProxyType({**matrix, spec.capability: frozenset({"org_admin"})})
+        tables = _tables(world.db)
+        audit = copy.deepcopy(world.db.audit_rows())
+        memory = _memory_state(world.db)
+        files = attachment_files()
+        start = len(world.db.calls)
+
+        monkeypatch.setattr(access, "_MATRIX", withdrawn)
+        refused = _send(client, request, caller)
+        writes = _writes_since(world.db, start)
+        changed = {
+            "tables": _tables(world.db) != tables,
+            "audit": world.db.audit_rows() != audit,
+            "memory": _memory_state(world.db) != memory,
+            "files": attachment_files() != files,
+            "runs": agent.run.await_count,
+        }
+        monkeypatch.setattr(access, "_MATRIX", matrix)
+        allowed = _send(client, request, caller)
+
+        assert (refused.status_code, refused.json()) == (403, FORBIDDEN)
+        assert writes == []
+        assert changed == {
+            "tables": False,
+            "audit": False,
+            "memory": False,
+            "files": False,
+            "runs": 0,
+        }
+        assert allowed.status_code == setup.status, allowed.text[:200]
+
+
+# ---------------------------------------------------------------------------
 # Completeness and §2.1 coverage
 # ---------------------------------------------------------------------------
 
@@ -991,7 +1089,7 @@ class TestRoleCaseCoverage:
         } == {}
 
     def test_tenancy_roles_every_route_is_checked_against_every_role(self) -> None:
-        """The cases are the full cross product: each non-public route x each of the 4 roles."""
+        """The cases are the full cross product: each non-public route x each of the 3 roles."""
         by_route: dict[tuple[str, str], set[Role]] = {}
         for spec, role in _ROLE_CASES:
             by_route.setdefault((spec.method, spec.path), set()).add(role)

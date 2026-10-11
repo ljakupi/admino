@@ -13,8 +13,8 @@ Security notes:
   is refused for every role and never raises. The Super Admin is not a wildcard.
 - Operator blindness: the Super Admin gets no content capability (chat, files,
   projects, exports, account connections, templates).
-- Least privilege: a Viewer is read-only; member roles never get a
-  platform-level capability.
+- Least privilege: only an Org Admin manages its org (users, settings, tool
+  permissions); member roles never get a platform-level capability.
 - ``Principal`` mirrors the users-table CHECKs: kind is 'super_admin' iff
   org_id is None iff role is None. It is a ``SealedModel``: frozen, and
   ``model_construct()`` / ``model_copy(update=...)`` (which skip validation)
@@ -58,7 +58,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 UserKind = Literal["super_admin", "member"]
-MemberRole = Literal["org_admin", "editor", "viewer"]
+MemberRole = Literal["org_admin", "editor"]
 
 
 def _plain_uuid(value: UUID) -> UUID:
@@ -172,8 +172,8 @@ class Capability(StrEnum):
 _SUPER_ADMIN_ONLY: Final = frozenset({"super_admin"})
 _ORG_ADMIN_ONLY: Final = frozenset({"org_admin"})
 _ORG_ADMIN_AND_EDITOR: Final = frozenset({"org_admin", "editor"})
-_ALL_MEMBERS: Final = frozenset({"org_admin", "editor", "viewer"})
-_EVERYONE: Final = frozenset({"super_admin", "org_admin", "editor", "viewer"})
+_ALL_MEMBERS: Final = frozenset({"org_admin", "editor"})
+_EVERYONE: Final = frozenset({"super_admin", "org_admin", "editor"})
 
 _MATRIX: Final[MappingProxyType[Capability, frozenset[str]]] = MappingProxyType(
     {
@@ -250,7 +250,7 @@ def principal_role(principal: object) -> str | None:
         principal: The object to classify.
 
     Returns:
-        "super_admin", "org_admin", "editor" or "viewer"; None for anything else.
+        "super_admin", "org_admin" or "editor"; None for anything else.
     """
     if type(principal) is not Principal:
         return None

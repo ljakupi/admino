@@ -4,8 +4,8 @@
 ``GET /api/attachments/{attachment_id}`` (metadata) and
 ``GET /api/attachments/{attachment_id}/content`` (the stored original). The app
 from ``create_app()`` (a stub agent) runs against the FakeDb world of
-tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
-each, plus a Super Admin, all with real session cookies), with both orgs given a
+tests/tenancy_world.py (orgs A and B with an Org Admin and an Editor each, plus a
+Super Admin, all with real session cookies), with both orgs given a
 storage quota and ``organizations.ATTACHMENTS_ROOT`` pointing into ``tmp_path``.
 The real ``admino.attachments``, ``admino.attachment_types``, ``admino.chats``
 and ``admino.audit_events`` run; ``server._processing`` is replaced (after
@@ -45,9 +45,9 @@ What these tests pin down:
   every ``Content-Length`` check before any statement (an unknown chat
   included; the session lookup and a platform settings read aside), the chat
   404 before any quota statement.
-- Section 5: 401 without a session; a Viewer and the Super Admin 403 before any
-  statement (the upload spends no bucket); a cross-origin POST is the CSRF 403;
-  per-user buckets: the upload's burst is the platform ``max_files_per_message``
+- Section 5: 401 without a session; the Super Admin 403 before any statement
+  (the upload spends no bucket); a cross-origin POST is the CSRF 403; per-user
+  buckets: the upload's burst is the platform ``max_files_per_message``
   (refill 0.5/s), the GET routes have ``/api/attachments/get`` (5.0, 50) and
   ``/api/attachments/content/get`` (2.0, 30); the routes declare their response
   models.
@@ -360,7 +360,7 @@ class _Env:
 
 @pytest.fixture()
 def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Env:
-    """Orgs A and B (OA/ED/VI each, a 64 MiB storage quota) and a Super Admin behind the
+    """Orgs A and B (OA/ED each, a 64 MiB storage quota) and a Super Admin behind the
     fake database; the attachment root in tmp_path; every rate-limit bucket roomy."""
     db = FakeDb()
     world = build_world(db)
@@ -740,21 +740,19 @@ class TestAttachmentsAccess:
         assert _work(env.world.db, since) == []
         assert _state(env) == before
 
-    @pytest.mark.parametrize("role", ["viewer", "super_admin"])
     @pytest.mark.parametrize("route", _ROUTES)
-    def test_attachments_api_viewer_and_super_admin_are_403_before_any_work(
-        self, env: _Env, route: str, role: str
+    def test_attachments_api_super_admin_is_403_before_any_work(
+        self, env: _Env, route: str
     ) -> None:
-        """The Viewer on their own chat and attachment (from before a demotion), the
-        Super Admin on an Editor's: 403, no statement, nothing stored, no upload bucket."""
-        caller = env.world.super_admin if role == "super_admin" else env.world.a["viewer"]
-        owner = env.world.a["viewer"] if role == "viewer" else env.world.a["editor"]
+        """The Super Admin (neither ``file.upload`` nor ``chat.send``) on an Editor's chat
+        and attachment: 403, no statement, nothing stored, no upload bucket."""
+        owner = env.world.a["editor"]
         attachment = _seed(env, owner)
         chat = env.world.db.add_chat(owner.user_id)
         before = _state(env)
         since = len(env.world.db.calls)
 
-        response = _call_route(env, route, caller, chat, attachment)
+        response = _call_route(env, route, env.world.super_admin, chat, attachment)
 
         assert _outcome(response) == (403, FORBIDDEN)
         assert _work(env.world.db, since) == []
@@ -1307,7 +1305,7 @@ class TestAttachmentsUploadOrder:
 
 _EARLY_CASES: Final = [
     pytest.param("no-session", (401, UNAUTHORIZED), id="no-session"),
-    pytest.param("viewer", (403, FORBIDDEN), id="viewer"),
+    pytest.param("super-admin", (403, FORBIDDEN), id="super-admin"),
     pytest.param("rate-limited", (429, _RATE_LIMITED), id="rate-limited"),
     pytest.param("no-name", _refused("invalid_filename"), id="invalid-filename"),
     pytest.param("no-length", _refused("content_length_required"), id="no-content-length"),
@@ -1339,9 +1337,8 @@ class TestAttachmentsUploadStream:
         name: bytes | None = b"notes.txt"
         if case == "no-session":
             caller = None
-        elif case == "viewer":
-            caller = env.world.a["viewer"]
-            chat = db.add_chat(caller.user_id)
+        elif case == "super-admin":
+            caller = env.world.super_admin
         elif case == "rate-limited":
             spent = await _raw_upload(env.app, caller, chat, _Wire([b"abcdefgh"] * 2), length=b"16")
             assert spent[0] == 201, spent

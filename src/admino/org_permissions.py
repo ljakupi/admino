@@ -707,7 +707,7 @@ async def permissions_summary(
 
     Args:
         pool: The database pool.
-        actor: The member asking (Org Admin, Editor or Viewer).
+        actor: The member asking (Org Admin or Editor).
 
     Returns:
         One entry per stored (tool, action), sorted.

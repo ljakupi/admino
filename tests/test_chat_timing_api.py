@@ -9,7 +9,7 @@ content in logs; tenant isolation (another org's, a colleague's, a trashed and a
 unknown chat stay the identical 404).
 
 Harness: the app from ``create_app()`` on the FakeDb world of tests/tenancy_world.py
-(orgs A and B with an Org Admin, an Editor and a Viewer each; fresh sessions, so no
+(orgs A and B with an Org Admin and an Editor each; fresh sessions, so no
 ``last_seen_at`` touch; conftest's warm platform settings cache), the REAL
 ``admino.agent.Agent`` with the real tool-call recorder, fake tools in an isolated
 registry and a scripted fake LLM answering ``chat`` (JSON turns, title calls) and
@@ -41,8 +41,8 @@ What is pinned:
 - Refusals keep their order and statements: another org's, a colleague's, a
   trashed and an unknown chat are the identical 404 ``chat_not_found`` after the
   session lookup and T1 only (no hold, no T2, no run), JSON and SSE; a busy chat is
-  the 409 ``run_active`` after T1 (its hold refused) with no T2; 401, a Viewer's
-  403, the CSRF 403, a message over the stored ``max_message_length`` (422) and the
+  the 409 ``run_active`` after T1 (its hold refused) with no T2; 401, the Super
+  Admin's 403, the CSRF 403, a message over the stored ``max_message_length`` (422) and the
   429 run no statement but the session lookup. Each logs exactly one line with its
   status and ``-`` LLM fields.
 - C1.1 / C1.3: one line per request on each turn route (``chat_message`` JSON and
@@ -431,7 +431,7 @@ def _watched_runtime(monkeypatch: pytest.MonkeyPatch, db: FakeDb) -> Any:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+    """Orgs A and B (OA/ED each) and a Super Admin, behind the fake database."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)
@@ -915,7 +915,7 @@ def test_chat_timing_unreachable_chat_is_the_identical_404_after_turn_setup_only
 _REFUSALS: Final[dict[str, tuple[int, dict[str, str], int]]] = {
     # case: (status, body, statements: the session lookup or nothing)
     "no_session": (401, UNAUTHORIZED, 0),
-    "viewer": (403, FORBIDDEN, 1),
+    "super_admin": (403, FORBIDDEN, 1),
     "cross_site": (403, _CSRF_REFUSED, 0),
     "over_stored_length": (422, _TOO_LONG, 1),
     "rate_limited": (429, _RATE_LIMITED, 1),
@@ -926,10 +926,10 @@ _REFUSALS: Final[dict[str, tuple[int, dict[str, str], int]]] = {
 def test_chat_timing_refusal_before_the_turn_setup_logs_one_line(
     h: _Harness, case: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """401 without a session, a Viewer's 403, the CSRF 403, a message over the stored
-    ``max_message_length`` (422, before the owner check) and the 429 of a spent bucket:
-    no statement but the session lookup, no run, and exactly one line with the status
-    and ``-`` LLM fields."""
+    """401 without a session, the Super Admin's 403 (no chat.send), the CSRF 403, a
+    message over the stored ``max_message_length`` (422, before the owner check) and the
+    429 of a spent bucket: no statement but the session lookup, no run, and exactly one
+    line with the status and ``-`` LLM fields."""
     status, body, statements = _REFUSALS[case]
     editor = h.world.a["editor"]
     chat_id = _chat_with_history(h.db, editor)
@@ -937,8 +937,8 @@ def test_chat_timing_refusal_before_the_turn_setup_logs_one_line(
     message, headers = _MESSAGE, {}
     if case == "no_session":
         account = None
-    elif case == "viewer":
-        account = h.world.a["viewer"]
+    elif case == "super_admin":
+        account = h.world.super_admin
     elif case == "cross_site":
         headers = {"Sec-Fetch-Site": "cross-site"}
     elif case == "over_stored_length":

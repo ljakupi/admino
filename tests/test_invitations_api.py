@@ -14,7 +14,8 @@ What these tests pin down:
   built from ``server.public_url`` only. 409 ``{"detail", "reason":
   "email_taken"}`` for an email that exists anywhere on the platform and
   ``{"detail", "reason": "seat_limit"}`` for a full org, with nothing written;
-  422 for a bad body without echo.
+  422 for a bad body without echo (GH-306: the retired role ``viewer``
+  included).
 - ``GET /api/org/invitations`` → 200 ``{"invitations": [...]}``: the caller's
   org's pending invitations, most recently sent first, flagged ``expired``.
 - ``DELETE /api/org/invitations/{id}`` → 204; ``POST
@@ -22,8 +23,8 @@ What these tests pin down:
   an unknown or an accepted invitation → 404 ``{"detail": "Invitation not
   found"}``; a non-UUID id → 422 without echo.
 - The four org routes need a session (401), authorize through
-  ``admino.access.can`` (``org.users.invite`` / ``org.users.view``): an Editor,
-  a Viewer and a Super Admin get 403 ``{"detail": "Forbidden"}``.
+  ``admino.access.can`` (``org.users.invite`` / ``org.users.view``): an Editor
+  and a Super Admin get 403 ``{"detail": "Forbidden"}``.
 - ``GET /api/auth/invitations/{token}`` (public) → 200 exactly ``{"org_name",
   "role", "email"}``; ``POST /api/auth/invitations/{token}/accept {name,
   password}`` (public) → 204 with the ``admino_session`` cookie (HttpOnly,
@@ -112,8 +113,8 @@ _NOT_FOUND = {"detail": "Invitation not found"}
 _EMAIL_TAKEN = {"detail": "A user with this email already exists.", "reason": "email_taken"}
 _SEAT_LIMIT = {"detail": "The organization has no free seats.", "reason": "seat_limit"}
 _SUMMARY_KEYS = {"id", "email", "role", "sent_at", "expires_at", "expired"}
-_ROLES = ["org_admin", "editor", "viewer"]
-_NOT_ADMINS = ["editor", "viewer", "super_admin"]
+_ROLES = ["org_admin", "editor"]
+_NOT_ADMINS = ["editor", "super_admin"]
 
 _ORG_ROUTES: list[tuple[str, str]] = [
     ("POST", "/api/org/invitations"),
@@ -522,6 +523,8 @@ _BAD_BODIES = [
     ),
     pytest.param({"email": "ECHOMARK42@example.ch", "role": "ECHOMARK42"}, id="unknown-role"),
     pytest.param({"email": "ECHOMARK42@example.ch", "role": "super_admin"}, id="super-admin-role"),
+    # GH-306: the retired member role is no role any more.
+    pytest.param({"email": "ECHOMARK42@example.ch", "role": "viewer"}, id="viewer-role"),
     pytest.param(
         {"email": "ECHOMARK42@example.ch", "role": "editor", "org_id": "ECHOMARK42"},
         id="extra-org-id",
@@ -539,7 +542,7 @@ class TestCreateRoute:
         """201; exactly the summary fields; the id is the new invitation's."""
         _, session = _admin(db)
 
-        response = _create(_client(_app()), session, role="viewer")
+        response = _create(_client(_app()), session, role="org_admin")
 
         assert response.status_code == 201
         body = response.json()
@@ -547,7 +550,7 @@ class TestCreateRoute:
         invitation = db.invitation_of(_invited_id(db))
         assert invitation is not None
         assert body["id"] == str(invitation["id"])
-        assert (body["email"], body["role"], body["expired"]) == (_EMAIL, "viewer", False)
+        assert (body["email"], body["role"], body["expired"]) == (_EMAIL, "org_admin", False)
         assert datetime.fromisoformat(body["sent_at"]) == invitation["sent_at"]
         assert datetime.fromisoformat(body["expires_at"]) == invitation["expires_at"]
 
@@ -651,7 +654,7 @@ class TestCreateRoute:
     def test_invitations_api_create_forbidden_without_org_users_invite(
         self, db: FakeDb, who: str
     ) -> None:
-        """An Editor, a Viewer and a Super Admin get 403 {"detail": "Forbidden"}; nothing is
+        """An Editor and a Super Admin get 403 {"detail": "Forbidden"}; nothing is
         written."""
         _route(_app(), "POST", _INVITES)
         session = _session_of(db, who)
@@ -696,11 +699,13 @@ class TestCreateRoute:
         _invite(db, client, session)
         before = _state(db)
 
-        response = _create(client, session, email="  " + _EMAIL.upper() + " ", role="viewer")
+        response = _create(client, session, email="  " + _EMAIL.upper() + " ", role="org_admin")
 
         assert response.status_code == 409
         assert response.json() == _EMAIL_TAKEN
-        _assert_only_refusal_audited(db, before, actor=admin, role="viewer", reason="email_taken")
+        _assert_only_refusal_audited(
+            db, before, actor=admin, role="org_admin", reason="email_taken"
+        )
 
     def test_invitations_api_create_full_org_is_409_seat_limit(self, db: FakeDb) -> None:
         """One seat, taken by the admin: 409 {"detail", "reason": "seat_limit"}; only the
@@ -853,7 +858,7 @@ class TestListRoute:
         _, other_session = _admin(db, org_id=OTHER_ORG_ID)
         client = _client(_app())
         older, _ = _invite(db, client, session, email="older.person@example.ch")
-        newer, _ = _invite(db, client, session, email="newer.person@example.ch", role="viewer")
+        newer, _ = _invite(db, client, session, email="newer.person@example.ch", role="org_admin")
         _age(db, older, timedelta(hours=5))
         _age(db, newer, timedelta(hours=1))
         _, accepted_token = _invite(db, client, session, email="accepted.person@example.ch")
@@ -870,7 +875,7 @@ class TestListRoute:
         assert [entry["id"] for entry in entries] == [newer, older]
         assert all(set(entry) == _SUMMARY_KEYS for entry in entries)
         assert [(entry["email"], entry["role"]) for entry in entries] == [
-            ("newer.person@example.ch", "viewer"),
+            ("newer.person@example.ch", "org_admin"),
             ("older.person@example.ch", "editor"),
         ]
 
@@ -1132,7 +1137,7 @@ class TestResendRoute:
 
     def test_invitations_api_resend_is_audited_with_the_client_ip(self, db: FakeDb) -> None:
         admin, session = _admin(db)
-        invitation_id, _ = _invite(db, _client(_app()), session, role="viewer")
+        invitation_id, _ = _invite(db, _client(_app()), session, role="org_admin")
 
         _resend(_client(_app(), ip=_IP_B), session, invitation_id)
 
@@ -1144,7 +1149,7 @@ class TestResendRoute:
             _IP_B,
         )
         assert rows[0]["target_ids"] == [invitation_id]
-        assert rows[0]["metadata"] == {"role": "viewer", "user_id": str(_invited_id(db))}
+        assert rows[0]["metadata"] == {"role": "org_admin", "user_id": str(_invited_id(db))}
 
     @pytest.mark.parametrize("case", ["other-org", "unknown", "accepted"])
     def test_invitations_api_resend_outside_the_orgs_pending_invitations_is_404(
@@ -1246,12 +1251,12 @@ class TestDetailsRoute:
     ) -> None:
         _, session = _admin(db)
         client = _client(_app())
-        _, token = _invite(db, client, session, role="viewer")
+        _, token = _invite(db, client, session, role="org_admin")
 
         response = _details(client, token)
 
         assert response.status_code == 200
-        assert response.json() == {"org_name": ORG_NAME, "role": "viewer", "email": _EMAIL}
+        assert response.json() == {"org_name": ORG_NAME, "role": "org_admin", "email": _EMAIL}
 
     def test_invitations_api_details_works_without_a_session(self, db: FakeDb) -> None:
         """No cookie, or a garbage one: the public route still answers 200."""
@@ -1392,7 +1397,7 @@ class TestAcceptRoute:
         inviting admin's language."""
         _, session = _admin(db, ui_language="fr")
         client = _client(_app())
-        _, token = _invite(db, client, session, role="viewer")
+        _, token = _invite(db, client, session, role="org_admin")
         cookie, _ = _session_set_cookie(_accept(client, token))
         client.cookies.clear()
 
@@ -1404,7 +1409,7 @@ class TestAcceptRoute:
             str(_invited_id(db)),
             "member",
             str(ORG_ID),
-            "viewer",
+            "org_admin",
         )
         assert body["ui_language"] == "fr"
 

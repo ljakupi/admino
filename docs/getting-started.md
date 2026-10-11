@@ -300,7 +300,7 @@ user only. Access tokens are kept in memory only and never persisted. The agent 
 connection in your own chats only, never in a colleague's. **Disconnect** on the same card
 revokes the token at the provider and deletes it.
 
-- Viewers can't chat, so they have no connections.
+- The Super Admin can't chat and has no connections.
 - An Org Admin turns services on or off for the whole organization under
   **Organization → Settings**, in **Tools and permissions**.
 - When your organization's data residency policy is on, the Google and Microsoft tools are
@@ -320,9 +320,8 @@ This trips people up, so it's worth stating plainly:
 
 ## Upgrading from the single-tenant version
 
-admino is becoming a multi-tenant platform, with organizations and user accounts in four
-roles: Super Admin, Org Admin, Editor and Viewer. **The upgrade starts from an empty
-platform.**
+admino is becoming a multi-tenant platform, with organizations and user accounts in three
+roles: Super Admin, Org Admin and Editor. **The upgrade starts from an empty platform.**
 
 - **Add `PG_APP_PASSWORD` to `.env` before you upgrade** (see `.env.example`). The app
   now connects as the non-superuser role `admino_app`; the `migrate` service creates it
@@ -340,6 +339,13 @@ platform.**
 - Some earlier versions created a "Default organization" to hold the audit events of tool
   calls made before login existed. The upgrade deletes it and its audit events
   automatically, so an upgraded install starts with no organization, like a new one.
+- Upgrading to this version retires the read-only member role. Accounts that held it are
+  deactivated, which ends their sessions, and stored as Editors; their pending invitations
+  are revoked. Each change is recorded in the organization's audit log with the `system`
+  actor: `user.deactivate` with the `reason` `viewer_retired`, and `invitation.revoke`. No
+  email is sent. Such an account keeps its connections and data, as with any deactivation.
+  Reactivation restores the stored role, so an Org Admin or the Super Admin who
+  reactivates it grants it the Editor role.
 
 ## Quality gates (for contributors)
 

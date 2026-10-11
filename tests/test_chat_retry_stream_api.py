@@ -9,7 +9,7 @@ logs are tests/test_chat_retry_api.py's; the real agent tests/test_chat_retry_ag
 the tenancy rows and GET ``retryable`` W5's.
 
 Harness: the app from ``create_app()`` on the FakeDb world of tests/tenancy_world.py
-(orgs A and B with an Org Admin, an Editor and a Viewer each, real session cookies),
+(orgs A and B with an Org Admin and an Editor each, real session cookies),
 the attachments root under ``tmp_path`` and derived files written with
 tests/attachment_derived.py. The agent is a stub (``_Script``, the pattern of
 tests/test_chat_stream_api.py): its ``run`` binds every call to ``Agent.run``'s
@@ -448,7 +448,7 @@ class _TitleLLM:
 
 @pytest.fixture()
 def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin behind the fake database, with the
+    """Orgs A and B (OA/ED each) and a Super Admin behind the fake database, with the
     attachments root under ``tmp_path``."""
     db = FakeDb()
     built = build_world(db)

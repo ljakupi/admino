@@ -155,8 +155,8 @@ Routes:
   read under the chat's hold, and an approval whose chat was trashed while it
   waited removes its confirmation before the 404 (GH-294). The caller's
   account is read again first under the hold: deactivated, removed or an org
-  deactivated meanwhile is the 401, demoted to Viewer the 403, with nothing
-  run or stored and the confirmation left pending (GH-298).
+  deactivated meanwhile is the 401, a role without ``chat.send`` the 403,
+  with nothing run or stored and the confirmation left pending (GH-298).
 - GET/PATCH /api/me/settings — The caller's own appearance (theme, density) and
   notification types (every role).
 - POST /api/me/settings/reset — Revert the caller's own settings to the
@@ -214,9 +214,8 @@ Security notes:
   ``Principal`` always comes from the session row, never from request data.
   There is no bearer-token or VPN mode, and ``Authorization`` headers
   authenticate nothing.
-- The chat routes also need ``Capability.CHAT_SEND`` (403 for a Viewer or a
-  Super Admin, before any database work); the principal is passed to
-  ``agent.run``.
+- The chat routes also need ``Capability.CHAT_SEND`` (403 for a Super Admin,
+  before any database work); the principal is passed to ``agent.run``.
 - Persisted chats (GH-176, ``admino.chats``): chats are private to their
   owner. Every statement binds the caller's org and user id (from the
   session, never a request value), so an unknown id, another org's chat, a
@@ -341,7 +340,7 @@ Security notes:
   chat id only.
 - Attachments (GH-187, ``admino.attachments``, ``admino.attachment_types``):
   the upload needs ``Capability.FILE_UPLOAD`` (Org Admin, Editor; 403 for a
-  Viewer or a Super Admin before any database work or bucket), the reads
+  Super Admin before any database work or bucket), the reads
   ``Capability.CHAT_SEND``. Every check of the upload comes before a body
   byte is read, in this order: the per-user bucket (its burst is the
   platform ``max_files_per_message``, read when the bucket is created), the
@@ -438,8 +437,8 @@ Security notes:
   (ids only); the same value again records nothing. No log line, error body
   or audit row names a file or holds its content.
 - Trash (GH-194, ``admino.trash``): the trash routes and ``DELETE
-  /api/attachments/{attachment_id}`` need ``chat.send`` (403 for a Viewer or
-  a Super Admin before any database work), the CSRF check on a state change
+  /api/attachments/{attachment_id}`` need ``chat.send`` (403 for a Super
+  Admin before any database work), the CSRF check on a state change
   and a per-user bucket each, spent first. The trash is the caller's own
   (V1): every statement binds the session's org and user, so another org's,
   a colleague's (an Org Admin's request included) and an unknown item answer
@@ -598,7 +597,7 @@ Security notes:
   split a ``tool_use`` from its result), never in another org's.
 - OAuth connections are per user (GH-162): every OAuth route but the callback
   spends a per-user bucket, then needs ``Capability.OAUTH_CONNECT`` through
-  ``access.can`` (Org Admin and Editor: 403 for a Viewer or a Super Admin)
+  ``access.can`` (Org Admin and Editor: 403 for a Super Admin)
   before any database work, and only ever reads, writes or deletes the
   caller's own ``oauth_tokens`` row (``TenantContext.from_principal``, never
   a request value). Under the org's data residency policy authorize is a 403
@@ -1930,7 +1929,7 @@ async def require_chat_sender(principal: _PrincipalDep) -> Principal:
 
     Raises:
         HTTPException: 403 ``Forbidden`` unless the principal has
-            ``Capability.CHAT_SEND`` (a Viewer or a Super Admin has not).
+            ``Capability.CHAT_SEND`` (a Super Admin has not).
     """
     if not can(principal, Capability.CHAT_SEND):
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -1946,7 +1945,7 @@ async def require_file_uploader(principal: _PrincipalDep) -> Principal:
 
     Raises:
         HTTPException: 403 ``Forbidden`` unless the principal has
-            ``Capability.FILE_UPLOAD`` (a Viewer or a Super Admin has not).
+            ``Capability.FILE_UPLOAD`` (a Super Admin has not).
     """
     if not can(principal, Capability.FILE_UPLOAD):
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -5864,7 +5863,7 @@ async def post_confirm(
     removed from the org, or whose org was deactivated or scheduled for
     deletion, is the 401 ``Unauthorized`` (as is any account row that fails
     the session lookup's account rules, fail closed), a role without
-    ``chat.send`` (demoted to Viewer) the 403 ``Forbidden``, JSON even for a
+    ``chat.send`` the 403 ``Forbidden``, JSON even for a
     streamed confirm, and the per-IP budget of unresolved session cookies is
     not spent. Nothing more is read, run or stored: no settings, promotions
     or policy, no agent run, no ``tool.call`` row, no message, and the
@@ -7609,7 +7608,7 @@ async def _oauth_authorize(
     """Build the provider's consent URL and bind its state to the caller's session.
 
     Order: the per-user bucket, ``oauth.connect`` (403 ``Forbidden`` for a
-    Viewer or a Super Admin), the org's data residency (403
+    Super Admin), the org's data residency (403
     ``OAUTH_RESIDENCY_DETAIL``), the consent URL; only then the pending state
     and the binding cookie, so a refused request stores and sets nothing.
 

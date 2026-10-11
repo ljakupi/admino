@@ -202,7 +202,7 @@ _ONE_CUSTOM_SETTING = [
     pytest.param({"notifications_approvals": False}, id="approvals-off"),
     pytest.param({"notifications_completed": False}, id="completed-off"),
 ]
-_ROLES = ["super_admin", "org_admin", "editor", "viewer"]
+_ROLES = ["super_admin", "org_admin", "editor"]
 _MODEL_MARKER = "Zephyrmarker/Model-77"
 _EMAIL_MARKER = "zephyr.marker.person@example.ch"
 _NAME_MARKER = "Zephyrmarker Person"
@@ -331,11 +331,11 @@ _REFUSED = [
     *(
         pytest.param(name, role, id=f"{name}-{role}")
         for name in _ORG_FUNCTIONS
-        for role in ("editor", "viewer", "super_admin")
+        for role in ("editor", "super_admin")
     ),
     *(
         pytest.param("update_platform_settings", role, id=f"update_platform_settings-{role}")
-        for role in ("org_admin", "editor", "viewer")
+        for role in ("org_admin", "editor")
     ),
 ]
 _ALLOWED = [
@@ -977,7 +977,7 @@ class TestUserSettings:
     async def test_scoped_settings_get_user_returns_the_stored_row(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
-        actor = _actor(db, "viewer")
+        actor = _actor(db, "editor")
         db.add_user_settings(actor.user_id, theme="dark", notifications_approvals=False)
 
         result = await svc.get_user_settings(db.pool, actor=actor)
@@ -1017,7 +1017,7 @@ class TestUserSettings:
     async def test_scoped_settings_update_notifications_keeps_the_theme(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
-        actor = _actor(db, "viewer")
+        actor = _actor(db, "editor")
         db.add_user_settings(actor.user_id, theme="dark", notifications_approvals=True)
 
         result = await svc.update_user_settings(
@@ -1125,7 +1125,7 @@ class TestUserCompleted:
     async def test_scoped_settings_get_user_returns_the_stored_completed(
         self, svc: ModuleType, db: FakeDb, stored: bool
     ) -> None:
-        actor = _actor(db, "viewer")
+        actor = _actor(db, "editor")
         db.add_user_settings(
             actor.user_id,
             theme="system",
@@ -1190,7 +1190,7 @@ class TestUserCompleted:
     async def test_scoped_settings_update_theme_keeps_a_stored_completed(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
-        actor = _actor(db, "viewer")
+        actor = _actor(db, "editor")
         db.add_user_settings(actor.user_id, theme="dark", notifications_completed=False)
 
         result = await svc.update_user_settings(
@@ -1272,7 +1272,7 @@ class TestUserCompleted:
         self, svc: ModuleType, db: FakeDb
     ) -> None:
         """Only completed differs from the column defaults."""
-        actor = _actor(db, "viewer")
+        actor = _actor(db, "editor")
 
         result = await svc.update_user_settings(
             db.pool, actor=actor, patch=_user_patch({"notifications": {"completed": False}})
@@ -1306,7 +1306,7 @@ class TestUserCompleted:
         """Neither a colleague in the same org nor a user of another org is touched."""
         actor = _actor(db, "editor")
         colleague = _actor(db, "editor")
-        stranger = _actor(db, "viewer", OTHER_ORG_ID)
+        stranger = _actor(db, "editor", OTHER_ORG_ID)
         db.add_user_settings(actor.user_id)
         others = {
             colleague.user_id: copy.deepcopy(db.add_user_settings(colleague.user_id)),
@@ -1421,7 +1421,7 @@ class TestResetUserSettings:
         self, svc: ModuleType, db: FakeDb
     ) -> None:
         """Idempotent: no row is no error; the row stays absent or holds the defaults."""
-        actor = _actor(db, "viewer")
+        actor = _actor(db, "editor")
 
         result = await svc.reset_user_settings(db.pool, actor=actor)
 
@@ -1477,7 +1477,7 @@ class TestResetUserSettings:
     async def test_scoped_settings_reset_asks_can_for_account_manage(
         self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        actor = _actor(db, "viewer")
+        actor = _actor(db, "editor")
         spy = _CanSpy(monkeypatch, svc)
 
         await svc.reset_user_settings(db.pool, actor=actor)
@@ -1498,7 +1498,7 @@ class TestResetUserSettings:
         db.users[actor.user_id]["response_language"] = "it"
         if has_row:
             _custom_user_row(db, actor.user_id)
-        others = [_actor(db, "org_admin"), _actor(db, "viewer", OTHER_ORG_ID)]
+        others = [_actor(db, "org_admin"), _actor(db, "editor", OTHER_ORG_ID)]
         others.append(_actor(db, "super_admin"))
         for other in others:
             _custom_user_row(db, other.user_id)
@@ -1560,7 +1560,7 @@ class TestResetUserSettings:
     ) -> None:
         """Two users' resets issue the same SQL text: only the bind arguments differ."""
         first = _actor(db, "editor")
-        second = _actor(db, "viewer", OTHER_ORG_ID)
+        second = _actor(db, "editor", OTHER_ORG_ID)
         _custom_user_row(db, first.user_id)
         _custom_user_row(db, second.user_id)
 
@@ -1713,7 +1713,7 @@ class TestAccountPreferences:
         self, svc: ModuleType, db: FakeDb, changes: dict[str, Any]
     ) -> None:
         """The row is created from the column defaults; only the given fields differ."""
-        actor = _actor(db, "viewer")
+        actor = _actor(db, "editor")
         expected = {**_USER_COLUMN_DEFAULTS, **changes}
 
         result = await svc.update_user_settings(
@@ -2124,9 +2124,9 @@ class TestOrgToolsEnabled:
         self, svc: ModuleType, db: FakeDb
     ) -> None:
         """A missing row reads as all seven on, and the read writes nothing."""
-        viewer = _actor(db, "viewer")
+        editor = _actor(db, "editor")
 
-        tools = await svc.org_tools_enabled(db.pool, _tenant(viewer))
+        tools = await svc.org_tools_enabled(db.pool, _tenant(editor))
 
         assert dict(tools) == _ALL_ON
         assert db.org_settings == {}
@@ -2188,12 +2188,12 @@ class TestOrgToolsEnabled:
     async def test_scoped_settings_org_tools_enabled_needs_no_capability(
         self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An internal read for a chat run: it never asks access.can (a Viewer's run
-        reads its org's switches too)."""
-        viewer = _actor(db, "viewer")
+        """An internal read for a chat run: it never asks access.can (every member's run
+        reads its org's switches)."""
+        editor = _actor(db, "editor")
         spy = _CanSpy(monkeypatch, svc)
 
-        await svc.org_tools_enabled(db.pool, _tenant(viewer))
+        await svc.org_tools_enabled(db.pool, _tenant(editor))
 
         assert spy.capabilities == []
 
@@ -2292,7 +2292,7 @@ class TestOrgResidency:
         assert _uuid(call.args[int(match.group(1)) - 1]) == ORG_ID
         assert str(ORG_ID) not in call.sql
 
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_scoped_settings_org_residency_needs_no_capability(
         self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch, role: str
     ) -> None:
@@ -3700,7 +3700,7 @@ class TestUpdatePlatformSectionsAuthorization:
     any statement; nothing is written and the cache is kept."""
 
     @pytest.mark.parametrize("section", list(_ONE_CHANGE))
-    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
     async def test_scoped_settings_member_cant_update_a_platform_section(
         self,
         svc: ModuleType,
@@ -3770,7 +3770,7 @@ class TestEachScopeSeededWithDefaults:
     def people(self, db: FakeDb) -> list[uuid.UUID]:
         return [
             db.add_account(role="org_admin", org_id=ORG_ID),
-            db.add_account(role="viewer", org_id=OTHER_ORG_ID, status="invited", name=None),
+            db.add_account(role="editor", org_id=OTHER_ORG_ID, status="invited", name=None),
             db.add_account(kind="super_admin", role=None),
         ]
 
@@ -3820,7 +3820,7 @@ class TestEachScopeSeededWithDefaults:
         self, svc: ModuleType, db: FakeDb, people: list[uuid.UUID]
     ) -> None:
         await self._migrate_and_seed(svc, db, _config())
-        admin, _viewer, super_admin = (_principal(db, user_id) for user_id in people)
+        admin, _invited, super_admin = (_principal(db, user_id) for user_id in people)
 
         org = await svc.get_org_settings(db.pool, actor=admin)
         mine = await svc.get_user_settings(db.pool, actor=admin)
@@ -3939,7 +3939,7 @@ class TestNoContentInLogs:
         """GH-35 (GH-307: completed): switching completed, a reset (with a row and
         without one) and a refused reset log no email or name."""
         caplog.set_level(logging.DEBUG)
-        actor = _actor(db, "viewer", email=_EMAIL_MARKER, name=_NAME_MARKER)
+        actor = _actor(db, "editor", email=_EMAIL_MARKER, name=_NAME_MARKER)
 
         await svc.update_user_settings(
             db.pool, actor=actor, patch=_user_patch({"notifications": {"completed": False}})
